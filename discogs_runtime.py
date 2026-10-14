@@ -75,6 +75,19 @@ class _Settings:
 
     def bind(self, api) -> None:
         self._api = api
+        # Every option MUST be registered before it can be read back.
+        # ConfigSection.__getitem__() looks the name up in Picard's Option
+        # registry and returns None for anything it does not find — so an
+        # unregistered setting reads as empty no matter what was saved to
+        # it, which is exactly how a stored Discogs token comes back blank.
+        for key, default in DEFAULTS.items():
+            try:
+                api.plugin_config.register_option(key, default)
+            except Exception:
+                # Already registered (a disable/enable cycle re-runs this),
+                # or this build names it differently. Either way the read
+                # below still falls back to DEFAULTS.
+                pass
 
     def unbind(self) -> None:
         self._api = None
@@ -84,13 +97,13 @@ class _Settings:
         if self._api is None:
             # Outside Picard (tests, static analysis): behave as defaults.
             return self._fallback.get(key, default)
-        try:
-            value = self._api.plugin_config.get(key, default)
-        except Exception:
-            return default
+        # Subscript, NOT .get(): Picard's ConfigSection has no get() method.
+        # Calling one and catching the AttributeError silently turned every
+        # setting into its default — the bug that made a saved token vanish.
+        value = self._api.plugin_config[key]
         # A setting stored before a default changed type can come back as the
         # wrong type; coerce booleans so `if settings['cover_art']` is sound.
-        if isinstance(default, bool) and not isinstance(value, bool):
+        if isinstance(default, bool) and not isinstance(value, bool) and value is not None:
             return str(value).strip().lower() in ('1', 'true', 'yes', 'on')
         return default if value is None else value
 
@@ -98,10 +111,7 @@ class _Settings:
         if self._api is None:
             self._fallback[key] = value
             return
-        try:
-            self._api.plugin_config[key] = value
-        except Exception:
-            self._fallback[key] = value
+        self._api.plugin_config[key] = value
 
     def get(self, key: str, default: Any = None) -> Any:
         value = self[key]
