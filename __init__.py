@@ -31,7 +31,7 @@ import re
 
 from PyQt6 import QtCore, QtWidgets
 
-from .discogs_runtime import bind_api, log, settings, unbind_api
+from .discogs_runtime import bind_api, get_api, log, settings, unbind_api
 
 # Picard 3 serves every plugin base class from one module, so a plugin no
 # longer reaches into picard.ui.* or picard.metadata for them. Registration
@@ -393,6 +393,101 @@ def _collect_track_fields(tracks, indices, pairs, out_by_pair: dict) -> None:
         out_by_pair[pair_index] = merged
 
 
+def _album_metadata_targets(album, album_metadata):
+    """Every metadata object that has to receive the Discogs fields.
+
+    Returns (metadata, track_key) pairs. `track_key` identifies which track
+    the object belongs to, so per-track tags reach the right rows; it is
+    None for the album's own metadata, which has no single track.
+
+    Three kinds of object matter and they are NOT the same object:
+      * the album metadata — what the album row shows;
+      * each Track's metadata — what the right-hand pane shows;
+      * each File's metadata — what File.save() actually writes to disk.
+    Picard copies between them at load time and never again, so an update
+    arriving later has to be written to all three or it reaches none of the
+    files.
+    """
+    targets = [(album_metadata, None)]
+    seen = {id(album_metadata)}
+
+    for index, track in enumerate(getattr(album, 'tracks', None) or []):
+        track_metadata = getattr(track, 'metadata', None)
+        if track_metadata is not None and id(track_metadata) not in seen:
+            targets.append((track_metadata, index))
+            seen.add(id(track_metadata))
+        # A track's linked files carry their own metadata, and that is the
+        # copy that gets saved.
+        for linked in getattr(track, 'files', None) or []:
+            file_metadata = getattr(linked, 'metadata', None)
+            if file_metadata is not None and id(file_metadata) not in seen:
+                targets.append((file_metadata, index))
+                seen.add(id(file_metadata))
+
+    # Files attached to the album but not to any track (unmatched extras).
+    try:
+        for linked in album.iterfiles():
+            file_metadata = getattr(linked, 'metadata', None)
+            if file_metadata is not None and id(file_metadata) not in seen:
+                targets.append((file_metadata, None))
+                seen.add(id(file_metadata))
+    except Exception:
+        log.debug('Discogs Enrichment: could not enumerate album files', exc_info=True)
+
+    return targets
+
+
+def _album_track_fields(album, release_data) -> dict:
+    """Per-track tags for the automatic path, keyed by track index.
+
+    Without this, "Discogs only" would clear the title on every track and
+    put nothing back, because the album-level field set has no track
+    identity in it.
+    """
+    if not settings['track_tags']:
+        return {}
+    tracks = getattr(album, 'tracks', None) or []
+    if not tracks:
+        return {}
+    discs = parse_discs(release_data)
+    # The automatic path has no disc-mapping dialog, so the tracklist is
+    # taken in release order; align_tracks_to_files then prefers each
+    # track's existing number over raw ordering.
+    audio = []
+    for disc in discs:
+        audio.extend(disc.get('tracks') or [])
+    if not audio:
+        return {}
+    metadatas = [getattr(t, 'metadata', None) for t in tracks]
+    aligned = align_tracks_to_files(audio, metadatas)
+    out = {}
+    for index, track in enumerate(aligned):
+        if track:
+            out[index] = extract_track_fields(track, index + 1, len(audio))
+    return out
+
+
+def _refresh_album_ui(album) -> None:
+    """Make the panes redraw after a late metadata change.
+
+    album.update() alone refreshes the rows; the metadata box caches the
+    current selection and keeps showing stale values until told the
+    selection is dirty.
+    """
+    try:
+        album.update()
+    except Exception:
+        log.debug('Discogs Enrichment: album.update() failed', exc_info=True)
+    try:
+        window = getattr(get_api().tagger, 'window', None) if get_api() else None
+        box = getattr(window, 'metadata_box', None)
+        if box is not None:
+            box.selection_dirty = True
+            box.update()
+    except Exception:
+        log.debug('Discogs Enrichment: metadata box refresh failed', exc_info=True)
+
+
 def _apply_discogs_fields(metadata, discogs_fields: dict, disc_count: int = 1) -> None:
     mode = settings['merge_mode'] or MODE_COMBINE
     if mode == MODE_MB_ONLY:
@@ -494,22 +589,50 @@ def process_album(api, album, metadata, release) -> None:
                 log.debug('Discogs Enrichment: album %r went away before the '
                           'Discogs result arrived, discarding it', album)
                 return
+            disc_count = release_disc_count(release_data)
             before = {k: list(metadata.getall(k)) for k in fields}
-            _apply_discogs_fields(metadata, fields, release_disc_count(release_data))
-            if (settings['merge_mode'] or MODE_COMBINE) == MODE_DISCOGS_ONLY:
-                _clear_non_discogs_tags(metadata, fields, op)
+
+            # Writing to the album metadata alone is not enough. Picard builds
+            # every track by COPYING the album metadata (Album._load_tracks),
+            # and it does that during _finalize_loading — which has already
+            # happened by the time this asynchronous Discogs reply arrives.
+            # Fields written here would land in an object nothing reads again,
+            # which is exactly why automatic lookups produced no discogs_*
+            # tags while the manual search did.
+            targets = _album_metadata_targets(album, metadata)
+            track_fields = _album_track_fields(album, release_data)
+            discogs_only = (settings['merge_mode'] or MODE_COMBINE) == MODE_DISCOGS_ONLY
+
+            for target, track_key in targets:
+                _apply_discogs_fields(target, fields, disc_count)
+                per_track = track_fields.get(track_key) or {}
+                for field, value in per_track.items():
+                    if field.startswith('~'):
+                        target[field] = value
+                        continue
+                    resolved = resolve_field_value(
+                        target.getall(field), value,
+                        settings['merge_mode'] or MODE_COMBINE, field=field)
+                    if resolved is not None:
+                        target[field] = resolved
+                if discogs_only:
+                    # The supplied set must include the track tags, or the
+                    # clear would delete the very title just written.
+                    supplied = set(fields) | set(per_track)
+                    _clear_non_discogs_tags(target, dict.fromkeys(supplied), op)
+
             changed = {k: (before.get(k), list(metadata.getall(k)))
                        for k in fields if list(metadata.getall(k)) != before.get(k)}
-            plugin_log.event(op, f'applied {len(changed)} of {len(fields)} field(s)')
+            plugin_log.event(op, f'applied {len(changed)} of {len(fields)} field(s) '
+                                 f'to {len(targets)} target(s)')
             for name, (was, now) in sorted(changed.items()):
                 plugin_log.detail(op, f'  {name}: {was} -> {now}')
             unchanged = [k for k in fields if k not in changed]
             if unchanged:
                 plugin_log.detail(op, f'  unchanged ({len(unchanged)}): {sorted(unchanged)[:20]}')
-            # No blocking task API in this Picard version — refresh the
-            # UI once the async fetch resolves instead of holding load.
-            album.update()
-            log.info('Discogs Enrichment: applied fields %r to album %r', list(fields.keys()), album)
+            _refresh_album_ui(album)
+            log.info('Discogs Enrichment: applied fields %r to album %r (%d target(s))',
+                     list(fields.keys()), album, len(targets))
 
         master_id = release_data.get('master_id')
         if not master_id:
