@@ -1,0 +1,42 @@
+uuid = "dd789f69-332f-498a-af94-d8e3273cc435"
+name = "Discogs Enrichment"
+description = "Tag from Discogs alongside or instead of MusicBrainz, with a release picker, box-set disc mapping and cover art."
+api = ["3.0"]
+version = "0.3.0"
+authors = ["herculepirate"]
+maintainers = ["herculepirate"]
+license = "GPL-2.0-or-later"
+license_url = "https://www.gnu.org/licenses/gpl-2.0.html"
+categories = ["metadata", "coverart"]
+homepage = "https://github.com/herculepirate/picard-discogs-enrichment"
+report_bugs_to = "https://github.com/herculepirate/picard-discogs-enrichment/issues"
+long_description = """
+Adds Discogs as a metadata source next to MusicBrainz, for the releases
+MusicBrainz covers thinly — specific pressings, small labels, reissues and
+box sets.
+
+**Choosing a release.** Searching Discogs opens a sortable table rather than
+silently taking the top hit: artist, title, year, country, medium, disc and
+track counts, edition markers (Reissue, Remastered, Deluxe), label,
+catalogue number and community have/want counts. A Match column scores each
+candidate against what Picard already knows — barcode, catalogue number,
+year, country and medium — and says which facts agreed. Search by any field
+Discogs supports, or paste a release ID or URL. A search that returns
+nothing widens itself by dropping the most over-specific terms and tells you
+which ones it dropped.
+
+**Four tag sources.** Discogs only, MusicBrainz only, Discogs preferred, or
+MusicBrainz preferred. Each is exact about what it overwrites and what it
+leaves alone, and single-valued fields never get two sources concatenated
+into one tag.
+
+**Box sets.** Maps the discs Picard has onto the discs Discogs lists, with a
+confidence score per pairing and manual override.
+
+**Cover art** downloads front, front+back or every image, and a size-capped
+troubleshooting log can be switched between basic and detailed and saved
+from the settings page.
+
+Requires a free Discogs personal access token, set under
+Options → Plugins → Discogs Enrichment.
+"""
