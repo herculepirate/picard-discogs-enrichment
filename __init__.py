@@ -28,6 +28,7 @@ version — those relied on plugin3-only UI registration hooks.
 
 import os
 import re
+import weakref
 
 from PyQt6 import QtCore, QtWidgets
 
@@ -393,6 +394,78 @@ def _collect_track_fields(tracks, indices, pairs, out_by_pair: dict) -> None:
         out_by_pair[pair_index] = merged
 
 
+# Discogs fields already applied to an album, kept so a file that attaches to
+# a track LATER can still be given them.
+#
+# The automatic lookup is asynchronous and Picard links files to tracks on its
+# own schedule, so the two race. When the reply wins, the files are not linked
+# yet and get nothing — observed directly in the plugin log, where repeated
+# loads of one 17-track album alternated between 35 targets (album + 17 tracks
+# + 17 files) and 18 (no files). With "Clear existing tags" on, a file that
+# misses the handover also loses the tags a previous run had written, so the
+# result was Discogs tags appearing to be deleted.
+#
+# Keyed by id() of the album, with the album held weakly: this must not keep
+# a removed album alive, and must not grow without bound over a long session.
+_APPLIED_BY_ALBUM: dict = {}
+_APPLIED_LIMIT = 64
+
+
+def _remember_applied(album, fields: dict, track_fields: dict, disc_count: int) -> None:
+    if len(_APPLIED_BY_ALBUM) >= _APPLIED_LIMIT:
+        _APPLIED_BY_ALBUM.clear()
+    try:
+        ref = weakref.ref(album)
+    except TypeError:
+        return
+    _APPLIED_BY_ALBUM[id(album)] = (ref, dict(fields), dict(track_fields), disc_count)
+
+
+def _forget_applied(album) -> None:
+    _APPLIED_BY_ALBUM.pop(id(album), None)
+
+
+def apply_to_late_file(api, track, file) -> None:
+    """Give a newly attached file the Discogs data its album already has.
+
+    Registered as a file-post-addition-to-track processor. Without it, a file
+    that joins its track after the Discogs reply has landed keeps whatever
+    MusicBrainz left and never sees the Discogs fields.
+    """
+    album = getattr(track, 'album', None)
+    entry = _APPLIED_BY_ALBUM.get(id(album)) if album is not None else None
+    if not entry:
+        return
+    ref, fields, track_fields, disc_count = entry
+    if ref() is not album:
+        # id() was reused by a different object after the original was freed.
+        _APPLIED_BY_ALBUM.pop(id(album), None)
+        return
+    metadata = getattr(file, 'metadata', None)
+    if metadata is None:
+        return
+
+    index = None
+    try:
+        index = list(album.tracks).index(track)
+    except (ValueError, TypeError, AttributeError):
+        pass
+    per_track = (track_fields.get(index) or {}) if index is not None else {}
+
+    _apply_discogs_fields(metadata, fields, disc_count)
+    mode = settings['merge_mode'] or MODE_COMBINE
+    for field, value in per_track.items():
+        if field.startswith('~'):
+            metadata[field] = value
+            continue
+        resolved = resolve_field_value(metadata.getall(field), value, mode, field=field)
+        if resolved is not None:
+            metadata[field] = resolved
+    if mode == MODE_DISCOGS_ONLY:
+        _clear_non_discogs_tags(metadata, dict.fromkeys(set(fields) | set(per_track)), 'late-file')
+    log.debug('Discogs Enrichment: applied cached Discogs data to a late-arriving file')
+
+
 def _album_metadata_targets(album, album_metadata):
     """Every metadata object that has to receive the Discogs fields.
 
@@ -630,6 +703,9 @@ def process_album(api, album, metadata, release) -> None:
             unchanged = [k for k in fields if k not in changed]
             if unchanged:
                 plugin_log.detail(op, f'  unchanged ({len(unchanged)}): {sorted(unchanged)[:20]}')
+            # Files that attach to their track after this point are handled
+            # by apply_to_late_file(), which needs the same field set.
+            _remember_applied(album, fields, track_fields, disc_count)
             _refresh_album_ui(album)
             log.info('Discogs Enrichment: applied fields %r to album %r (%d target(s))',
                      list(fields.keys()), album, len(targets))
@@ -1975,6 +2051,9 @@ def enable(api) -> None:
     log.debug('Discogs Enrichment: enabling')
 
     api.register_album_metadata_processor(process_album)
+    # Closes the race between the asynchronous Discogs reply and Picard
+    # linking files to tracks; see apply_to_late_file().
+    api.register_file_post_addition_to_track_processor(apply_to_late_file)
     api.register_options_page(DiscogsOptionsPage)
 
     api.register_album_action(DiscogsSearchAction)
