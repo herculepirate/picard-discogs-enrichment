@@ -42,10 +42,14 @@ size-capped, and saved from the settings page.
 
 ## Installing
 
-Picard 3 finds plugins by scanning its `plugins3` folder for directories
-containing a `MANIFEST.toml`. Installing is therefore a directory copy, and
-the only thing that differs between a `.deb`, a Flatpak and a Snap is where
-that folder lives.
+Picard 3 installs plugins with its own plugin manager, which keeps each one as
+a **git checkout** so its **Update** button can bring it up to date. Install it
+through Picard (or `picard-cli`, or `install.sh`, which uses `picard-cli`) and
+it stays updatable.
+
+> **Never copy or edit files inside Picard's `plugins3` folder by hand.** Picard
+> refuses to update a checkout with local edits ("Plugin … has uncommitted
+> changes"). If that has already happened, run `./install.sh --repair`.
 
 > Picard 2.x installed plugins as `.zip` files. Picard 3 does not read those
 > at all — if you have a `plugins` folder full of zips, it is the old one and
@@ -53,16 +57,10 @@ that folder lives.
 
 ### Option 1 — from inside Picard (easiest, works everywhere)
 
-**Options → Plugins → Install**, then either:
+**Options → Plugins → Install Plugin…**, then paste
+`https://github.com/herculepirate/picard-discogs-enrichment`.
 
-- paste `https://github.com/herculepirate/picard-discogs-enrichment` into the
-  URL field, or
-- download/clone this repository and point the **Local path** field at the
-  folder.
-
-Picard validates that the folder has a `MANIFEST.toml` before accepting it.
-
-### Option 2 — the install script
+### Option 2 — the install script (Linux: apt/.deb or Flatpak)
 
 ```bash
 git clone https://github.com/herculepirate/picard-discogs-enrichment.git
@@ -70,75 +68,31 @@ cd picard-discogs-enrichment
 ./install.sh
 ```
 
-It detects which Picard you have and copies the plugin into the right place.
+It finds your Picard (including the Flatpak) and installs through Picard's own
+`picard-cli`, so Picard manages the result.
 
 ```bash
-./install.sh --list                 # show detected installs and their paths
-./install.sh --flavour flatpak      # force one: deb | flatpak | snap
-./install.sh --dir /custom/plugins3 # install somewhere specific
-./install.sh --uninstall            # remove it again
+./install.sh --status      # installed commit, commits behind, any hand edits
+./install.sh --update      # update to the latest commit
+./install.sh --repair      # back up hand edits in the installed copy, discard them, update
+./install.sh --local       # install from this folder instead of GitHub (development)
+./install.sh --uninstall
+./install.sh --flavour flatpak   # choose when both a .deb and a Flatpak Picard exist
 ```
 
-If you have more than one Picard installed it will say so rather than
-guessing, and you run it once per flavour.
+`--repair` copies any edited files to `~/discogs-enrichment-local-edits-<date>/`
+(with a `changes.diff`) before discarding them, so nothing is lost. An install
+made by an older version of this script (a plain copy) is replaced with a
+Picard-managed one automatically.
 
-### Option 3 — copy the folder yourself
-
-Copy this repository's contents into your `plugins3` directory, in a folder
-named exactly:
-
-```
-discogs_enrichment_dd789f69-332f-498a-af94-d8e3273cc435
-```
-
-That is `<sanitized plugin name>_<uuid>`, which is how Picard names plugin
-folders itself. Any folder name loads, but using a different one means a
-later install from the plugin registry creates a **second** folder with the
-same uuid, and both load at once.
-
-The `plugins3` directory is:
-
-| Picard install | `plugins3` directory |
-| --- | --- |
-| **Debian/Ubuntu (`.deb`, apt)** | `~/.local/share/MusicBrainz/Picard/plugins3/` |
-| **Flatpak** | `~/.var/app/org.musicbrainz.Picard/data/MusicBrainz/Picard/plugins3/` |
-| **Snap** | `~/snap/picard/current/.local/share/MusicBrainz/Picard/plugins3/` |
-| **Windows** | `%APPDATA%\MusicBrainz\Picard\plugins3\` |
-| **macOS** | `~/Library/Application Support/MusicBrainz/Picard/plugins3/` |
-
-Flatpak and Snap each confine Picard to their own data directory — a Snap in
-particular gives Picard a `$HOME` of `~/snap/picard/current`, so the plugin
-folder is **not** under your real home. That is the single most common reason
-a manually-copied plugin does not appear.
-
-If you have set `PICARD_PLUGIN_DIR`, that overrides all of the above.
-
-```bash
-# Flatpak example
-DEST=~/.var/app/org.musicbrainz.Picard/data/MusicBrainz/Picard/plugins3
-mkdir -p "$DEST"
-cp -R picard-discogs-enrichment \
-      "$DEST/discogs_enrichment_dd789f69-332f-498a-af94-d8e3273cc435"
-```
-
-### Option 4 — the command line
-
-If your build ships `picard-cli`:
+### Option 3 — `picard-cli` directly
 
 ```bash
 picard-cli plugins install https://github.com/herculepirate/picard-discogs-enrichment
-picard-cli plugins install /path/to/picard-discogs-enrichment   # local folder
-picard-cli plugins list
+picard-cli plugins update "Discogs Enrichment"
+# Flatpak:
+flatpak run --command=picard-cli org.musicbrainz.Picard plugins install https://github.com/herculepirate/picard-discogs-enrichment
 ```
-
-Inside a Flatpak, run it through the sandbox:
-
-```bash
-flatpak run --command=picard-cli org.musicbrainz.Picard plugins install <url-or-path>
-```
-
-`picard-cli` is not shipped by every package. If the command is missing, use
-one of the options above — they do the same thing.
 
 ### After installing
 
@@ -206,9 +160,14 @@ correctly.
 
 ## Troubleshooting
 
-**The plugin does not appear in Options → Plugins.** Almost always the wrong
-directory — see the table above, and note that Flatpak and Snap do not use
-your real home directory. `./install.sh --list` prints the path it would use.
+**"Failed to update the plugin … has uncommitted changes".** Files in the
+installed copy were edited or replaced by hand. Run `./install.sh --repair`
+(it backs the edits up first), or in Picard choose Update and accept
+"Discard changes" if `picard-cli` asks. `./install.sh --status` shows what was
+changed.
+
+**The plugin does not appear in Options → Plugins.** Install it again through
+Picard (Option 1) or `./install.sh`, then enable it and restart Picard.
 
 **No Discogs data appears.** Check the token is set, and that the tag source
 is not "MusicBrainz only".
@@ -224,6 +183,20 @@ redacted from it.
 ---
 
 ## Development
+
+Install from your working copy once, then commit and update; never edit the
+installed copy:
+
+```bash
+./install.sh --local      # Picard now tracks this folder's git history
+# edit, then:
+git commit -am "…"
+./install.sh --update     # Picard fast-forwards to your commit; restart Picard
+git push                  # when you are happy with it
+```
+
+Only committed work is installed. `./install.sh` (without `--local`) switches
+back to the GitHub source; settings are kept either way.
 
 Pure logic lives in `discogs_mapping.py` with no Qt or Picard imports, so it
 can be tested directly. `discogs_runtime.py` holds the late-bound `api`
