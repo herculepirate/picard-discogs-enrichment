@@ -23,6 +23,14 @@ from .discogs_client import DiscogsClient
 from .discogs_logging import plugin_log
 from .discogs_mapping import discogs_release_id_from_mb
 
+# Picard 3 keeps the "queue_images() is done / still waiting" answers on
+# CoverArtProvider.QueueState; older builds had them on the class itself. Asking the class
+# directly raised AttributeError in queue_images(), which stopped Picard's whole cover art
+# queue for the album, so resolve them once, tolerantly.
+_QUEUE_STATE = getattr(CoverArtProvider, 'QueueState', CoverArtProvider)
+FINISHED = _QUEUE_STATE.FINISHED
+WAIT = _QUEUE_STATE.WAIT
+
 # Discogs image `type` values map onto Picard/CAA cover art types.
 # Discogs only distinguishes 'primary' from 'secondary'; it does not say
 # whether a secondary image is the back, the spine, an inner sleeve or a
@@ -81,8 +89,8 @@ class CoverArtProviderDiscogs(CoverArtProvider):
                 client.get_release(release_id, self._on_release)
             except Exception:
                 log.error('Discogs Enrichment: cover art request failed', exc_info=True)
-                return CoverArtProvider.FINISHED
-            return CoverArtProvider.WAIT
+                return FINISHED
+            return WAIT
 
         # No MusicBrainz->Discogs link, so identify the release the same way
         # the tagging side does rather than guessing.
@@ -93,7 +101,7 @@ class CoverArtProviderDiscogs(CoverArtProvider):
         if not any([barcode, (catalog_number and artist), (artist and album_title)]):
             plugin_log.decision(self.op, 'cover art: not enough metadata to find the '
                                          'release on Discogs')
-            return CoverArtProvider.FINISHED
+            return FINISHED
 
         try:
             client.search_release(
@@ -105,8 +113,8 @@ class CoverArtProviderDiscogs(CoverArtProvider):
             )
         except Exception:
             log.error('Discogs Enrichment: cover art search failed', exc_info=True)
-            return CoverArtProvider.FINISHED
-        return CoverArtProvider.WAIT
+            return FINISHED
+        return WAIT
 
     # -- callbacks ---------------------------------------------------------
 
