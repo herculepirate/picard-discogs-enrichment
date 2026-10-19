@@ -125,12 +125,29 @@ Single-valued fields — album, artist, albumartist, date, barcode, country,
 media, disc numbers and the sort fields — never become multi-valued, in any
 mode. Two different album titles joined into one string is not useful data.
 
+### Artist names and MusicBrainz artist IDs
+
+When Discogs replaces `artist` or `albumartist` with its own credit (for
+example `Steve Roach / Kevin Braheny / Michael Stearns`), the MusicBrainz
+artist IDs that came with the old credit would describe different people than
+the new name. Players that group artists by MusicBrainz ID (Lyrion, Navidrome)
+then show the new name against the wrong artist — one joined credit can end up
+as the name of a single artist's page.
+
+So whenever the plugin actually changes an artist name it also removes the
+tags that belonged to the old one: `musicbrainz_artistid` /
+`musicbrainz_albumartistid`, and the `artists` / `albumartists` lists unless
+Discogs supplied them. A name that did not change keeps all of its tags.
+Release and recording IDs are never touched, so the file stays re-matchable
+in Picard. Use **MusicBrainz preferred** if you want MusicBrainz's artist
+names and IDs left exactly as they are.
+
 ### What "Discogs only" keeps
 
 Everything a release database could know is replaced. What survives is only
 what Discogs cannot supply and the file could not recover:
 
-- **`musicbrainz_*`** — so the file stays re-matchable. With the release MBID
+- **`musicbrainz_*`** (except the artist IDs, see above) — so the file stays re-matchable. With the release MBID
   intact Picard finds the release again in one lookup. Every MusicBrainz URL
   derives from these: the release page is
   `musicbrainz.org/release/<musicbrainz_albumid>`. (Picard has no separate

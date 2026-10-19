@@ -258,6 +258,52 @@ def extract_original_year(master: dict[str, Any] | None) -> dict[str, str]:
 _DISCOGS_ARTIST_SUFFIX_RE = re.compile(r'\s*\(\d+\)\s*$')
 
 
+# Tags that describe the SAME artist as `artist` / `albumartist`. When Discogs
+# replaces a name, these still describe the OLD credit and have to go,
+# otherwise a player that keys artists by MusicBrainz ID (Lyrion, Navidrome)
+# shows the new name against the old artist's ID.
+ARTIST_COMPANION_TAGS = {
+    'artist': ('musicbrainz_artistid', 'artistsort', 'artists'),
+    'albumartist': ('musicbrainz_albumartistid', 'albumartistsort', 'albumartists'),
+}
+
+
+def same_artist_name(a, b) -> bool:
+    """True if two artist-name values are the same once case, spacing and
+    Unicode form are ignored (a list is compared as its "; " join)."""
+    def norm(v):
+        if isinstance(v, (list, tuple)):
+            v = '; '.join(str(x) for x in v)
+        return ' '.join(unicodedata.normalize('NFKC', str(v or '')).casefold().split())
+    return norm(a) == norm(b)
+
+
+def snapshot_artist_names(metadata) -> dict:
+    """The current artist / albumartist values, taken BEFORE Discogs writes."""
+    return {field: list(metadata.getall(field)) for field in ARTIST_COMPANION_TAGS}
+
+
+def drop_stale_artist_companions(metadata, before: dict, supplied) -> list[str]:
+    """Delete MusicBrainz artist IDs / name lists that belong to an artist
+    name Discogs has just replaced.
+
+    `before` comes from snapshot_artist_names(). A companion tag is removed
+    only when the name really changed and Discogs did not supply that tag
+    itself. Release and recording IDs are never touched, so the files stay
+    re-matchable in Picard. Returns the tags removed.
+    """
+    removed = []
+    for field, companions in ARTIST_COMPANION_TAGS.items():
+        if same_artist_name(before.get(field), metadata.getall(field)):
+            continue
+        for tag in companions:
+            if tag in supplied or not metadata.getall(tag):
+                continue
+            metadata.delete(tag)
+            removed.append(tag)
+    return removed
+
+
 def clean_artist_name(name: str) -> str:
     """Strip Discogs' numeric disambiguation suffix from an artist name."""
     return _DISCOGS_ARTIST_SUFFIX_RE.sub('', str(name or '')).strip()

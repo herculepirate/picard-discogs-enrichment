@@ -45,6 +45,8 @@ from .discogs_logging import (LEVEL_BASIC, LEVEL_DETAILED, LEVEL_OFF,
                               log_path, plugin_log)
 from .discogs_coverart import ART_ALL, ART_FRONT, ART_FRONT_BACK
 from .discogs_mapping import (
+    drop_stale_artist_companions,
+    snapshot_artist_names,
     MODE_COMBINE,
     MODE_DISCOGS_ONLY,
     MODE_FILL_GAPS,
@@ -452,6 +454,7 @@ def apply_to_late_file(api, track, file) -> None:
         pass
     per_track = (track_fields.get(index) or {}) if index is not None else {}
 
+    names_before = snapshot_artist_names(metadata)
     _apply_discogs_fields(metadata, fields, disc_count)
     mode = settings['merge_mode'] or MODE_COMBINE
     for field, value in per_track.items():
@@ -463,6 +466,7 @@ def apply_to_late_file(api, track, file) -> None:
             metadata[field] = resolved
     if mode == MODE_DISCOGS_ONLY:
         _clear_non_discogs_tags(metadata, dict.fromkeys(set(fields) | set(per_track)), 'late-file')
+    _drop_stale_artist_ids(metadata, names_before, set(fields) | set(per_track), 'late-file')
     log.debug('Discogs Enrichment: applied cached Discogs data to a late-arriving file')
 
 
@@ -559,6 +563,28 @@ def _refresh_album_ui(album) -> None:
             box.update()
     except Exception:
         log.debug('Discogs Enrichment: metadata box refresh failed', exc_info=True)
+
+
+def _drop_stale_artist_ids(metadata, names_before: dict, supplied, op: str = 'ids') -> int:
+    """Remove MusicBrainz artist IDs that no longer match the artist name.
+
+    Discogs replaces `artist` / `albumartist` with its own credit string,
+    for example "Steve Roach / Kevin Braheny / Michael Stearns". The
+    MusicBrainz artist IDs written alongside the old credit would then
+    describe different people than the new name, and a player that keys
+    artists by MusicBrainz ID shows the wrong name on the wrong artist.
+    They are removed whenever the name actually changed.
+    """
+    try:
+        removed = drop_stale_artist_companions(metadata, names_before, supplied)
+    except Exception:
+        log.debug('Discogs Enrichment: could not drop stale artist IDs', exc_info=True)
+        return 0
+    if removed:
+        plugin_log.event(op, f'artist name replaced by Discogs: removed {len(removed)} '
+                             f'MusicBrainz artist tag(s) that no longer match')
+        plugin_log.detail(op, f'  removed: {sorted(removed)}')
+    return len(removed)
 
 
 def _apply_discogs_fields(metadata, discogs_fields: dict, disc_count: int = 1) -> None:
@@ -677,6 +703,7 @@ def process_album(api, album, metadata, release) -> None:
             discogs_only = (settings['merge_mode'] or MODE_COMBINE) == MODE_DISCOGS_ONLY
 
             for target, track_key in targets:
+                names_before = snapshot_artist_names(target)
                 _apply_discogs_fields(target, fields, disc_count)
                 per_track = track_fields.get(track_key) or {}
                 for field, value in per_track.items():
@@ -693,6 +720,7 @@ def process_album(api, album, metadata, release) -> None:
                     # clear would delete the very title just written.
                     supplied = set(fields) | set(per_track)
                     _clear_non_discogs_tags(target, dict.fromkeys(supplied), op)
+                _drop_stale_artist_ids(target, names_before, set(fields) | set(per_track), op)
 
             changed = {k: (before.get(k), list(metadata.getall(k)))
                        for k in fields if list(metadata.getall(k)) != before.get(k)}
@@ -1752,6 +1780,7 @@ class _DiscogsSearchBase(BaseAction):
         updated_count = 0
         for pair_index, (owner, metadata) in enumerate(pairs):
             changed = False
+            names_before = snapshot_artist_names(metadata)
             # Per-disc tags from the disc-mapping dialog are authoritative:
             # the user explicitly said "this album is that Discogs disc", so
             # discnumber/totaldiscs/discsubtitle are written directly rather
@@ -1809,6 +1838,9 @@ class _DiscogsSearchBase(BaseAction):
             if mode == MODE_DISCOGS_ONLY:
                 if _clear_non_discogs_tags(metadata, fields, getattr(self, 'op', 'search')):
                     changed = True
+            supplied_now = set(fields) | set(track_fields_by_pair.get(pair_index) or {})
+            if _drop_stale_artist_ids(metadata, names_before, supplied_now, getattr(self, 'op', 'search')):
+                changed = True
 
             if changed:
                 # One removed/closed file must not abort the whole batch.
