@@ -15,7 +15,7 @@ from collections.abc import Callable
 from typing import Any
 from urllib.parse import quote
 
-from PyQt6.QtCore import QUrl
+from PyQt6.QtCore import QTimer, QUrl
 from PyQt6.QtNetwork import QNetworkRequest
 
 from .discogs_runtime import log, settings
@@ -25,7 +25,7 @@ from picard.webservice import WSRequest
 
 DISCOGS_HOST = 'api.discogs.com'
 MUSICBRAINZ_HOST = 'musicbrainz.org'
-USER_AGENT = 'PicardDiscogsEnrichment/0.1 +https://github.com/'
+USER_AGENT = 'PicardDiscogsEnrichment/0.3.2 +https://github.com/herculepirate/picard-discogs-enrichment'
 
 
 # Process-wide response cache. Tagging a box set, re-running a lookup, or
@@ -128,9 +128,14 @@ class DiscogsClient:
         if use_cache and path in _RESPONSE_CACHE:
             plugin_log.request(op, 'Discogs', path, cached=True)
             log.debug('Discogs Enrichment: cache hit for %s', path)
-            # Deliver asynchronously-shaped arguments so cached and live
-            # paths behave identically for the caller.
-            self._never_raise(handler)(_RESPONSE_CACHE[path], None, None)
+            # Deliver on the next event-loop turn, exactly like a live reply.
+            # Calling back synchronously breaks callers that return WAIT and
+            # expect the answer later: Picard's cover art queue is a running
+            # generator, and a provider that calls next_in_queue() from
+            # inside queue_images() gets "generator already executing" and
+            # stalls the album's whole cover art pipeline.
+            document = _RESPONSE_CACHE[path]
+            QTimer.singleShot(0, lambda: self._never_raise(handler)(document, None, None))
             return
 
         url = QUrl(f'https://{DISCOGS_HOST}{path}')

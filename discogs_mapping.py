@@ -185,7 +185,7 @@ def extract_credits(extraartists: list[dict]) -> dict[str, list[str]]:
     """
     out: dict[str, list[str]] = {}
     for credit in extraartists or []:
-        name = (credit.get('name') or '').strip()
+        name = clean_artist_name(credit.get('anv') or credit.get('name'))
         role_text = (credit.get('role') or '').strip()
         if not name or not role_text:
             continue
@@ -220,7 +220,7 @@ def extract_company_credits(companies: list[dict]) -> dict[str, list[str]]:
     """
     out: dict[str, list[str]] = {}
     for company in companies or []:
-        name = (company.get('name') or '').strip()
+        name = clean_artist_name(company.get('name'))
         role_text = (company.get('entity_type_name') or '').strip()
         if not name or not role_text:
             continue
@@ -607,15 +607,18 @@ def extract_discogs_fields(release: dict[str, Any]) -> dict[str, str | list[str]
         out['discogs_style'] = styles
 
     if labels := release.get('labels'):
-        label_names = dedupe(entry.get('name', '') for entry in labels)
-        catnos = dedupe(entry.get('catno', '') for entry in labels)
+        label_names = dedupe(clean_artist_name(entry.get('name')) for entry in labels)
+        # Discogs writes the literal word "none" when a release has no
+        # catalogue number; that is not a catalogue number.
+        catnos = dedupe(entry.get('catno', '') for entry in labels
+                        if str(entry.get('catno') or '').strip().casefold() != 'none')
         if label_names:
             out['label'] = label_names
         if catnos:
             out['catalognumber'] = catnos
             out['discogs_catalognumber'] = catnos
 
-    for identifier in release.get('identifiers', []):
+    for identifier in release.get('identifiers') or []:
         if identifier.get('type') == 'Barcode' and identifier.get('value'):
             out['barcode'] = identifier['value'].replace(' ', '')
             break
@@ -744,7 +747,7 @@ def extract_remaining_release_fields(release: dict[str, Any]) -> dict[str, str |
             out[tag] = display
 
     if series := release.get('series'):
-        names = dedupe(s.get('name', '') for s in series)
+        names = dedupe(clean_artist_name(s.get('name')) for s in series)
         if names:
             out['discogs_series'] = names
 
