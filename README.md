@@ -151,27 +151,21 @@ Whenever the plugin applies a Discogs release it settles each artist field
   credit and are removed, unless Discogs supplied that tag itself.
 
 Release and recording IDs are never touched, so the file stays re-matchable
-in Picard. This only runs when a Discogs release is applied; for albums
-Discogs does not match, see the tagging script in *Collaborations without a
-Discogs match* below.
+in Picard.
 
-### Collaborations without a Discogs match
+### Collaborations on every album
 
-Add this as a Picard tagging script (Options → Scripting) so every album gets
-the same one-name-per-artist layout even when the plugin does not run:
-
-```
-$noop(Collaborations: one name per artist, in the same order as the MusicBrainz IDs)
-$if($gt($lenmulti(%_albumartists%),1),$setmulti(albumartist,%_albumartists%))
-$if($gt($lenmulti(%_albumartists_sort%),1),$setmulti(albumartistsort,%_albumartists_sort%))
-$if($gt($lenmulti(%artists%),1),$setmulti(artist,%artists%))
-$if($gt($lenmulti(%_artists_sort%),1),$setmulti(artistsort,%_artists_sort%))
-```
+The same one-name-per-artist rewrite also runs on MusicBrainz's own data the
+moment Picard loads an album — whether or not Discogs is used, finds a match,
+or is switched to "MusicBrainz only" — so no tagging script is needed. It is
+on by default: **Options → Plugins → Discogs Enrichment → "Write
+collaborations as one artist name per artist"**. Turn it off to keep Picard's
+usual joined credit.
 
 If your file-naming script uses `%albumartist%`, a collaboration then expands
 to `Max Corbacho; Bruno Sanfilippo`. To name the folder
-`Bruno Sanfilippo & Max Corbacho` (sorted, so both orders share a folder) use
-`$join($sortmulti(%albumartist%), & )` for the artist folder instead.
+`Bruno Sanfilippo & Max Corbacho` (sorted, so both orders share one folder)
+use `$join($sortmulti(%albumartist%), & )` for the artist folder instead.
 
 ### What "Discogs only" keeps
 

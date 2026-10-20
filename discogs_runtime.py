@@ -51,6 +51,10 @@ DEFAULTS: dict[str, Any] = {
     'cover_art': True,
     'cover_art_scope': 'front',
     'use_cache': True,
+    # Write a collaboration as one artist name per MusicBrainz artist ID
+    # ("Max Corbacho", "Bruno Sanfilippo") instead of Picard's joined credit,
+    # on every album, with or without a Discogs match. See README.
+    'split_collaborations': True,
     'log_level': 'basic',
     'log_max_kb': '2048',
     'prefer_original_date': False,

@@ -1027,8 +1027,16 @@ class DiscogsOptionsPage(OptionsPage):
         self.use_cache_checkbox = QtWidgets.QCheckBox('Reuse Discogs responses', self)
         self.use_cache_checkbox.setToolTip(
             'Avoids refetching the same release. Discogs allows 60 requests a minute.')
+        self.split_collab_checkbox = QtWidgets.QCheckBox(
+            'Write collaborations as one artist name per artist', self)
+        self.split_collab_checkbox.setToolTip(
+            'Picard writes "A & B" next to two MusicBrainz artist IDs, and Lyrion/Navidrome\n'
+            'then rename artist A\'s page to "A & B". This writes "A" and "B" as separate\n'
+            'names, each next to its own ID, on every album (with or without Discogs),\n'
+            'so the album is listed under every collaborator.')
         for box in (self.reverse_match_checkbox, self.skip_preview_checkbox,
-                    self.auto_disc_map_checkbox, self.use_cache_checkbox):
+                    self.auto_disc_map_checkbox, self.use_cache_checkbox,
+                    self.split_collab_checkbox):
             layout.addWidget(box)
 
         # --- troubleshooting log -----------------------------------------
@@ -1205,6 +1213,7 @@ class DiscogsOptionsPage(OptionsPage):
         self.cover_art_checkbox.setChecked(True)
         _select_by_data(self.cover_art_scope_combo, ART_FRONT)
         self.use_cache_checkbox.setChecked(True)
+        self.split_collab_checkbox.setChecked(True)
         _select_by_data(self.style_combo, STYLE_SEPARATE)
         _select_by_data(self.strictness_combo, STRICTNESS_NORMAL)
         _select_by_data(self.log_level_combo, LEVEL_BASIC)
@@ -1239,6 +1248,7 @@ class DiscogsOptionsPage(OptionsPage):
         _select_by_data(self.cover_art_scope_combo, s['cover_art_scope'] or ART_FRONT)
         self._update_art_warning()
         self.use_cache_checkbox.setChecked(bool(s['use_cache']))
+        self.split_collab_checkbox.setChecked(bool(s['split_collaborations']))
         _select_by_data(self.style_combo, s['style_mode'] or STYLE_SEPARATE)
         _select_by_data(self.strictness_combo, s['strictness'] or STRICTNESS_NORMAL)
         _select_by_data(self.log_level_combo, s['log_level'] or LEVEL_BASIC)
@@ -1273,6 +1283,7 @@ class DiscogsOptionsPage(OptionsPage):
         s['cover_art'] = self.cover_art_checkbox.isChecked()
         s['cover_art_scope'] = self.cover_art_scope_combo.currentData()
         s['use_cache'] = self.use_cache_checkbox.isChecked()
+        s['split_collaborations'] = self.split_collab_checkbox.isChecked()
         s['style_mode'] = self.style_combo.currentData()
         s['strictness'] = self.strictness_combo.currentData()
         s['log_level'] = self.log_level_combo.currentData()
@@ -2065,6 +2076,26 @@ class DiscogsSearchClusterAction(_DiscogsSearchBase):
         return groups
 
 
+def _split_collaborations(metadata, op: str) -> None:
+    """Rewrite MusicBrainz's joined collaboration credit as one name per
+    artist ID, straight after Picard builds the metadata, so it happens on
+    every album whether or not Discogs is used or finds a match."""
+    try:
+        if not settings['split_collaborations']:
+            return
+    except Exception:
+        return
+    _settle_artist_credits(metadata, snapshot_artist_credits(metadata), (), op)
+
+
+def split_album_collaborations(api, album, metadata, release_node) -> None:
+    _split_collaborations(metadata, 'mb-album')
+
+
+def split_track_collaborations(api, track, metadata, track_node, release_node=None) -> None:
+    _split_collaborations(metadata, 'mb-track')
+
+
 def enable(api) -> None:
     """Picard 3 entry point, called once when the plugin is enabled.
 
@@ -2081,6 +2112,10 @@ def enable(api) -> None:
     bind_api(api)
     log.debug('Discogs Enrichment: enabling')
 
+    # Runs on MusicBrainz's data first (higher priority = earlier), then the
+    # Discogs lookup starts from the already-split names.
+    api.register_album_metadata_processor(split_album_collaborations, priority=100)
+    api.register_track_metadata_processor(split_track_collaborations, priority=100)
     api.register_album_metadata_processor(process_album)
     # Closes the race between the asynchronous Discogs reply and Picard
     # linking files to tracks; see apply_to_late_file().
