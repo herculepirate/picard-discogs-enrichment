@@ -127,20 +127,51 @@ mode. Two different album titles joined into one string is not useful data.
 
 ### Artist names and MusicBrainz artist IDs
 
-When Discogs replaces `artist` or `albumartist` with its own credit (for
-example `Steve Roach / Kevin Braheny / Michael Stearns`), the MusicBrainz
-artist IDs that came with the old credit would describe different people than
-the new name. Players that group artists by MusicBrainz ID (Lyrion, Navidrome)
-then show the new name against the wrong artist — one joined credit can end up
-as the name of a single artist's page.
+Picard writes a collaboration as one joined credit
+(`Max Corbacho & Bruno Sanfilippo`) next to several MusicBrainz artist IDs.
+Players that group artists by MusicBrainz ID (Lyrion, Navidrome) give that
+whole credit to the first ID, so Max Corbacho's artist page is renamed
+`Max Corbacho & Bruno Sanfilippo` — and the album never appears under
+Bruno Sanfilippo.
 
-So whenever the plugin actually changes an artist name it also removes the
-tags that belonged to the old one: `musicbrainz_artistid` /
-`musicbrainz_albumartistid`, and the `artists` / `albumartists` lists unless
-Discogs supplied them. A name that did not change keeps all of its tags.
+Whenever the plugin applies a Discogs release it settles each artist field
+(`albumartist` and `artist`) against MusicBrainz's per-artist list:
+
+- **Same artists as MusicBrainz** (in any order, joined by `&`, `/`, `,`,
+  `and`, `feat.` …, whether Discogs rewrote the credit or not): a
+  collaboration is written as **one name per artist**
+  (`Max Corbacho`, `Bruno Sanfilippo`) in MusicBrainz's order, and the
+  MusicBrainz artist IDs, the `artists` / `albumartists` lists and the sort
+  names are kept in that same order. Each name now sits next to its own ID,
+  so the album is listed under every collaborator and no artist page is
+  renamed. A single artist, or a group that is one MusicBrainz artist
+  (`Simon & Garfunkel`), is left as it is.
+- **Different artists** (Discogs credits someone else, or spells a name
+  differently): the IDs, per-artist lists and sort name belonged to the old
+  credit and are removed, unless Discogs supplied that tag itself.
+
 Release and recording IDs are never touched, so the file stays re-matchable
-in Picard. Use **MusicBrainz preferred** if you want MusicBrainz's artist
-names and IDs left exactly as they are.
+in Picard. This only runs when a Discogs release is applied; for albums
+Discogs does not match, see the tagging script in *Collaborations without a
+Discogs match* below.
+
+### Collaborations without a Discogs match
+
+Add this as a Picard tagging script (Options → Scripting) so every album gets
+the same one-name-per-artist layout even when the plugin does not run:
+
+```
+$noop(Collaborations: one name per artist, in the same order as the MusicBrainz IDs)
+$if($gt($lenmulti(%_albumartists%),1),$setmulti(albumartist,%_albumartists%))
+$if($gt($lenmulti(%_albumartists_sort%),1),$setmulti(albumartistsort,%_albumartists_sort%))
+$if($gt($lenmulti(%artists%),1),$setmulti(artist,%artists%))
+$if($gt($lenmulti(%_artists_sort%),1),$setmulti(artistsort,%_artists_sort%))
+```
+
+If your file-naming script uses `%albumartist%`, a collaboration then expands
+to `Max Corbacho; Bruno Sanfilippo`. To name the folder
+`Bruno Sanfilippo & Max Corbacho` (sorted, so both orders share a folder) use
+`$join($sortmulti(%albumartist%), & )` for the artist folder instead.
 
 ### What "Discogs only" keeps
 

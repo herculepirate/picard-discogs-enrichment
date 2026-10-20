@@ -304,6 +304,170 @@ def drop_stale_artist_companions(metadata, before: dict, supplied) -> list[str]:
     return removed
 
 
+# How each artist field relates to MusicBrainz's per-artist data. Picard
+# writes a collaboration as ONE joined credit ("A & B") next to SEVERAL
+# artist IDs. Players that key artists by MusicBrainz ID (Lyrion, Navidrome)
+# then give the whole joined credit to the FIRST ID, so artist A's page is
+# renamed "A & B". Writing one name per ID, in the same order, avoids that and
+# lists the album under every collaborator.
+ARTIST_CREDIT_TAGS = {
+    'albumartist': {
+        'ids': 'musicbrainz_albumartistid',
+        'names': ('albumartists', '~albumartists'),
+        'plural': 'albumartists',
+        'sort': 'albumartistsort',
+        'sorts': ('~albumartists_sort',),
+    },
+    'artist': {
+        'ids': 'musicbrainz_artistid',
+        'names': ('artists', '~artists'),
+        'plural': 'artists',
+        'sort': 'artistsort',
+        'sorts': ('~artists_sort',),
+    },
+}
+
+# Words and symbols that may sit BETWEEN collaborator names in a credit.
+_CREDIT_JOIN_WORDS = {
+    'and', 'with', 'feat', 'featuring', 'ft', 'vs', 'x', 'meets', 'presents',
+    'pres', 'e', 'y', 'und', 'et', 'og', 'och', 'en',
+}
+_CREDIT_JOIN_SYMBOLS_RE = re.compile(r'[&/,;+×·•|~\-–—]')
+
+
+def _norm_name(value) -> str:
+    return ' '.join(unicodedata.normalize('NFKC', str(value or '')).casefold().split())
+
+
+def _is_credit_join(gap: str) -> bool:
+    """True if the text between two names is only joining words/symbols."""
+    words = _CREDIT_JOIN_SYMBOLS_RE.sub(' ', gap).replace('.', ' ').split()
+    return all(word in _CREDIT_JOIN_WORDS for word in words)
+
+
+def credit_matches_names(value, names) -> bool:
+    """True if `value` (a credit string, or a list of names) names exactly
+    the artists in `names`, in that order, joined only by "&", "/", ",",
+    "and", "feat." and the like. Case, spacing and Unicode form are ignored.
+
+    "Max Corbacho & Bruno Sanfilippo", "Max Corbacho / Bruno Sanfilippo" and
+    ["Max Corbacho", "Bruno Sanfilippo"] all match
+    ["Max Corbacho", "Bruno Sanfilippo"]; "Bruno Sanfilippo & Max Corbacho"
+    does not (wrong order), nor does a credit naming someone else.
+    """
+    names = [n for n in (names or []) if _norm_name(n)]
+    if not names:
+        return False
+    values = value if isinstance(value, (list, tuple)) else [value]
+    text = _norm_name('; '.join(str(v) for v in values))
+    pos = 0
+    for i, name in enumerate(names):
+        wanted = _norm_name(name)
+        idx = text.find(wanted, pos)
+        if idx < 0:
+            return False
+        gap = text[pos:idx]
+        if (i == 0 and gap.strip()) or not _is_credit_join(gap):
+            return False
+        pos = idx + len(wanted)
+    return not text[pos:].strip()
+
+
+def credit_names_same_artists(value, names) -> bool:
+    """Like credit_matches_names(), but the credit may list the artists in
+    any order (Discogs and MusicBrainz sometimes order a duo differently).
+    Only tried for up to five names."""
+    names = [n for n in (names or []) if _norm_name(n)]
+    if credit_matches_names(value, names):
+        return True
+    if not 1 < len(names) <= 5:
+        return False
+    from itertools import permutations
+    return any(credit_matches_names(value, list(p)) for p in permutations(names))
+
+
+def _first_nonempty(metadata, keys) -> list[str]:
+    for key in keys:
+        values = [str(v) for v in metadata.getall(key) if str(v).strip()]
+        if values:
+            return values
+    return []
+
+
+def snapshot_artist_credits(metadata) -> dict:
+    """Artist names, MusicBrainz per-artist names, IDs and sort names,
+    taken BEFORE Discogs writes anything."""
+    snap = {}
+    for field, spec in ARTIST_CREDIT_TAGS.items():
+        value = list(metadata.getall(field))
+        names = _first_nonempty(metadata, spec['names'])
+        if not names and len(value) > 1:
+            names = [str(v) for v in value]
+        snap[field] = {
+            'value': value,
+            'names': names,
+            'ids': [str(v) for v in metadata.getall(spec['ids']) if str(v).strip()],
+            'sorts': _first_nonempty(metadata, spec['sorts']),
+        }
+    return snap
+
+
+def settle_artist_credits(metadata, before: dict, supplied=()) -> list[str]:
+    """Make each artist field safe for players that key artists by
+    MusicBrainz ID. Returns a short description of every change made.
+
+    - The credit names the same artists MusicBrainz lists, in the same order
+      (whether Discogs rewrote it or not): a collaboration is written as one
+      name per artist, and the MusicBrainz IDs are kept in that same order.
+      A single artist is left as it is.
+    - The credit names different artists (Discogs credits someone else, or
+      spells a name differently): the MusicBrainz IDs, per-artist names and
+      sort name belong to the old credit and are removed, unless Discogs
+      supplied that tag itself.
+    """
+    supplied = set(supplied or ())
+    changes = []
+    for field, spec in ARTIST_CREDIT_TAGS.items():
+        snap = (before or {}).get(field) or {}
+        value = list(metadata.getall(field))
+        if not value:
+            continue
+        names = snap.get('names') or []
+        ids = snap.get('ids') or []
+        sorts = snap.get('sorts') or []
+
+        if credit_names_same_artists(value, names):
+            if len(names) < 2:
+                continue                     # single artist: nothing to do
+            if [str(v) for v in value] != names:
+                metadata[field] = list(names)
+                changes.append(f'{field}: {value} -> {names}')
+            if list(metadata.getall(spec['plural'])) != names:
+                metadata[spec['plural']] = list(names)
+            if len(ids) == len(names):
+                if list(metadata.getall(spec['ids'])) != ids:
+                    metadata[spec['ids']] = list(ids)
+                    changes.append(f'{spec["ids"]}: restored {len(ids)} ID(s)')
+            elif metadata.getall(spec['ids']):
+                metadata.delete(spec['ids'])
+                changes.append(f'{spec["ids"]}: removed ({len(ids)} ID(s) for {len(names)} names)')
+            if len(sorts) == len(names):
+                if list(metadata.getall(spec['sort'])) != sorts:
+                    metadata[spec['sort']] = list(sorts)
+            elif metadata.getall(spec['sort']):
+                metadata.delete(spec['sort'])
+            continue
+
+        if same_artist_name(snap.get('value'), value):
+            continue                         # untouched and not a known collaboration
+        for tag in (spec['ids'], spec['plural'], spec['sort']):
+            if tag in supplied or not metadata.getall(tag):
+                continue
+            metadata.delete(tag)
+            changes.append(f'{tag}: removed (credit now names different artists)')
+    return changes
+
+
 def clean_artist_name(name: str) -> str:
     """Strip Discogs' numeric disambiguation suffix from an artist name."""
     return _DISCOGS_ARTIST_SUFFIX_RE.sub('', str(name or '')).strip()
