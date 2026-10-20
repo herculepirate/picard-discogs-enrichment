@@ -574,7 +574,10 @@ def _settle_artist_credits(metadata, names_before: dict, supplied, op: str = 'id
     rename artist A's page to "A & B". See settle_artist_credits().
     """
     try:
-        changes = settle_artist_credits(metadata, names_before, supplied)
+        # "Discogs only" promises Discogs' names; every other mode keeps
+        # MusicBrainz's names wherever MusicBrainz has an ID for each artist.
+        prefer_mb = (settings['merge_mode'] or MODE_COMBINE) != MODE_DISCOGS_ONLY
+        changes = settle_artist_credits(metadata, names_before, supplied, prefer_mb)
     except Exception:
         log.debug('Discogs Enrichment: could not settle artist credits', exc_info=True)
         return 0

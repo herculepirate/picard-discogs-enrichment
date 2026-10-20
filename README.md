@@ -146,9 +146,17 @@ Whenever the plugin applies a Discogs release it settles each artist field
   so the album is listed under every collaborator and no artist page is
   renamed. A single artist, or a group that is one MusicBrainz artist
   (`Simon & Garfunkel`), is left as it is.
-- **Different artists** (Discogs credits someone else, or spells a name
-  differently): the IDs, per-artist lists and sort name belonged to the old
-  credit and are removed, unless Discogs supplied that tag itself.
+- **Named differently** (Discogs' "credited as" short names such as
+  `Adams / Reich - Solisti New York, Ransom Wilson`, a different spelling,
+  or other people) **and MusicBrainz has an ID for every artist**:
+  MusicBrainz's names win — `John Adams`, `Steve Reich`, `Solisti New York`,
+  `Ransom Wilson`, each with its ID, per-artist list entry and sort name — so
+  the album stays on every artist's page. Every other Discogs field (label,
+  credits, genres, notes, …) is still applied.
+- **"Discogs only" mode, or MusicBrainz lacks an ID for some artist**: the
+  credit stays as Discogs wrote it, and the MusicBrainz IDs, per-artist lists
+  and sort name of the old credit are removed (unless Discogs supplied that
+  tag itself), so the joined name cannot take over a single artist's page.
 
 Release and recording IDs are never touched, so the file stays re-matchable
 in Picard.

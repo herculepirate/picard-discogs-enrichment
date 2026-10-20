@@ -412,7 +412,7 @@ def snapshot_artist_credits(metadata) -> dict:
     return snap
 
 
-def settle_artist_credits(metadata, before: dict, supplied=()) -> list[str]:
+def settle_artist_credits(metadata, before: dict, supplied=(), prefer_mb_names: bool = True) -> list[str]:
     """Make each artist field safe for players that key artists by
     MusicBrainz ID. Returns a short description of every change made.
 
@@ -420,10 +420,15 @@ def settle_artist_credits(metadata, before: dict, supplied=()) -> list[str]:
       (whether Discogs rewrote it or not): a collaboration is written as one
       name per artist, and the MusicBrainz IDs are kept in that same order.
       A single artist is left as it is.
-    - The credit names different artists (Discogs credits someone else, or
-      spells a name differently): the MusicBrainz IDs, per-artist names and
-      sort name belong to the old credit and are removed, unless Discogs
-      supplied that tag itself.
+    - The credit names the artists differently (Discogs' "credited as" short
+      names such as "Adams / Reich", or other people) and MusicBrainz has an
+      ID for every artist: MusicBrainz's names win, one per artist, with
+      their IDs, per-artist lists and sort names. Artist pages in players
+      that key by ID then stay correct and complete.
+    - Same, but `prefer_mb_names` is False ("Discogs only"), or MusicBrainz
+      has no ID for each artist: the credit stays as written and the
+      MusicBrainz IDs, per-artist names and sort name of the old credit are
+      removed, unless Discogs supplied that tag itself.
     """
     supplied = set(supplied or ())
     changes = []
@@ -460,6 +465,20 @@ def settle_artist_credits(metadata, before: dict, supplied=()) -> list[str]:
 
         if same_artist_name(snap.get('value'), value):
             continue                         # untouched and not a known collaboration
+
+        if prefer_mb_names and names and len(ids) == len(names):
+            # MusicBrainz knows exactly who these artists are; keep its names.
+            metadata[field] = list(names)
+            if len(names) > 1 or metadata.getall(spec['plural']):
+                metadata[spec['plural']] = list(names)
+            metadata[spec['ids']] = list(ids)
+            if len(sorts) == len(names):
+                metadata[spec['sort']] = list(sorts)
+            elif spec['sort'] not in supplied and metadata.getall(spec['sort']):
+                metadata.delete(spec['sort'])
+            changes.append(f'{field}: kept MusicBrainz names {names} with their IDs '
+                           f'(Discogs credited {value})')
+            continue
         for tag in (spec['ids'], spec['plural'], spec['sort']):
             if tag in supplied or not metadata.getall(tag):
                 continue
