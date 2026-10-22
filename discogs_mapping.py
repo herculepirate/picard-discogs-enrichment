@@ -815,7 +815,8 @@ def parse_discs(release: dict[str, Any]) -> list[dict]:
     # not raise here: this runs on the main tagging path, where an
     # AttributeError is swallowed by the reply guard and silently abandons
     # the whole enrichment instead of degrading to single-disc.
-    tracklist = [e for e in (release.get('tracklist') or []) if isinstance(e, dict)]
+    tracklist = _flatten_index_entries(
+        [e for e in (release.get('tracklist') or []) if isinstance(e, dict)])
     discs: list[dict] = []
 
     # --- convention 1: position prefixes -------------------------------
@@ -824,7 +825,13 @@ def parse_discs(release: dict[str, Any]) -> list[dict]:
     for entry in tracklist:
         if (entry.get('type_') or 'track') != 'track':
             continue
-        match = position_re.match(entry.get('position') or '')
+        if '_parent_position' in entry:
+            # A movement: its work's position decides the disc. Its own number counts within
+            # the work ("1.1", "2a"), so only a hyphenated disc prefix ("1-2.1") is trusted.
+            match = (position_re.match(entry['_parent_position'])
+                     or _SUB_DISC_RE.match(entry.get('position') or ''))
+        else:
+            match = position_re.match(entry.get('position') or '')
         if not match:
             by_number = {}
             break
@@ -860,12 +867,66 @@ def parse_discs(release: dict[str, Any]) -> list[dict]:
             current['tracks'].append(entry)
 
     discs = [d for d in discs if d['tracks']]
+    # Headings also mark SECTIONS within one disc ("Women", "Side A", a suite). When the
+    # release's formats declare a single disc, the headings cannot be disc boundaries.
+    declared = _declared_disc_total(release)
+    if len(discs) > 1 and declared == 1:
+        discs = [{'number': 1, 'title': '',
+                  'tracks': [track for disc in discs for track in disc['tracks']]}]
     for index, disc in enumerate(discs, start=1):
         disc['number'] = index
 
     if not discs:
         return []
     return discs
+
+
+_SUB_DISC_RE = re.compile(r'^\s*(?:[A-Za-z]{1,4})?(\d+)\s*-\s*\d+', re.IGNORECASE)
+
+
+def _flatten_index_entries(tracklist: list[dict]) -> list[dict]:
+    """Replace each "index" entry (a work split into movements) with its sub_tracks, which
+    hold the audio. A movement's own position ("2a", "1-2.1", or blank) numbers it within
+    its work, so its parent's position is kept for disc numbering. Matches
+    count_audio_tracks(): an index entry without sub_tracks has no audio."""
+    out: list[dict] = []
+    for entry in tracklist:
+        kind = str(entry.get('type_') or entry.get('type') or 'track').strip().casefold()
+        if kind != 'index':
+            out.append(entry)
+            continue
+        for sub in entry.get('sub_tracks') or []:
+            if not isinstance(sub, dict):
+                continue
+            sub_kind = str(sub.get('type_') or sub.get('type') or 'track').strip().casefold()
+            if sub_kind != 'track':
+                continue
+            flat = dict(sub)
+            flat['type_'] = 'track'
+            flat['_parent_position'] = entry.get('position') or ''
+            out.append(flat)
+    return out
+
+
+def _declared_disc_total(release: dict[str, Any]) -> int | None:
+    """Discs declared by the release's formats (CD qty 2 + DVD qty 1 = 3), or None when the
+    release lists no formats. Digital media count as one disc (qty counts files there)."""
+    formats = [f for f in (release.get('formats') or []) if f]
+    if not formats:
+        return None
+    total = 0
+    for fmt in formats:
+        if not isinstance(fmt, dict):
+            total += 1
+            continue
+        if str(fmt.get('name') or '').strip().casefold() in _NON_DISC_MEDIA:
+            total += 1
+            continue
+        try:
+            total += int(str(fmt.get('qty') or '1').strip())
+        except (TypeError, ValueError):
+            total += 1
+    return max(total, 1)
 
 
 def extract_disc_fields(disc: dict, total_discs: int) -> dict[str, str]:
