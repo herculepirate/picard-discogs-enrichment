@@ -27,6 +27,11 @@ import re
 import unicodedata
 from typing import Any
 
+try:                                   # inside Picard: part of the plugin package
+    from .discogs_countries import country_code
+except ImportError:                    # loaded on its own (tests, batch tools)
+    from discogs_countries import country_code
+
 # Fields Picard/MusicBrainz already owns by default. Whether Discogs is
 # allowed to touch them (and how) is controlled by the merge mode — see
 # resolve_field_value() below. Includes the real Picard/MusicBrainz credit
@@ -185,7 +190,10 @@ def extract_credits(extraartists: list[dict]) -> dict[str, list[str]]:
     """
     out: dict[str, list[str]] = {}
     for credit in extraartists or []:
-        name = clean_artist_name(credit.get('anv') or credit.get('name'))
+        # The artist's own name, not the "credited as" spelling (anv): sleeves often credit
+        # roles by surname ("Reininger"), which then neither merges with MusicBrainz's full
+        # name nor says who it is. The main artist credit keeps the anv (format_artist_credit).
+        name = clean_artist_name(credit.get('name') or credit.get('anv'))
         role_text = (credit.get('role') or '').strip()
         if not name or not role_text:
             continue
@@ -412,7 +420,55 @@ def snapshot_artist_credits(metadata) -> dict:
     return snap
 
 
-def settle_artist_credits(metadata, before: dict, supplied=(), prefer_mb_names: bool = True) -> list[str]:
+# ---------------------------------------------------------------------------
+# Collaborators MusicBrainz's credit is missing
+# ---------------------------------------------------------------------------
+# Discogs release id -> {'credit': the credit as Discogs writes it,
+#                        'artists': [{'mbid', 'name', 'sort'}, ...] in Discogs order}
+# Filled by the client once every release artist's MusicBrainz ID is looked up.
+_RELEASE_ARTISTS: dict[str, dict] = {}
+_VARIOUS_ARTISTS_DISCOGS_ID = 194
+
+
+def discogs_release_artists(release: dict[str, Any] | None) -> list[tuple[int, str]]:
+    """(Discogs artist id, name) of each release artist, in order; [] for Various."""
+    out = []
+    for entry in (release or {}).get('artists') or []:
+        if not isinstance(entry, dict) or not entry.get('id'):
+            continue
+        if int(entry['id']) == _VARIOUS_ARTISTS_DISCOGS_ID:
+            return []
+        out.append((int(entry['id']), clean_artist_name(entry.get('name'))))
+    return out
+
+
+def artist_from_mb_url_lookup(document) -> dict | None:
+    """The MusicBrainz artist linked to a Discogs artist page, from MusicBrainz's
+    /ws/2/url?resource=...&inc=artist-rels answer: {'mbid', 'name', 'sort'} or None."""
+    if not isinstance(document, dict):
+        return None
+    for relation in document.get('relations') or []:
+        if relation.get('target-type') != 'artist':
+            continue
+        artist = relation.get('artist') or {}
+        if artist.get('id'):
+            return {'mbid': artist['id'], 'name': artist.get('name') or '',
+                    'sort': artist.get('sort-name') or ''}
+    return None
+
+
+def remember_release_artists(release_id, resolved: dict) -> None:
+    if len(_RELEASE_ARTISTS) > 2000:
+        _RELEASE_ARTISTS.clear()
+    _RELEASE_ARTISTS[str(release_id)] = resolved
+
+
+def release_artists_for(release_id) -> dict | None:
+    return _RELEASE_ARTISTS.get(str(release_id or ''))
+
+
+def settle_artist_credits(metadata, before: dict, supplied=(), prefer_mb_names: bool = True,
+                          discogs_artists: dict | None = None) -> list[str]:
     """Make each artist field safe for players that key artists by
     MusicBrainz ID. Returns a short description of every change made.
 
@@ -429,6 +485,11 @@ def settle_artist_credits(metadata, before: dict, supplied=(), prefer_mb_names: 
       has no ID for each artist: the credit stays as written and the
       MusicBrainz IDs, per-artist names and sort name of the old credit are
       removed, unless Discogs supplied that tag itself.
+    - Discogs credits MORE artists than MusicBrainz (MusicBrainz's credit is
+      missing a collaborator) and `discogs_artists` gives a MusicBrainz ID for
+      every Discogs artist, including all of MusicBrainz's own: every artist is
+      written, one name per artist with its ID and sort name, in Discogs' order.
+      If any artist has no ID, the rules above apply unchanged.
     """
     supplied = set(supplied or ())
     changes = []
@@ -466,6 +527,20 @@ def settle_artist_credits(metadata, before: dict, supplied=(), prefer_mb_names: 
         if same_artist_name(snap.get('value'), value):
             continue                         # untouched and not a known collaboration
 
+        full = _complete_discogs_artists(discogs_artists, value, ids)
+        if prefer_mb_names and full:
+            new_names = [a['name'] for a in full]
+            metadata[field] = list(new_names)
+            metadata[spec['plural']] = list(new_names)
+            metadata[spec['ids']] = [a['mbid'] for a in full]
+            if all(a.get('sort') for a in full):
+                metadata[spec['sort']] = [a['sort'] for a in full]
+            elif spec['sort'] not in supplied and metadata.getall(spec['sort']):
+                metadata.delete(spec['sort'])
+            changes.append(f'{field}: {names} -> {new_names} (Discogs credits more artists '
+                           f'than MusicBrainz; their MusicBrainz IDs were looked up)')
+            continue
+
         if prefer_mb_names and names and len(ids) == len(names):
             # MusicBrainz knows exactly who these artists are; keep its names.
             metadata[field] = list(names)
@@ -485,6 +560,22 @@ def settle_artist_credits(metadata, before: dict, supplied=(), prefer_mb_names: 
             metadata.delete(tag)
             changes.append(f'{tag}: removed (credit now names different artists)')
     return changes
+
+
+def _complete_discogs_artists(discogs_artists, value, mb_ids) -> list[dict] | None:
+    """Discogs' release artists, if usable for this field: at least two, every one with a
+    MusicBrainz ID, the field still holding the credit Discogs wrote, and every artist
+    MusicBrainz already had among them (so nobody MusicBrainz knows is dropped)."""
+    info = discogs_artists or {}
+    artists = info.get('artists') or []
+    if len(artists) < 2 or not all(a.get('mbid') and a.get('name') for a in artists):
+        return None
+    if not (same_artist_name(value, info.get('credit'))
+            or credit_matches_names(value, [a['name'] for a in artists])):
+        return None
+    if not set(mb_ids) <= {a['mbid'] for a in artists}:
+        return None
+    return artists
 
 
 def clean_artist_name(name: str) -> str:
@@ -671,7 +762,11 @@ def extract_discogs_fields(release: dict[str, Any]) -> dict[str, str | list[str]
     if country := release.get('country'):
         # Picard's tag is 'releasecountry', not 'country' — see
         # picard/util/tags.py and mbjson.py's own country->releasecountry map.
-        out['releasecountry'] = country
+        # Picard stores an ISO code ("IT"), Discogs a name ("Italy"): convert, and
+        # write nothing for names that span countries ("UK & Europe").
+        code = country_code(country)
+        if code:
+            out['releasecountry'] = code
 
     if formats := release.get('formats'):
         format_descriptions = []
@@ -1483,10 +1578,12 @@ def explain_release_match(candidate: dict[str, Any],
     if mb_year.isdigit():
         judge('year', str(candidate.get('year') or '')[:4] == mb_year, _SCORE_YEAR)
 
-    mb_country = str(mb.get('releasecountry') or '').strip().casefold()
+    # MusicBrainz holds a code ("IT"), Discogs a name ("Italy"); compare as codes.
+    mb_country = (country_code(mb.get('releasecountry'))
+                  or str(mb.get('releasecountry') or '').strip()).casefold()
     if mb_country:
         judge('country',
-              str(candidate.get('country') or '').strip().casefold() == mb_country,
+              (country_code(candidate.get('country')) or str(candidate.get('country') or '').strip()).casefold() == mb_country,
               _SCORE_COUNTRY)
 
     mb_media = str(mb.get('media') or '').strip().casefold()

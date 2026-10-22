@@ -146,6 +146,15 @@ Whenever the plugin applies a Discogs release it settles each artist field
   so the album is listed under every collaborator and no artist page is
   renamed. A single artist, or a group that is one MusicBrainz artist
   (`Simon & Garfunkel`), is left as it is.
+- **Discogs credits more artists than MusicBrainz** (MusicBrainz's credit is
+  missing a collaborator, e.g. *Croatian Variations*: MusicBrainz credits
+  `Blaine L. Reininger`, Discogs `Steven Brown & Blaine L. Reininger`): the
+  plugin looks up each Discogs artist's MusicBrainz ID through the Discogs
+  link on their MusicBrainz artist page — an exact match, not a name guess,
+  and no Discogs requests. When every artist is found, and MusicBrainz's own
+  artists are among them, all are written — `Steven Brown`,
+  `Blaine L. Reininger` — each with its ID and sort name, in Discogs' order.
+  If any artist cannot be found, the rules below apply unchanged.
 - **Named differently** (Discogs' "credited as" short names such as
   `Adams / Reich - Solisti New York, Ransom Wilson`, a different spelling,
   or other people) **and MusicBrainz has an ID for every artist**:
@@ -160,6 +169,15 @@ Whenever the plugin applies a Discogs release it settles each artist field
 
 Release and recording IDs are never touched, so the file stays re-matchable
 in Picard.
+
+Role credits (composer, arranger, producer, performer, …) use each artist's
+own name, not the sleeve's "credited as" spelling (often a surname alone), so
+they merge with MusicBrainz's names instead of listing the same person twice.
+
+**Release country** is written as the code Picard and MusicBrainz use (`IT`,
+`GB`, `XE` for Europe, `XW` for Worldwide), converted from Discogs' name
+(`Italy`, `UK`, `Europe`). A Discogs country that spans several countries
+(`UK & Europe`) has no code, so the existing value is left alone.
 
 ### Collaborations on every album
 

@@ -21,11 +21,18 @@ from PyQt6.QtNetwork import QNetworkRequest
 from .discogs_runtime import log, settings
 
 from .discogs_logging import plugin_log, timed
+from .discogs_mapping import (
+    artist_from_mb_url_lookup,
+    discogs_release_artists,
+    format_artist_credit,
+    release_artists_for,
+    remember_release_artists,
+)
 from picard.webservice import WSRequest
 
 DISCOGS_HOST = 'api.discogs.com'
 MUSICBRAINZ_HOST = 'musicbrainz.org'
-USER_AGENT = 'PicardDiscogsEnrichment/0.3.5 +https://github.com/herculepirate/picard-discogs-enrichment'
+USER_AGENT = 'PicardDiscogsEnrichment/0.3.6 +https://github.com/herculepirate/picard-discogs-enrichment'
 
 
 # Process-wide response cache. Tagging a box set, re-running a lookup, or
@@ -36,9 +43,15 @@ _RESPONSE_CACHE: dict = {}
 _CACHE_LIMIT = 256
 
 
+# Discogs artist id -> {'mbid', 'name', 'sort'} or None (no MusicBrainz artist links to it)
+_ARTIST_MBID_CACHE: dict = {}
+_ARTIST_LOOKUP_TIMEOUT_MS = 30000
+
+
 def clear_cache() -> None:
     """Drop everything cached. Exposed so a user can force fresh data."""
     _RESPONSE_CACHE.clear()
+    _ARTIST_MBID_CACHE.clear()
 
 
 class DiscogsClient:
@@ -542,9 +555,83 @@ class DiscogsClient:
                 log.warning('Discogs Enrichment: release response was not JSON as expected: %r', document)
                 handler(None)
                 return
-            handler(document)
+            # Before handing the release over, find the MusicBrainz ID of each of its
+            # artists, so a collaborator MusicBrainz's credit is missing can be added
+            # with the right ID (see settle_artist_credits()).
+            self.resolve_release_artists(document, lambda: handler(document))
 
         self._get(path, _on_response)
+
+    def resolve_release_artists(self, release: dict, done: Callable[[], None]) -> None:
+        """Look up the MusicBrainz artist linked to each Discogs release artist (by the
+        artist's Discogs page, exact), remember the result for the release, then call
+        done() exactly once. Releases with one artist need nothing. Any failure, or no
+        answer within 30 s, still calls done(): the lookup can only add information."""
+        state = {'called': False}
+
+        def finish():
+            if not state['called']:
+                state['called'] = True
+                done()
+
+        try:
+            release_id = release.get('id')
+            artists = discogs_release_artists(release)
+            if len(artists) < 2 or release_artists_for(release_id) is not None:
+                finish()
+                return
+            results: list = [None] * len(artists)
+            pending = {'n': len(artists)}
+
+            def store(index, found):
+                results[index] = found
+                pending['n'] -= 1
+                if pending['n'] == 0 and not state['called']:
+                    resolved = [{'mbid': (r or {}).get('mbid', ''),
+                                 'name': (r or {}).get('name') or name,
+                                 'sort': (r or {}).get('sort', '')}
+                                for r, (_aid, name) in zip(results, artists)]
+                    remember_release_artists(release_id, {
+                        'credit': format_artist_credit(release.get('artists')),
+                        'artists': resolved})
+                    missing = [name for r, (_aid, name) in zip(results, artists) if not r]
+                    log.debug('Discogs Enrichment: MusicBrainz artists for Discogs release %s: '
+                              '%d of %d found%s', release_id, len(artists) - len(missing),
+                              len(artists), f' (not linked: {missing})' if missing else '')
+                    finish()
+
+            QTimer.singleShot(_ARTIST_LOOKUP_TIMEOUT_MS, finish)
+            for index, (artist_id, _name) in enumerate(artists):
+                self.find_musicbrainz_artist(artist_id, lambda found, i=index: store(i, found))
+        except Exception:
+            log.debug('Discogs Enrichment: artist lookup failed', exc_info=True)
+            finish()
+
+    def find_musicbrainz_artist(self, discogs_artist_id, handler) -> None:
+        """Which MusicBrainz artist links to this Discogs artist page? handler(dict|None).
+        Exact (MusicBrainz's own URL relationship), cached, and costs no Discogs requests."""
+        if discogs_artist_id in _ARTIST_MBID_CACHE:
+            found = _ARTIST_MBID_CACHE[discogs_artist_id]
+            QTimer.singleShot(0, lambda: handler(found))
+            return
+        resource = f'https://www.discogs.com/artist/{discogs_artist_id}'
+        path = '/ws/2/url?resource=' + quote(resource, safe='') + '&inc=artist-rels&fmt=json'
+
+        def _on_response(document, reply, error):
+            found = None if error else artist_from_mb_url_lookup(document)
+            _ARTIST_MBID_CACHE[discogs_artist_id] = found
+            handler(found)
+
+        request = WSRequest(
+            method='GET',
+            url=QUrl(f'https://{MUSICBRAINZ_HOST}{path}'),
+            handler=self._never_raise(_on_response),
+            parse_response_type='json',
+            priority=True,
+            important=False,
+        )
+        log.debug('Discogs Enrichment: MusicBrainz artist lookup for Discogs artist %s', discogs_artist_id)
+        self._webservice.add_request(request)
 
     def get_master(self, master_id, handler: Callable[[dict[str, Any] | None], None]) -> None:
         """Fetch a Discogs master release — used to find the earliest known
