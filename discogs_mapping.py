@@ -1530,10 +1530,19 @@ CONFIDENT_SCORE = 50
 
 def _norm_code(value: str) -> str:
     """Normalise a barcode/catalogue number for comparison: strip spaces,
-    dashes and dots, casefold. Discogs and MusicBrainz punctuate these
-    inconsistently ("PB 41447" vs "PB-41447").
+    dashes and dots, casefold, and drop leading zeros inside numbers.
+    Discogs and MusicBrainz punctuate and pad these inconsistently:
+    "PB 41447" vs "PB-41447", "CHARRMCD03" vs "CHARRMCD3", and a UPC is
+    the same barcode as its EAN with a leading 0.
     """
-    return re.sub(r'[\s\-.]', '', fold_for_compare(value))
+    text = re.sub(r'[\s\-.]', '', fold_for_compare(value))
+    return re.sub(r'(?<!\d)0+(?=\d)', '', text)
+
+
+def _codes(value) -> set[str]:
+    """Every catalogue number in a value: Picard joins several with "; "."""
+    values = value if isinstance(value, (list, tuple)) else re.split(r'\s*;\s*', str(value or ''))
+    return {_norm_code(v) for v in values if _norm_code(v)}
 
 
 def explain_release_match(candidate: dict[str, Any],
@@ -1569,10 +1578,10 @@ def explain_release_match(candidate: dict[str, Any],
         candidate_barcodes = {_norm_code(b) for b in (raw if isinstance(raw, list) else [raw])}
         judge('barcode', mb_barcode in candidate_barcodes, _SCORE_BARCODE)
 
-    mb_catno = _norm_code(mb.get('catalognumber'))
-    if mb_catno:
+    mb_catnos = _codes(mb.get('catalognumber'))
+    if mb_catnos:
         judge('catalogue number',
-              _norm_code(candidate.get('catno')) == mb_catno, _SCORE_CATNO)
+              bool(_codes(candidate.get('catno')) & mb_catnos), _SCORE_CATNO)
 
     mb_year = str(mb.get('date') or '')[:4]
     if mb_year.isdigit():
