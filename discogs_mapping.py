@@ -965,6 +965,13 @@ def parse_discs(release: dict[str, Any]) -> list[dict]:
     # Headings also mark SECTIONS within one disc ("Women", "Side A", a suite). When the
     # release's formats declare a single disc, the headings cannot be disc boundaries.
     declared = _declared_disc_total(release)
+    if declared is not None and 1 < declared < len(discs):
+        # More sections than the formats have discs ("CD 1 - Album", "SIDE A", "SIDE B",
+        # "CD 2 - Instrumentals" on a 2-CD release): only headings that name a disc start
+        # one; the others are sections inside it.
+        by_disc_heading = _split_at_disc_headings(tracklist)
+        if by_disc_heading is not None:
+            discs = by_disc_heading
     if len(discs) > 1 and declared == 1:
         discs = [{'number': 1, 'title': '',
                   'tracks': [track for disc in discs for track in disc['tracks']]}]
@@ -974,6 +981,51 @@ def parse_discs(release: dict[str, Any]) -> list[dict]:
     if not discs:
         return []
     return discs
+
+
+_DISC_NUMBER_WORDS = ('one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve'
+                      '|i|ii|iii|iv|v|vi|vii|viii|ix|x|xi|xii')
+_DISC_HEADING_RE = re.compile(
+    r'^\s*(?:'
+    r'(?:cd|disc|disk|dvd|sacd|bd|blu-?ray)'
+    r'(?:[\s\-.#:]*\d+\b|[\s\-.#:]+(?:' + _DISC_NUMBER_WORDS + r')\b)'
+    r'|(?:bonus|extra)\s+(?:cd|disc|disk|dvd|sacd|blu-?ray)\b'
+    r')', re.IGNORECASE)
+
+
+def _names_a_disc(title: str) -> bool:
+    """True for a heading that names a disc ("CD 1", "CD2", "Disc Two", "CD 2 -
+    Instrumentals", "Bonus CD"); False for a section ("SIDE A", "Part I", "Women")."""
+    return bool(_DISC_HEADING_RE.match(title or ''))
+
+
+def _split_at_disc_headings(tracklist: list[dict]) -> list[dict] | None:
+    """Discs started only by headings that name a disc, other headings ignored. None when
+    no heading names a disc, so the caller keeps its own split."""
+    discs: list[dict] = []
+    current: dict | None = None
+    named = False
+    for entry in tracklist:
+        etype = entry.get('type_') or 'track'
+        if etype == 'heading':
+            title = (entry.get('title') or '').strip()
+            if not _names_a_disc(title):
+                continue
+            named = True
+            if current is not None and not current['tracks']:
+                current['title'] = title     # consecutive disc headings: the last one names it
+                continue
+            current = {'number': len(discs) + 1, 'title': title, 'tracks': []}
+            discs.append(current)
+        elif etype == 'track':
+            if current is None:
+                current = {'number': 1, 'title': '', 'tracks': []}
+                discs.append(current)
+            current['tracks'].append(entry)
+    if not named:
+        return None
+    discs = [d for d in discs if d['tracks']]
+    return discs or None
 
 
 _SUB_DISC_RE = re.compile(r'^\s*(?:[A-Za-z]{1,4})?(\d+)\s*-\s*\d+', re.IGNORECASE)

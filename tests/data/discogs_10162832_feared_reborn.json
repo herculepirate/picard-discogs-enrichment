@@ -1,0 +1,197 @@
+{
+ "_note": "Shape of Discogs release 10162832 (Feared - Reborn): formats and tracklist structure as Discogs lists them; track titles are placeholders.",
+ "id": 10162832,
+ "title": "Reborn",
+ "artists": [
+  {
+   "name": "Feared",
+   "id": 0
+  }
+ ],
+ "formats": [
+  {
+   "name": "CD",
+   "qty": "1",
+   "descriptions": [
+    "Album"
+   ]
+  },
+  {
+   "name": "CD",
+   "qty": "1",
+   "descriptions": [
+    "Album"
+   ]
+  }
+ ],
+ "tracklist": [
+  {
+   "type_": "heading",
+   "position": "",
+   "title": "CD 1 - Album",
+   "duration": ""
+  },
+  {
+   "type_": "heading",
+   "position": "",
+   "title": "SIDE A",
+   "duration": ""
+  },
+  {
+   "type_": "track",
+   "position": "1",
+   "title": "Album Side A Track 1",
+   "duration": ""
+  },
+  {
+   "type_": "track",
+   "position": "2",
+   "title": "Album Side A Track 2",
+   "duration": ""
+  },
+  {
+   "type_": "track",
+   "position": "3",
+   "title": "Album Side A Track 3",
+   "duration": ""
+  },
+  {
+   "type_": "track",
+   "position": "4",
+   "title": "Album Side A Track 4",
+   "duration": ""
+  },
+  {
+   "type_": "track",
+   "position": "5",
+   "title": "Album Side A Track 5",
+   "duration": ""
+  },
+  {
+   "type_": "track",
+   "position": "6",
+   "title": "Album Side A Track 6",
+   "duration": ""
+  },
+  {
+   "type_": "heading",
+   "position": "",
+   "title": "SIDE B",
+   "duration": ""
+  },
+  {
+   "type_": "track",
+   "position": "1",
+   "title": "Album Side B Track 1",
+   "duration": ""
+  },
+  {
+   "type_": "track",
+   "position": "2",
+   "title": "Album Side B Track 2",
+   "duration": ""
+  },
+  {
+   "type_": "track",
+   "position": "3",
+   "title": "Album Side B Track 3",
+   "duration": ""
+  },
+  {
+   "type_": "track",
+   "position": "4",
+   "title": "Album Side B Track 4",
+   "duration": ""
+  },
+  {
+   "type_": "track",
+   "position": "5",
+   "title": "Album Side B Track 5",
+   "duration": ""
+  },
+  {
+   "type_": "track",
+   "position": "6",
+   "title": "Album Side B Track 6",
+   "duration": ""
+  },
+  {
+   "type_": "heading",
+   "position": "",
+   "title": "CD 2 - Instrumentals",
+   "duration": ""
+  },
+  {
+   "type_": "track",
+   "position": "1",
+   "title": "Instrumental 1",
+   "duration": ""
+  },
+  {
+   "type_": "track",
+   "position": "2",
+   "title": "Instrumental 2",
+   "duration": ""
+  },
+  {
+   "type_": "track",
+   "position": "3",
+   "title": "Instrumental 3",
+   "duration": ""
+  },
+  {
+   "type_": "track",
+   "position": "4",
+   "title": "Instrumental 4",
+   "duration": ""
+  },
+  {
+   "type_": "track",
+   "position": "5",
+   "title": "Instrumental 5",
+   "duration": ""
+  },
+  {
+   "type_": "track",
+   "position": "6",
+   "title": "Instrumental 6",
+   "duration": ""
+  },
+  {
+   "type_": "track",
+   "position": "7",
+   "title": "Instrumental 7",
+   "duration": ""
+  },
+  {
+   "type_": "track",
+   "position": "8",
+   "title": "Instrumental 8",
+   "duration": ""
+  },
+  {
+   "type_": "track",
+   "position": "9",
+   "title": "Instrumental 9",
+   "duration": ""
+  },
+  {
+   "type_": "track",
+   "position": "10",
+   "title": "Instrumental 10",
+   "duration": ""
+  },
+  {
+   "type_": "track",
+   "position": "11",
+   "title": "Instrumental 11",
+   "duration": ""
+  },
+  {
+   "type_": "track",
+   "position": "12",
+   "title": "Instrumental 12",
+   "duration": ""
+  }
+ ]
+}
