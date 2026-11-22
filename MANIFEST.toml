@@ -2,7 +2,7 @@ uuid = "dd789f69-332f-498a-af94-d8e3273cc435"
 name = "Discogs Enrichment"
 description = "Tag from Discogs alongside or instead of MusicBrainz, with a release picker, box-set disc mapping and cover art."
 api = ["3.0"]
-version = "0.4.2"
+version = "0.5.0"
 authors = ["herculepirate"]
 maintainers = ["herculepirate"]
 license = "GPL-2.0-or-later"
@@ -15,8 +15,8 @@ Adds Discogs as a metadata source next to MusicBrainz, for the releases
 MusicBrainz covers thinly — specific pressings, small labels, reissues and
 box sets.
 
-**Choosing a release.** Searching Discogs opens a sortable table rather than
-silently taking the top hit: artist, title, year, country, medium, disc and
+**Choosing a release.** Searching Discogs opens a sortable table, not
+the top hit: artist, title, year, country, medium, disc and
 track counts, edition markers (Reissue, Remastered, Deluxe), label,
 catalogue number and community have/want counts. A Match column scores each
 candidate against what Picard already knows — barcode, catalogue number,
@@ -33,17 +33,18 @@ is applied on its own only when your copy proves it, MusicBrainz links it, or
 it carries the matched release's barcode, with nothing of your copy against
 it. Otherwise the release picker asks you, one album at a time.
 
+**The web, off by default.** Empty genres and credits, cover art, lyrics and
+albums no database has, from Deezer, iTunes, Bandcamp, Wikipedia, VGMdb and
+LRCLIB, each only when every track's length fits your files.
+
 **Four tag sources.** Discogs only, MusicBrainz only, Discogs preferred, or
 MusicBrainz preferred. Each is exact about what it overwrites and what it
 leaves alone, and single-valued fields never get two sources concatenated
 into one tag.
 
-**Box sets.** Maps the discs Picard has onto the discs Discogs lists, with a
-confidence score per pairing and manual override.
+**Box sets.** Maps Picard's discs onto Discogs', with manual override.
 
-**Cover art** downloads front, front+back or every image, and a size-capped
-troubleshooting log can be switched between basic and detailed and saved
-from the settings page.
+**Cover art** (front, front+back or every image) and a troubleshooting log.
 
 Requires a free Discogs personal access token, set under
 Options → Plugins → Discogs Enrichment.

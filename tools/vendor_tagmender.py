@@ -44,10 +44,11 @@ MODULES = {
     "ocr_order": "ocr_order.py",
     "ma": "match_albums.py",
     "engine": "engine.py",
+    "web": "web_tag.py",
 }
 # other spellings of the same modules in TagMender's imports
 ALIASES = {"exclusions": "ex", "match_albums": "ma", "engine": "engine", "tagio": "tagio",
-           "companions": "companions", "ocr_order": "ocr_order"}
+           "companions": "companions", "ocr_order": "ocr_order", "web_tag": "web"}
 
 # what the plugin calls (through discogs_evidence.py); everything they reach comes along
 ROOTS = {
@@ -65,6 +66,16 @@ ROOTS = {
         "AuthError",
         # merging what the OCR helper read (discogs_ocr.merge_scans): pure text work
         "split_documents", "drop_file_name_lines", "scan_catnos", "labels_from_text",
+    ],
+}
+
+# the web sources (discogs_web): TagMender's web_tag.py - Deezer, iTunes, Bandcamp, Wikipedia,
+# Wikidata - and the tags it writes from a proven web album
+WEB_ROOTS = {
+    "web": [
+        "deezer", "itunes", "bandcamp", "bandcamp_album", "wikipedia", "SOURCES", "chosen_sources",
+        "album_candidates", "tags_for", "genre_list", "physical_copy", "track_artists",
+        "wikidata_artist_ids", "artist_ids",
     ],
 }
 
@@ -210,6 +221,7 @@ def build(root: Path) -> dict[str, str]:
     return {"tm_match_core.py": hdr + core,
             "tm_readers.py": _closure(mods, ROOTS, hdr),
             "tm_ocr.py": _closure(mods, OCR_ROOTS, hdr),
+            "tm_web.py": _closure(mods, WEB_ROOTS, hdr),
             "tm_ocr_order.json": (root / "assets" / "ocr_order.json").read_text()}
 
 

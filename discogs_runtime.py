@@ -64,6 +64,14 @@ DEFAULTS: dict[str, Any] = {
     # your scans and PDF booklets read (OCR, on your system's Python: discogs_ocr_helper)
     'ocr_scans': True,
     'ocr_max_images': 15,
+    # web sources (discogs_web): off by default. Fill empty genres/credits and add cover art from
+    # the first source that proves the album; lyrics from LRCLIB where a track has none.
+    'web_sources': False,
+    'web_source_list': '',
+    'web_fill_tags': True,
+    'web_cover_art': True,
+    'web_lyrics': False,
+    'web_synced_lyrics': False,
     'log_level': 'basic',
     'log_max_kb': '2048',
     'prefer_original_date': False,

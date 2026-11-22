@@ -34,6 +34,11 @@ year, a vinyl or SACD rip, and the barcode and catalogue number printed on
 your scans and PDF booklets (OCR). Discogs is searched by these first and its
 releases ranked against them. See [Your copy's evidence](#your-copys-evidence).
 
+**The web, where MusicBrainz and Discogs fall short** (off by default):
+empty genres and credits, cover art, lyrics, and albums no database has, from
+Deezer, iTunes, Bandcamp, Wikipedia, VGMdb and LRCLIB — each used only when
+every track's length fits your files. See [Web sources](#web-sources).
+
 **Four tag sources**, each exact about what it overwrites. See
 [Tag sources](#tag-sources).
 
@@ -338,6 +343,55 @@ PDF booklets (OCR)"**.
 
 ---
 
+## Web sources
+
+Off by default: **Options → Plugins → Discogs Enrichment → Web sources**.
+They are TagMender's (`web_tag`), plus VGMdb and LRCLIB:
+
+| Source | Through | What it is good for |
+| --- | --- | --- |
+| Deezer, iTunes | their public catalogue APIs | genres, front covers (iTunes up to 3000 px) |
+| Bandcamp | Bandcamp's own search, and the album data its pages publish for search engines | independent releases, their tags as genres |
+| Wikipedia | the MediaWiki API (infobox and track listing) | genres of older and well-known albums |
+| VGMdb | [vgmdb.info](https://vgmdb.info)'s JSON | game and anime soundtracks, Japanese releases: composer, arranger and lyricist credits, scans |
+| LRCLIB | [lrclib.net](https://lrclib.net)'s API | lyrics |
+
+**The proof.** A web album is used only when TagMender's matcher is sure of
+it: artist, title, track count and every track's length fit your files (or,
+before the files are attached, the matched MusicBrainz release). The sources
+are asked in the order you list them, and the first that proves the album is
+used.
+
+**What it fills.** On an album MusicBrainz matched: only tags nothing else
+gave — the genre, and VGMdb's composer, arranger and lyricist. Never a
+pressing's label, barcode or catalogue number (a shop's album is the album,
+not your pressing). When Discogs later supplies a tag the web filled, Discogs'
+value replaces it.
+
+**Cover art.** A provider named **"Web (Deezer, iTunes, Bandcamp, VGMdb)"**
+offers the proven album's front cover (VGMdb's back and booklet scans too,
+with the art scope set to more than the front). Enable it, and place it,
+under **Options → Cover Art**; like every provider it runs only while no
+earlier one found a front cover.
+
+**Lyrics** ("Lyrics from LRCLIB, where a track has none"): LRCLIB's lyrics
+for that very track — its artist and title, and its length within two seconds
+of yours (a live version is another recording). Plain lyrics, or LRC
+time-synced ones with "Prefer time-synced lyrics".
+
+**Albums no database has.** Right-click a cluster MusicBrainz finds nothing
+for → **Tag from the web…**: the first source that proves the album gives
+album, album artist, track artists, titles, numbers, date and genre (a shop's
+barcode only when your copy is that download), after you confirm. Save in
+Picard to keep them.
+
+No search engine's page is read, nor any site whose terms forbid automated
+reading; every request goes through Picard's web service, one a second per
+site. *vgmdb.info* depends on VGMdb.net, which now sits behind Cloudflare, so
+it may be unreachable; it is then skipped and the troubleshooting log says so.
+
+---
+
 ## Troubleshooting
 
 **"Failed to update the plugin … has uncommitted changes".** Files in the
@@ -382,7 +436,7 @@ Pure logic lives in `discogs_mapping.py`, `discogs_evidence.py` and
 `discogs_decide.py` with no Qt
 or Picard imports, so it can be tested directly (`python3 tests/test_*.py`).
 
-`tm_match_core.py`, `tm_readers.py`, `tm_ocr.py` and `tm_ocr_order.json` are
+`tm_match_core.py`, `tm_readers.py`, `tm_ocr.py`, `tm_web.py` and `tm_ocr_order.json` are
 **generated** from a
 [TagMender](https://github.com/herculepirate/tagmender) checkout by
 `tools/vendor_tagmender.py`: its pressing scorer verbatim, and the folder
@@ -410,6 +464,9 @@ tm_ocr.py, tm_ocr_order.json  generated from TagMender: scan and document readin
 discogs_ocr_helper.py    reads the scans on your system's Python; prints JSON
 discogs_ocr_bridge.py    starts the helper (flatpak-spawn --host in a Flatpak)
 discogs_ocr.py           pure logic — what the scans read, added as TagMender adds it
+tm_web.py                generated from TagMender: web sources (web_tag)
+discogs_web.py           pure logic — web sources, VGMdb, LRCLIB, the proof
+discogs_webenrich.py     web sources in Picard: fills, lyrics, cover art, cluster action
 tools/vendor_tagmender.py  regenerates the tm_* files
 tools/library_check.py   what the plugin reads and decides, over a music folder
 discogs_client.py        Discogs API over Picard's web service

@@ -70,6 +70,8 @@ class PicardHttp:
         return box.get('document'), box.get('error')
 
     def get_json(self, url: str, host: str) -> dict | None:
+        if host == 'discogs' and self.client is None:
+            return None                               # (no token: Discogs is not asked)
         if host == 'discogs':
             path = url.split(DISCOGS_HOST, 1)[1] if DISCOGS_HOST in url else url
             if path not in _RESPONSE_CACHE:
@@ -105,18 +107,21 @@ class Worker:
     keep Discogs' rate steady, and Picard's own thread pool (file loading) is never blocked
     by a look-up waiting on the network."""
 
-    _instance: 'Worker | None' = None
+    _instances: dict[str, 'Worker'] = {}
 
-    def __init__(self) -> None:
+    def __init__(self, name: str = 'discogs') -> None:
         self._jobs: queue.Queue = queue.Queue()
-        self._thread = threading.Thread(target=self._run, name='discogs-enrichment', daemon=True)
+        self._thread = threading.Thread(target=self._run, name=f'discogs-enrichment-{name}', daemon=True)
         self._thread.start()
 
     @classmethod
-    def shared(cls) -> 'Worker':
-        if cls._instance is None or not cls._instance._thread.is_alive():
-            cls._instance = cls()
-        return cls._instance
+    def shared(cls, name: str = 'discogs') -> 'Worker':
+        """The worker of that name: "discogs" (folder, scans, Discogs), "web" (web sources: never
+        held up behind a long scan reading)."""
+        w = cls._instances.get(name)
+        if w is None or not w._thread.is_alive():
+            w = cls._instances[name] = cls(name)
+        return w
 
     def submit(self, job: Callable[[], Any], then: Callable[..., None]) -> None:
         """Run JOB on the worker; then THEN(result=...) or THEN(error=...) on the main thread."""

@@ -90,6 +90,9 @@ from .discogs_decide import decide, match_detail, release_row
 from .discogs_decide import explain as explain_verdict
 from .discogs_http_bridge import PicardHttp, Worker
 from .discogs_ocr import merge_scans, scans_summary
+from .discogs_webenrich import (CoverArtProviderWeb, WebTagClusterAction, drop_web_fills,
+                                enrich_album)
+from .discogs_webenrich import apply_to_late_file as _web_late_file
 from .discogs_ocr_bridge import OcrBridge, partial_message, unavailable_message
 from . import discogs_mapping as _dm
 from .tm_readers import mb_linked_discogs_ids
@@ -446,6 +449,10 @@ def apply_to_late_file(api, track, file) -> None:
     MusicBrainz left and never sees the Discogs fields.
     """
     album = getattr(track, 'album', None)
+    try:
+        _web_late_file(track, file)
+    except Exception:
+        log.debug('Discogs Enrichment: web data for a late file failed', exc_info=True)
     entry = _APPLIED_BY_ALBUM.get(id(album)) if album is not None else None
     if not entry:
         return
@@ -651,6 +658,12 @@ def process_album(api, album, metadata, release) -> None:
                          f'[date={metadata.get("date")} barcode={metadata.get("barcode")} '
                          f'catno={metadata.get("catalognumber")} country={metadata.get("releasecountry")}]')
 
+    # the web sources (off by default) and lyrics: on their own worker, whatever Discogs does
+    try:
+        enrich_album(album, metadata, release, op, _album_metadata_targets, _refresh_album_ui)
+    except Exception:
+        log.error('Discogs Enrichment: web sources failed to start', exc_info=True)
+
     if (settings['merge_mode'] or MODE_COMBINE) == MODE_MB_ONLY:
         plugin_log.decision(op, 'tag source is MusicBrainz only \u2014 no Discogs lookup')
         return
@@ -713,6 +726,8 @@ def process_album(api, album, metadata, release) -> None:
             # tags while the manual search did.
             targets = _album_metadata_targets(album, metadata)
             track_fields = _album_track_fields(album, release_data)
+            # what the web filled and Discogs now supplies is Discogs' (the web fills only gaps)
+            drop_web_fills(album, targets, set(fields) | {k for v in track_fields.values() for k in v})
             discogs_only = (settings['merge_mode'] or MODE_COMBINE) == MODE_DISCOGS_ONLY
 
             for target, track_key in targets:
@@ -1299,6 +1314,34 @@ class DiscogsOptionsPage(OptionsPage):
                     self.picker_when_unsure_checkbox, self.ocr_scans_checkbox):
             layout.addWidget(box)
 
+        # --- web sources -------------------------------------------------
+        layout.addWidget(_section_label(self, 'Web sources (where MusicBrainz and Discogs fall short)'))
+        self.web_sources_checkbox = QtWidgets.QCheckBox(
+            'Fill empty genres and credits, and add cover art, from the web', self)
+        self.web_sources_checkbox.setToolTip(
+            'Deezer, iTunes, Bandcamp, Wikipedia and VGMdb (through vgmdb.info), as TagMender\n'
+            'uses them: an album is used only when its artist, title, track count and every\n'
+            'track\'s length fit your files. It then fills only tags nothing else gave (genre;\n'
+            'VGMdb\'s composer, arranger and lyricist), never a pressing\'s label, barcode or\n'
+            'catalogue number, and offers its front cover as cover art (Options > Cover Art,\n'
+            '"Web"). Discogs replaces what it also supplies. Right-click a cluster MusicBrainz\n'
+            'has no release for: "Tag from the web\u2026".')
+        self.web_source_list_edit = QtWidgets.QLineEdit(self)
+        self.web_source_list_edit.setPlaceholderText('Deezer, iTunes, Bandcamp, Wikipedia, VGMdb')
+        self.web_source_list_edit.setToolTip('The sources asked, in this order; the first that proves the album is used.')
+        self.web_lyrics_checkbox = QtWidgets.QCheckBox('Lyrics from LRCLIB, where a track has none', self)
+        self.web_lyrics_checkbox.setToolTip(
+            'LRCLIB\'s lyrics of that very track: its artist and title, and its length within two\n'
+            'seconds of yours. Written to the lyrics tag only when it is empty.')
+        self.web_synced_checkbox = QtWidgets.QCheckBox('Prefer time-synced lyrics (LRC)', self)
+        layout.addWidget(self.web_sources_checkbox)
+        row = QtWidgets.QHBoxLayout()
+        row.addWidget(QtWidgets.QLabel('Sources, in order:', self))
+        row.addWidget(self.web_source_list_edit)
+        layout.addLayout(row)
+        layout.addWidget(self.web_lyrics_checkbox)
+        layout.addWidget(self.web_synced_checkbox)
+
         # --- troubleshooting log -----------------------------------------
         layout.addWidget(_section_label(self, 'Troubleshooting log'))
         log_row = QtWidgets.QHBoxLayout()
@@ -1477,6 +1520,10 @@ class DiscogsOptionsPage(OptionsPage):
         self.folder_evidence_checkbox.setChecked(True)
         self.picker_when_unsure_checkbox.setChecked(True)
         self.ocr_scans_checkbox.setChecked(True)
+        self.web_sources_checkbox.setChecked(False)
+        self.web_source_list_edit.setText('')
+        self.web_lyrics_checkbox.setChecked(False)
+        self.web_synced_checkbox.setChecked(False)
         _select_by_data(self.style_combo, STYLE_SEPARATE)
         _select_by_data(self.strictness_combo, STRICTNESS_NORMAL)
         _select_by_data(self.log_level_combo, LEVEL_BASIC)
@@ -1515,6 +1562,10 @@ class DiscogsOptionsPage(OptionsPage):
         self.folder_evidence_checkbox.setChecked(bool(s['folder_evidence']))
         self.picker_when_unsure_checkbox.setChecked(bool(s['picker_when_unsure']))
         self.ocr_scans_checkbox.setChecked(bool(s['ocr_scans']))
+        self.web_sources_checkbox.setChecked(bool(s['web_sources']))
+        self.web_source_list_edit.setText(str(s['web_source_list'] or ''))
+        self.web_lyrics_checkbox.setChecked(bool(s['web_lyrics']))
+        self.web_synced_checkbox.setChecked(bool(s['web_synced_lyrics']))
         _select_by_data(self.style_combo, s['style_mode'] or STYLE_SEPARATE)
         _select_by_data(self.strictness_combo, s['strictness'] or STRICTNESS_NORMAL)
         _select_by_data(self.log_level_combo, s['log_level'] or LEVEL_BASIC)
@@ -1553,6 +1604,10 @@ class DiscogsOptionsPage(OptionsPage):
         s['folder_evidence'] = self.folder_evidence_checkbox.isChecked()
         s['picker_when_unsure'] = self.picker_when_unsure_checkbox.isChecked()
         s['ocr_scans'] = self.ocr_scans_checkbox.isChecked()
+        s['web_sources'] = self.web_sources_checkbox.isChecked()
+        s['web_source_list'] = self.web_source_list_edit.text().strip()
+        s['web_lyrics'] = self.web_lyrics_checkbox.isChecked()
+        s['web_synced_lyrics'] = self.web_synced_checkbox.isChecked()
         s['style_mode'] = self.style_combo.currentData()
         s['strictness'] = self.strictness_combo.currentData()
         s['log_level'] = self.log_level_combo.currentData()
@@ -2426,13 +2481,15 @@ def enable(api) -> None:
     api.register_album_action(DiscogsSearchAction)
     api.register_file_action(DiscogsSearchAction)
     api.register_cluster_action(DiscogsSearchClusterAction)
+    api.register_cluster_action(WebTagClusterAction)
 
     # Cover art is a bonus. If the provider API differs on this build,
     # tagging still has to work, so a failure here is logged, not raised.
     try:
         from .discogs_coverart import CoverArtProviderDiscogs
         api.register_cover_art_provider(CoverArtProviderDiscogs)
-        log.debug('Discogs Enrichment: cover art provider registered')
+        api.register_cover_art_provider(CoverArtProviderWeb)
+        log.debug('Discogs Enrichment: cover art providers registered')
     except Exception:
         log.warning('Discogs Enrichment: could not register the cover art provider',
                     exc_info=True)
