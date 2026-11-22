@@ -1689,6 +1689,8 @@ def describe_match(detail: dict[str, Any]) -> tuple[str, str]:
     The label goes in the picker's Match column; the explanation is its
     tooltip and detail-pane line.
     """
+    if detail and detail.get('label') and 'text' in detail:
+        return detail['label'], detail['text']      # (discogs_decide.match_detail: TagMender's)
     if not detail or not detail.get('comparable'):
         return '', ('Nothing to compare against — Picard has no barcode, '
                     'catalogue number, year, country or medium for these files.')

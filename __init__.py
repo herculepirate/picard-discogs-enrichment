@@ -39,7 +39,6 @@ from .discogs_runtime import bind_api, get_api, log, settings, unbind_api
 # is done through the api object handed to enable(), not by importing
 # register_* functions.
 from picard.plugin3.api import BaseAction, OptionsPage
-from picard.util.thread import run_task
 
 from .discogs_client import DiscogsClient, clear_cache
 from .discogs_logging import (LEVEL_BASIC, LEVEL_DETAILED, LEVEL_OFF,
@@ -85,8 +84,13 @@ from .discogs_mapping import (
 )
 from .discogs_disc_dialog import CONFIDENT_DISC_SCORE, DiscMappingDialog, auto_map
 from .discogs_evidence import (album_location, contradicts_release, copy_evidence,
-                               discid_verdict, evidence_summary, match_facts,
+                               discid_verdict, evidence_summary, has_copy_evidence, match_facts,
                                mb_release_discids, read_copy, search_terms)
+from .discogs_decide import decide, match_detail, release_row
+from .discogs_decide import explain as explain_verdict
+from .discogs_http_bridge import PicardHttp, Worker
+from . import discogs_mapping as _dm
+from .tm_readers import mb_linked_discogs_ids
 from .discogs_picker_dialog import DiscogsPickerDialog
 from .discogs_preview_dialog import DiscogsPreviewDialog
 from .discogs_search_dialog import DiscogsSearchDialog
@@ -846,41 +850,148 @@ def process_album(api, album, metadata, release) -> None:
         _start()
         return
     mb_discids = mb_release_discids(release)
+    mb_facts = _mb_match_facts(metadata)
+    all_linked = mb_linked_discogs_ids(release or {})
+    webservice = album.tagger.webservice
 
-    def _gather():
+    def _job():
+        """On the plugin's worker thread: read the folder; when your copy says anything of its
+        pressing, decide as TagMender does (discogs_decide), its requests sent through Picard."""
         loc = album_location(paths)
-        return loc, (copy_evidence(read_copy(loc)) if loc else None)
+        if loc is None:
+            return None, None, None, None
+        album_d = read_copy(loc)
+        ev = copy_evidence(album_d)
+        if not has_copy_evidence(ev):
+            return loc, ev, None, None
+        http = PicardHttp(client, webservice)
+        verdict = decide(album_d, http, _dm, mb_release_id=getattr(album, 'id', '') or '',
+                         mb_discids=mb_discids, linked=all_linked, mb_facts=mb_facts)
+        return loc, ev, verdict, http
 
-    def _gathered(result=None, error=None):
+    def _apply(release_id, why):
+        plugin_log.decision(op, why)
+        client.get_release(str(release_id), _guard_async(_on_release_detail))
+
+    def _done(result=None, error=None):
         try:
             if not _album_is_alive(album):
                 return
             if error is not None:
-                plugin_log.event(op, f'could not read the album folder: {error!r}')
-                log.warning('Discogs Enrichment: could not read the album folder of %r: %r', album, error)
+                plugin_log.event(op, f'reading the album folder or deciding failed: {error!r}')
+                _start()
+                return
+            loc, ev, verdict, http = result
+            if loc is None:
+                plugin_log.decision(op, 'album folder not read: the files are spread over a '
+                                        'folder holding other albums too')
+                _start()
+                return
+            state['ev'] = ev
+            plugin_log.event(op, f'your copy ("{loc["album_folder"]}"): ' + '; '.join(evidence_summary(ev)))
+            dverdict = discid_verdict(ev, mb_discids)
+            if dverdict == 'agrees':
+                plugin_log.decision(op, 'your disc ID is on the MusicBrainz release Picard matched')
+            if verdict is None:
+                _start()                      # (your copy says nothing of its pressing: as 0.4.0)
+                return
+            _log_verdict(op, verdict, http)
+            best = verdict.get('best') or {}
+            rid = (best.get('cand') or {}).get('id')
+            status = verdict['status']
+            if status == 'auto':
+                _apply(rid, f'Discogs release {rid} is proven by your copy: {explain_verdict(best)}')
+            elif status == 'linked':
+                _apply(rid, f'Discogs release {rid}: MusicBrainz links it and nothing of your copy '
+                            f'is against it')
+            elif status == 'musicbrainz':
+                _apply(rid, f'Discogs release {rid}: {verdict["why"][0]}')
+            elif status == 'review':
+                _review(verdict, http)
             else:
-                loc, ev = result
-                if loc is None:
-                    plugin_log.decision(op, 'album folder not read: the files are spread over a '
-                                            'folder holding other albums too')
-                else:
-                    state['ev'] = ev
-                    plugin_log.event(op, f'your copy ("{loc["album_folder"]}"): '
-                                         + '; '.join(evidence_summary(ev)))
-                    verdict = discid_verdict(ev, mb_discids)
-                    if verdict == 'agrees':
-                        plugin_log.decision(op, 'your disc ID is on the MusicBrainz release Picard '
-                                                'matched: that is your pressing')
-                    elif verdict == 'unknown':
-                        plugin_log.detail(op, 'your disc ID is not attached to the MusicBrainz '
-                                              'release Picard matched (MusicBrainz lists few disc IDs)')
-            _start()
+                plugin_log.decision(op, 'TagMender found no Discogs release; trying the plain search')
+                _start()
         except Exception:
             log.error('Discogs Enrichment: folder evidence failed', exc_info=True)
 
-    run_task(_gather, _gathered)
+    def _review(verdict, http):
+        why = '; '.join(verdict.get('why') or ()) or 'nothing proves one pressing'
+        if not settings['picker_when_unsure']:
+            plugin_log.decision(op, f'not sure which pressing ({why}); not tagging automatically '
+                                    f'(use Search Discogs\u2026 to choose)')
+            return
+        scored = sorted(verdict.get('scored') or (), key=lambda x: -(x.get('confidence') or 0))
+        rows, details = [], []
+        for x in scored[:25]:
+            det = http.releases.get(str((x.get('cand') or {}).get('id')))
+            if det:
+                rows.append(release_row(det))
+                details.append(match_detail(x, verdict.get('best')))
+        if not rows:
+            plugin_log.decision(op, f'not sure which pressing ({why}), and no release to offer')
+            return
+        plugin_log.decision(op, f'not sure which pressing ({why}): asking you')
+        title = f'{metadata.get("albumartist") or metadata.get("artist")} \u2014 {metadata.get("album")}'
+        queue_picker(album, title, why, rows, details, client,
+                     lambda rid: _apply(rid, f'you chose Discogs release {rid}'))
+
+    Worker.shared().submit(_job, _done)
 
 
+
+
+def _log_verdict(op, verdict, http) -> None:
+    """TagMender's verdict in the troubleshooting log: the status, why, and each candidate."""
+    status, classified = verdict.get('status'), verdict.get('classified')
+    plugin_log.event(op, f'TagMender: {status}' + (f' (classify said {classified})' if classified != status else '')
+                         + f'; {http.used} Discogs request(s)' + (' \u2014 budget spent' if http.spent else ''))
+    for why in (verdict.get('why') or ())[:4]:
+        plugin_log.detail(op, f'  why: {why}')
+    if verdict.get('discid_on'):
+        plugin_log.detail(op, f'  disc ID on: {verdict["discid_on"]}')
+    for x in sorted(verdict.get('scored') or (), key=lambda x: -(x.get('confidence') or 0))[:8]:
+        c = x.get('cand') or {}
+        plugin_log.detail(op, f'  {c.get("id")} {c.get("year")} {c.get("country")} '
+                              f'{",".join(sorted(c.get("formats") or ()))} {sorted(c.get("catnos") or ())[:2]}: '
+                              f'{explain_verdict(x)[:300]}')
+
+
+# Pickers for albums TagMender is unsure of, shown one at a time and not modal, so a batch
+# load is never held up by a dialog.
+_PICKERS: list = []
+_PICKER_OPEN: list = []
+
+
+def queue_picker(album, title, why, rows, details, client, on_pick) -> None:
+    _PICKERS.append((album, title, why, rows, details, client, on_pick))
+    _show_next_picker()
+
+
+def _show_next_picker() -> None:
+    while _PICKERS and not _PICKER_OPEN:
+        album, title, why, rows, details, client, on_pick = _PICKERS.pop(0)
+        if not _album_is_alive(album):
+            continue
+        parent = getattr(album.tagger, 'window', None)
+
+        def _fetch(release_id, callback):
+            client.get_release(release_id, _guard_async(callback))
+        picker = DiscogsPickerDialog(rows, parent=parent, match_details=details, detail_fetcher=_fetch)
+        picker.setWindowTitle(f'Choose Discogs Release \u2014 {title}')
+        picker.setModal(False)
+        picker.setToolTip(f'Not sure which pressing: {why}')
+        _PICKER_OPEN.append(picker)
+
+        def _finished(code, picker=picker, album=album, on_pick=on_pick):
+            _PICKER_OPEN.clear()
+            try:
+                if code and picker.selected_result and _album_is_alive(album):
+                    on_pick(picker.selected_result.get('id'))
+            finally:
+                picker.deleteLater()
+                _show_next_picker()
+        picker.finished.connect(_finished)
+        picker.show()
 
 
 def _section_label(parent, text):
@@ -1115,9 +1226,18 @@ class DiscogsOptionsPage(OptionsPage):
             'made from. Discogs is searched by these first and its releases ranked against\n'
             'them, and a Discogs release MusicBrainz links to is not applied when your\n'
             'copy\'s barcode is not on it. Nothing in the folder is changed.')
+        self.picker_when_unsure_checkbox = QtWidgets.QCheckBox(
+            'Ask me when the pressing is not proven', self)
+        self.picker_when_unsure_checkbox.setToolTip(
+            'A Discogs release is applied on its own only when your copy proves it (its barcode,\n'
+            'disc ID or catalogue number), when MusicBrainz links it, or when it carries the\n'
+            'barcode of the MusicBrainz release Picard matched - and nothing of your copy is\n'
+            'against it. Otherwise this opens the release picker, one album at a time; without it\n'
+            'the album gets no Discogs data until you use Search Discogs\u2026')
         for box in (self.reverse_match_checkbox, self.skip_preview_checkbox,
                     self.auto_disc_map_checkbox, self.use_cache_checkbox,
-                    self.split_collab_checkbox, self.folder_evidence_checkbox):
+                    self.split_collab_checkbox, self.folder_evidence_checkbox,
+                    self.picker_when_unsure_checkbox):
             layout.addWidget(box)
 
         # --- troubleshooting log -----------------------------------------
@@ -1296,6 +1416,7 @@ class DiscogsOptionsPage(OptionsPage):
         self.use_cache_checkbox.setChecked(True)
         self.split_collab_checkbox.setChecked(True)
         self.folder_evidence_checkbox.setChecked(True)
+        self.picker_when_unsure_checkbox.setChecked(True)
         _select_by_data(self.style_combo, STYLE_SEPARATE)
         _select_by_data(self.strictness_combo, STRICTNESS_NORMAL)
         _select_by_data(self.log_level_combo, LEVEL_BASIC)
@@ -1332,6 +1453,7 @@ class DiscogsOptionsPage(OptionsPage):
         self.use_cache_checkbox.setChecked(bool(s['use_cache']))
         self.split_collab_checkbox.setChecked(bool(s['split_collaborations']))
         self.folder_evidence_checkbox.setChecked(bool(s['folder_evidence']))
+        self.picker_when_unsure_checkbox.setChecked(bool(s['picker_when_unsure']))
         _select_by_data(self.style_combo, s['style_mode'] or STYLE_SEPARATE)
         _select_by_data(self.strictness_combo, s['strictness'] or STRICTNESS_NORMAL)
         _select_by_data(self.log_level_combo, s['log_level'] or LEVEL_BASIC)
@@ -1368,6 +1490,7 @@ class DiscogsOptionsPage(OptionsPage):
         s['use_cache'] = self.use_cache_checkbox.isChecked()
         s['split_collaborations'] = self.split_collab_checkbox.isChecked()
         s['folder_evidence'] = self.folder_evidence_checkbox.isChecked()
+        s['picker_when_unsure'] = self.picker_when_unsure_checkbox.isChecked()
         s['style_mode'] = self.style_combo.currentData()
         s['strictness'] = self.strictness_combo.currentData()
         s['log_level'] = self.log_level_combo.currentData()

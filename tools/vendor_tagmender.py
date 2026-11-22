@@ -50,6 +50,9 @@ ROOTS = {
         "scan_evidence", "packaging_evidence", "notes_text", "codes_from_notes",
         # (documents_text: PDFs and scanned pages - read by the OCR helper, phase 3)
         "discogs_candidate", "discogs_format_names", "mb_linked_discogs_ids",
+        # finding and fetching Discogs candidates; disc IDs (over the plugin's http bridge)
+        "discogs_search", "with_discogs_ids", "toc_releases", "toc_discogs_order", "_discid_url",
+        "AuthError",
     ],
 }
 

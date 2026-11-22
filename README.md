@@ -246,21 +246,50 @@ album's own folder, using TagMender's readers (see [Development](#development)):
 | Notes (`.txt`, `.nfo`) | Catalogue numbers and barcodes the ripper typed |
 | Your files' tags | A barcode and catalogue number, unless another tagger wrote them (the files carry release IDs): those came *from* a release and prove nothing |
 
-What it does with them:
+What it does with them, when your copy says anything of its pressing:
 
-- **Searches Discogs by your copy first**: its barcode, then its catalogue
-  number, then MusicBrainz's.
-- **Ranks candidates against your copy**: your copy's barcode, catalogue
-  number, pressing year and medium replace MusicBrainz's. Hovering the Match
-  column says where each fact came from: *"Strong: agrees on catalogue number
-  (from the folder name)"*.
-- **Checks MusicBrainz's link.** When MusicBrainz links the release to a
-  Discogs release that does not carry your copy's barcode, that release is not
-  applied; Discogs is searched by your copy instead.
-- **Checks the disc ID** against the disc IDs MusicBrainz attaches to the
-  release Picard matched (no extra requests), and says so in the log.
-- **Pre-fills Search Discogs…** with your copy's barcode, catalogue number
-  and pressing year.
+1. **Your disc ID.** When MusicBrainz attaches it to the release Picard matched
+   (no request needed), the Discogs releases that MusicBrainz release links to
+   are proven by it. Otherwise MusicBrainz's disc ID lookup and the CUETools
+   database are asked.
+2. **Discogs is searched as TagMender searches it**: your copy's barcodes, then
+   its catalogue numbers (with the artist, then the label), then the title,
+   then the master's other versions; plus every Discogs release MusicBrainz
+   links to.
+3. **Every candidate is scored by TagMender's own scorer** — track count and
+   lengths, title and artist, your disc ID, barcode, catalogue number, year,
+   country, label, format, packaging, rip date — and TagMender decides whether
+   it is sure.
+4. **The Discogs release is applied on its own only when:**
+
+   | | |
+   | --- | --- |
+   | **Proven** | TagMender is sure *and* your copy proves the pick: your disc ID, your barcode or your catalogue number, with no other pressing proven as strongly (a disc ID beats a barcode, a barcode a catalogue number; a number two pressings share proves neither) |
+   | **Linked** | MusicBrainz links that Discogs release to the release Picard matched, and nothing of your copy is against it |
+   | **Same as MusicBrainz** | It carries the matched MusicBrainz release's barcode (or its catalogue number and year), and nothing of your copy is against it |
+
+5. **Otherwise you choose.** The release picker opens with TagMender's
+   candidates, best first; its Match column shows TagMender's confidence and
+   every clue for and against (*"Proven: 100% | for: disc ID (track positions
+   of the CD) matches; label Century Media, 77219-2 in the tags"*). Pickers
+   open one album at a time and do not block Picard. Turn this off with
+   **"Ask me when the pressing is not proven"**; the album then gets no Discogs
+   data until you use Search Discogs….
+
+Your disc ID on a *different* MusicBrainz release than the one Picard matched
+always asks you: the MusicBrainz match and your copy disagree.
+
+When your copy says nothing of its pressing, the plugin behaves as before: the
+MusicBrainz link, or a search by MusicBrainz's barcode and catalogue number.
+
+An automatic look-up makes at most 15 Discogs requests (searches and
+releases; repeats come from the cache). Picard sends them one a second, which
+is Discogs' limit, and albums are looked up one at a time on the plugin's own
+thread, so a large batch takes a while but never slows Picard down. The
+troubleshooting log (detailed) lists every candidate with its score and clues.
+
+**Search Discogs…** is pre-filled with your copy's barcode, catalogue number
+and pressing year.
 
 A disc ID counts only when its TOC has three tracks or more: a one- or
 two-track disc ID, or a single-file image read as one track, is just "a CD
@@ -269,9 +298,8 @@ folder holding other albums (an artist's or library folder), and nothing in
 it is changed. Switch it off under **Options → Plugins → Discogs Enrichment →
 "Read the album folder for which pressing you own"**.
 
-Coming next: TagMender's own pressing scorer deciding when a Discogs release
-is proven, and barcodes, catalogue numbers and matrix codes read from your
-scans (OCR).
+Coming next: barcodes, catalogue numbers and matrix codes read from your
+scans and PDF booklets (OCR).
 
 ---
 
@@ -315,7 +343,8 @@ git push                  # when you are happy with it
 Only committed work is installed. `./install.sh` (without `--local`) switches
 back to the GitHub source; settings are kept either way.
 
-Pure logic lives in `discogs_mapping.py` and `discogs_evidence.py` with no Qt
+Pure logic lives in `discogs_mapping.py`, `discogs_evidence.py` and
+`discogs_decide.py` with no Qt
 or Picard imports, so it can be tested directly (`python3 tests/test_*.py`).
 
 `tm_match_core.py` and `tm_readers.py` are **generated** from a
@@ -333,6 +362,8 @@ __init__.py              enable()/disable(), actions, options page
 discogs_runtime.py       late-bound api: settings + logging
 discogs_mapping.py       pure logic — field mapping, merge modes, scoring
 discogs_evidence.py      pure logic — your copy's evidence from the album folder
+discogs_decide.py        pure logic — TagMender's verdict on the Discogs release
+discogs_http_bridge.py   TagMender's synchronous http over Picard's web service
 tm_match_core.py         generated from TagMender: pressing scorer, code rules
 tm_readers.py            generated from TagMender: folder, rip log, cue readers
 tools/vendor_tagmender.py  regenerates the two tm_* files

@@ -58,6 +58,9 @@ DEFAULTS: dict[str, Any] = {
     # Read the album's folder (folder and file names, rip logs, cue sheets, notes) for what
     # your copy says of its pressing, and search and rank Discogs by it. See README.
     'folder_evidence': True,
+    # When TagMender cannot prove which Discogs release your copy is, open the release picker
+    # (one album at a time, not modal) instead of leaving the album without Discogs data.
+    'picker_when_unsure': True,
     'log_level': 'basic',
     'log_max_kb': '2048',
     'prefer_original_date': False,
