@@ -1,0 +1,15 @@
+{
+ "version": 1,
+ "note": "Which scans carry a code OCR can use (barcode, catalogue number, matrix), by role: reads and hits. A starting estimate until users' exported counts (tagmender ocr stats --export) replace it; kept small so a computer's own counts soon outweigh it.",
+ "roles": {
+  "back": {"reads": 20, "hits": 10},
+  "label": {"reads": 10, "hits": 5},
+  "disc": {"reads": 20, "hits": 8},
+  "obi": {"reads": 10, "hits": 4},
+  "tray": {"reads": 10, "hits": 3},
+  "spine": {"reads": 10, "hits": 2},
+  "other": {"reads": 10, "hits": 1},
+  "booklet": {"reads": 20, "hits": 1},
+  "front": {"reads": 20, "hits": 1}
+ }
+}

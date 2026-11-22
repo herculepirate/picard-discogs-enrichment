@@ -3,7 +3,7 @@
 
     python3 tools/vendor_tagmender.py [--tagmender ~/Documents/Github/tagmender] [--check]
 
-Writes two generated files. Never edit either by hand: change TagMender, then run this again.
+Writes the generated files below. Never edit one by hand: change TagMender, then run this again.
 
 * tm_match_core.py - TagMender's match_core.py, unchanged apart from a header. It is pure
   (standard library only): the candidate scorer (score_candidate, classify), clue weights,
@@ -15,6 +15,11 @@ Writes two generated files. Never edit either by hand: change TagMender, then ru
   function's own "from engine import is_disc_dir" become plain names of tm_readers.
   A name the closure reaches in a module not listed in MODULES stops the run, unless STUBS
   stands in for it.
+* tm_ocr.py        - the same, from OCR_ROOTS: TagMender's scan and document reading (barcodes
+  decoded off the scans, tesseract's page text, spines, the barcode's digit band, disc rings,
+  PDF booklets). It never runs inside Picard: discogs_ocr_helper.py runs it on your system's
+  Python, where PIL, pyzbar, numpy and tesseract are installed.
+* tm_ocr_order.json - TagMender's shipped scan order (assets/ocr_order.json), which tm_ocr reads.
 
 --check exits 1 when either file would change (tests/test_vendored.py runs it).
 """
@@ -35,11 +40,14 @@ HERE = Path(__file__).resolve().parent.parent
 MODULES = {
     "ex": "exclusions.py",
     "tagio": "tagio.py",
+    "companions": "companions.py",
+    "ocr_order": "ocr_order.py",
     "ma": "match_albums.py",
     "engine": "engine.py",
 }
 # other spellings of the same modules in TagMender's imports
-ALIASES = {"exclusions": "ex", "match_albums": "ma", "engine": "engine", "tagio": "tagio"}
+ALIASES = {"exclusions": "ex", "match_albums": "ma", "engine": "engine", "tagio": "tagio",
+           "companions": "companions", "ocr_order": "ocr_order"}
 
 # what the plugin calls (through discogs_evidence.py); everything they reach comes along
 ROOTS = {
@@ -48,11 +56,24 @@ ROOTS = {
         "folder_reading", "rip_logs", "log_tocs", "cue_tocs", "cdtoc_tag_toc", "mb_discid",
         "ctdb_toc", "rip_log_year", "sacd_marks", "vinyl_marks", "enhanced_marks",
         "scan_evidence", "packaging_evidence", "notes_text", "codes_from_notes",
-        # (documents_text: PDFs and scanned pages - read by the OCR helper, phase 3)
+        # the folder's documents as text, without OCR (notes, saved pages, a PDF's own text when
+        # pdftotext is there); with OCR the helper reads them (tm_ocr)
+        "documents_text", "album_documents",
         "discogs_candidate", "discogs_format_names", "mb_linked_discogs_ids",
         # finding and fetching Discogs candidates; disc IDs (over the plugin's http bridge)
         "discogs_search", "with_discogs_ids", "toc_releases", "toc_discogs_order", "_discid_url",
         "AuthError",
+        # merging what the OCR helper read (discogs_ocr.merge_scans): pure text work
+        "split_documents", "drop_file_name_lines", "scan_catnos", "labels_from_text",
+    ],
+}
+
+# what discogs_ocr_helper.py calls, on your system's Python (not Picard's)
+OCR_ROOTS = {
+    "ma": [
+        "list_images", "images_key", "scan_key", "new_scan_log", "each_scan", "decoded_barcodes",
+        "ocr_text", "ocr_spines", "ocr_barcode_digits", "ocr_disc_rings", "ocr_langs", "page_kind",
+        "documents_text", "album_documents", "OCR_VERSION",
     ],
 }
 
@@ -73,6 +94,8 @@ OVERRIDES = {
     # never TagMender's own state folder: the plugin reads no TagMender job history
     # (tagmender_originals / tagmender_decided then find nothing, as for an album it never tagged)
     ("ex", "STATE_DIR"): 'STATE_DIR = Path("/nonexistent/tagmender-state-not-read-by-the-plugin")',
+    # TagMender's shipped scan order, copied beside the generated module
+    ("ocr_order", "SHIPPED"): 'SHIPPED = Path(__file__).resolve().parent / "tm_ocr_order.json"',
 }
 
 STDLIB = {
@@ -181,8 +204,18 @@ def build(root: Path) -> dict[str, str]:
     mods = {a: Module(a, root / f) for a, f in MODULES.items()}
     core = (root / "match_core.py").read_text()
     head, version = _git_head(root), _version(root)
+    sources = ", ".join(f"{f} @ {hashlib.sha1((root / f).read_bytes()).hexdigest()[:10]}"
+                        for f in ["match_core.py", *MODULES.values()])
+    hdr = HEADER.format(version=version, head=head, sources=sources)
+    return {"tm_match_core.py": hdr + core,
+            "tm_readers.py": _closure(mods, ROOTS, hdr),
+            "tm_ocr.py": _closure(mods, OCR_ROOTS, hdr),
+            "tm_ocr_order.json": (root / "assets" / "ocr_order.json").read_text()}
 
-    want = [(a, n) for a, names in ROOTS.items() for n in names]
+
+def _closure(mods: dict, roots: dict, hdr: str) -> str:
+    """One generated module: ROOTS and every module-level name they reach."""
+    want = [(a, n) for a, names in roots.items() for n in names]
     seen: set[tuple[str, str]] = set()
     used_stubs: set[str] = set()
     problems: list[str] = []
@@ -277,16 +310,12 @@ def build(root: Path) -> dict[str, str]:
             if a == alias and (a, name) in seen:
                 blocks.append(f"# --- {MODULES[alias]} {name} (overridden by vendor_tagmender.py)\n{stmt}")
 
-    sources = ", ".join(f"{f} @ {hashlib.sha1((root / f).read_bytes()).hexdigest()[:10]}"
-                        for f in ["match_core.py", *MODULES.values()])
-    hdr = HEADER.format(version=version, head=head, sources=sources)
-    readers = (hdr + "# flake8: noqa\nfrom __future__ import annotations\n\n"
+    return (hdr + "# flake8: noqa\nfrom __future__ import annotations\n\n"
                + _imports_for("\n".join(blocks), mods, used_stubs) + "\n\n"
                "try:\n    from . import tm_match_core as mc\nexcept ImportError:  # run outside Picard (tests)\n"
                "    import tm_match_core as mc\n\n"
                + "".join(STUBS[m] + "\n" for m in sorted(used_stubs)) + "\n"
                + "\n\n\n".join(blocks) + "\n")
-    return {"tm_match_core.py": hdr + core, "tm_readers.py": readers}
 
 
 def _imports_for(body: str, mods: dict, used_stubs: set) -> str:

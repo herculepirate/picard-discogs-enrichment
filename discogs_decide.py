@@ -123,8 +123,13 @@ def agrees_with_musicbrainz(s: dict, mb: dict) -> str:
 
 
 def decide(album: dict, http, dm, *, mb_release_id: str = '', mb_discids=(), linked=(),
-           mb_facts: dict | None = None, cfg: dict | None = None, ocr_text: str = '') -> dict[str, Any]:
+           mb_facts: dict | None = None, cfg: dict | None = None, ocr_text: str = '',
+           scan_probe: dict | None = None) -> dict[str, Any]:
     """Which Discogs release ALBUM (read_album's dict) is.
+
+    OCR_TEXT and SCAN_PROBE come from discogs_ocr.merge_scans: the text of your scans and
+    documents every candidate is scored against, and the codes printed on them the first
+    search did not ask (searched too: the release they name may not be among what it found).
 
     Returns {"status", "best" (a scored candidate or None), "scored", "why", "discid_on" (see
     _disc_ids), "classified" (TagMender's own classify status)}. The status, first that holds:
@@ -144,6 +149,9 @@ def decide(album: dict, http, dm, *, mb_release_id: str = '', mb_discids=(), lin
     discid_on = _disc_ids(album, http, mb_release_id, set(mb_discids or ()), linked)
 
     cands = tr.discogs_search(http, album, cfg, dm)
+    if scan_probe:
+        ids = {str(c.get('id')) for c in cands}
+        cands += [c for c in tr.discogs_search(http, scan_probe, cfg, dm) if str(c.get('id')) not in ids]
     cands = tr.with_discogs_ids(http, dm, cands, linked, limit=MAX_LINKED)
     if not cands:
         return {'status': 'nomatch', 'best': None, 'scored': [], 'why': ['no Discogs release found'],

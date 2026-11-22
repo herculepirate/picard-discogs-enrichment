@@ -61,6 +61,9 @@ DEFAULTS: dict[str, Any] = {
     # When TagMender cannot prove which Discogs release your copy is, open the release picker
     # (one album at a time, not modal) instead of leaving the album without Discogs data.
     'picker_when_unsure': True,
+    # your scans and PDF booklets read (OCR, on your system's Python: discogs_ocr_helper)
+    'ocr_scans': True,
+    'ocr_max_images': 15,
     'log_level': 'basic',
     'log_max_kb': '2048',
     'prefer_original_date': False,

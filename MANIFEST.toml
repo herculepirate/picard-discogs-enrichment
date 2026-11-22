@@ -2,7 +2,7 @@ uuid = "dd789f69-332f-498a-af94-d8e3273cc435"
 name = "Discogs Enrichment"
 description = "Tag from Discogs alongside or instead of MusicBrainz, with a release picker, box-set disc mapping and cover art."
 api = ["3.0"]
-version = "0.4.1"
+version = "0.4.2"
 authors = ["herculepirate"]
 maintainers = ["herculepirate"]
 license = "GPL-2.0-or-later"
@@ -27,8 +27,9 @@ which ones it dropped.
 
 **Reads your copy.** The album's folder says which pressing you own:
 catalogue numbers in its name, rip logs and cue sheets whose disc ID fits your
-files, a pressing year, a vinyl or SACD rip. Discogs is searched by these
-first, every candidate is scored by TagMender's pressing scorer, and a release
+files, a pressing year, a vinyl or SACD rip, and the barcode and codes printed
+on your scans and PDF booklets (OCR, on your system's Python). Discogs is
+searched by these first, every candidate is scored by TagMender's pressing scorer, and a release
 is applied on its own only when your copy proves it (its disc ID, barcode or
 catalogue number), MusicBrainz links it, or it carries the matched MusicBrainz
 release's barcode, with nothing of your copy against it. Otherwise the release

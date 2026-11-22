@@ -30,7 +30,8 @@ leaving you to guess.
 **Reads your copy, not just MusicBrainz.** The album's folder says which
 pressing you own: a catalogue number in its name (`[Relativity, 88561-1115-2,
 U.S.A.]`), a rip log or cue sheet whose disc ID fits your files, a pressing
-year, a vinyl or SACD rip. Discogs is searched by these first and its
+year, a vinyl or SACD rip, and the barcode and catalogue number printed on
+your scans and PDF booklets (OCR). Discogs is searched by these first and its
 releases ranked against them. See [Your copy's evidence](#your-copys-evidence).
 
 **Four tag sources**, each exact about what it overwrites. See
@@ -243,7 +244,9 @@ album's own folder, using TagMender's readers (see [Development](#development)):
 | Folder and file names | Catalogue numbers in brackets (`(Under One Flag, CD FLAG 54, France)`), a remaster or reissue year (`[2004 RM]`), vinyl and SACD rips |
 | Rip logs (EAC, XLD) and cue sheets | The disc's table of contents and so its MusicBrainz disc ID, only when it fits your files to the sector; the year it was ripped; catalogue numbers in the paths the ripper wrote to |
 | `CDTOC` tags, and lossless files that are whole CD sectors | The disc ID, rebuilt from the files' own lengths |
-| Notes (`.txt`, `.nfo`) | Catalogue numbers and barcodes the ripper typed |
+| Notes (`.txt`, `.nfo`), saved pages | Catalogue numbers and barcodes the ripper typed (searched, never proof) |
+| Scans (`.jpg`, `.png` … in the folder and its subfolders) | Barcodes decoded off the back or a sticker (proof); the page text: catalogue numbers, labels, "Made in", matrix codes on the disc ring; the barcode's digit band read alone when it will not decode. Needs [OCR](#reading-your-scans-ocr) |
+| PDF booklets | Their text (OCR'd when a page has none of its own) |
 | Your files' tags | A barcode and catalogue number, unless another tagger wrote them (the files carry release IDs): those came *from* a release and prove nothing |
 
 What it does with them, when your copy says anything of its pressing:
@@ -298,8 +301,40 @@ folder holding other albums (an artist's or library folder), and nothing in
 it is changed. Switch it off under **Options → Plugins → Discogs Enrichment →
 "Read the album folder for which pressing you own"**.
 
-Coming next: barcodes, catalogue numbers and matrix codes read from your
-scans and PDF booklets (OCR).
+### Reading your scans (OCR)
+
+The scans are read as TagMender reads them, by `discogs_ocr_helper.py` on
+**your system's Python** — Picard's Flatpak has no Pillow, zbar or tesseract.
+Install, on the system (not in Picard):
+
+```bash
+sudo apt install tesseract-ocr python3-pil python3-pyzbar python3-numpy poppler-utils
+# more languages are read when their packs are installed, e.g. tesseract-ocr-jpn
+```
+
+`tesseract-ocr` and `python3-pil` are needed; without `python3-pyzbar` no
+barcode is decoded, without `python3-numpy` the digit band and disc rings are
+not read, without `poppler-utils` a PDF's own text is not.
+
+**Flatpak Picard** must be allowed to start the helper on your system, once:
+
+```bash
+flatpak override --user --talk-name=org.freedesktop.Flatpak org.musicbrainz.Picard
+```
+
+then restart Picard. The plugin then runs `flatpak-spawn --host python3 …`.
+
+Up to 15 scans an album are read, the likeliest to carry a code first
+(the back, tray, disc and obi before the booklet). Each is read once — a full
+set takes a minute or two the first time — and kept in a cache
+(`~/.var/app/org.musicbrainz.Picard/cache/discogs-enrichment/ocr.sqlite` for
+the Flatpak). A barcode decoded off a scan is your copy's own, as a tag would
+be; the codes printed on the scans are searched too, and the page text is
+scored against every candidate. Nothing is sent anywhere.
+
+While OCR is unavailable, **every look-up says so** in the log and Picard's
+status bar, naming what is missing. Switch it off under **"Read my scans and
+PDF booklets (OCR)"**.
 
 ---
 
@@ -347,12 +382,17 @@ Pure logic lives in `discogs_mapping.py`, `discogs_evidence.py` and
 `discogs_decide.py` with no Qt
 or Picard imports, so it can be tested directly (`python3 tests/test_*.py`).
 
-`tm_match_core.py` and `tm_readers.py` are **generated** from a
+`tm_match_core.py`, `tm_readers.py`, `tm_ocr.py` and `tm_ocr_order.json` are
+**generated** from a
 [TagMender](https://github.com/herculepirate/tagmender) checkout by
 `tools/vendor_tagmender.py`: its pressing scorer verbatim, and the folder
-reader (`read_album`) with every reader it reaches. Never edit them; change
+reader (`read_album`) with every reader it reaches, and its scan reading
+(run by the OCR helper, outside Picard). Never edit them; change
 TagMender and run the tool again. `tests/test_vendored.py` fails when they are
-behind TagMender. `discogs_runtime.py` holds the late-bound `api`
+behind TagMender. `tools/library_check.py ~/Music [--ocr] [--decide]` shows, outside Picard,
+what the plugin reads of every album in a folder and (with `--decide`, over
+the network, cached) what it would decide; nothing is changed or tagged.
+`discogs_runtime.py` holds the late-bound `api`
 object: `enable(api)` binds it once and the rest of the plugin imports `log`
 and `settings` from there, rather than threading the api through every call.
 
@@ -366,7 +406,12 @@ discogs_decide.py        pure logic — TagMender's verdict on the Discogs relea
 discogs_http_bridge.py   TagMender's synchronous http over Picard's web service
 tm_match_core.py         generated from TagMender: pressing scorer, code rules
 tm_readers.py            generated from TagMender: folder, rip log, cue readers
-tools/vendor_tagmender.py  regenerates the two tm_* files
+tm_ocr.py, tm_ocr_order.json  generated from TagMender: scan and document reading
+discogs_ocr_helper.py    reads the scans on your system's Python; prints JSON
+discogs_ocr_bridge.py    starts the helper (flatpak-spawn --host in a Flatpak)
+discogs_ocr.py           pure logic — what the scans read, added as TagMender adds it
+tools/vendor_tagmender.py  regenerates the tm_* files
+tools/library_check.py   what the plugin reads and decides, over a music folder
 discogs_client.py        Discogs API over Picard's web service
 discogs_*_dialog.py      release picker, search, disc mapping, preview
 discogs_coverart.py      cover art provider

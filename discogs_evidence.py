@@ -115,7 +115,9 @@ def _barcode_form(code) -> str:
 def copy_evidence(album: dict[str, Any] | None) -> dict[str, Any]:
     """The facts of your copy the plugin searches and ranks with, from TagMender's reading.
 
-    barcodes   - your copy's own (tags no other tagger wrote); proof of the release
+    barcodes   - your copy's own (tags no other tagger wrote, else decoded or read whole off
+                 your scans: discogs_ocr.merge_scans); proof of the release
+    scan_codes - barcodes and catalogue numbers in your scans and documents, searched
     note_barcodes - typed in the folder's notes: searched, never proof
     catnos     - as written, best first: the folder name's, then notes', rip logs', tags'
     year       - the pressing's (a remaster/reissue year in the folder name), else None
@@ -130,6 +132,10 @@ def copy_evidence(album: dict[str, Any] | None) -> dict[str, Any]:
     by_tagger = bool(album.get('tags_by_tagger'))
     tag_barcodes = sorted(album.get('tag_barcodes') or ())
     barcodes = [] if by_tagger else [f for f in dict.fromkeys(map(_barcode_form, tag_barcodes)) if f]
+    from_scans = False
+    if not barcodes:
+        barcodes = [f for f in dict.fromkeys(map(_barcode_form, sorted(album.get('scan_barcodes') or ()))) if f]
+        from_scans = bool(barcodes)
     note_barcodes = [f for f in dict.fromkeys(map(_barcode_form, album.get('note_barcodes') or ()))
                      if f and f not in barcodes]
     folder_own = set(album.get('catnos_folder_own') or ())
@@ -148,7 +154,7 @@ def copy_evidence(album: dict[str, Any] | None) -> dict[str, Any]:
                                        else "the folder's notes or rip log" if first in typed
                                        else "your files' tags")
     if barcodes:
-        sources['barcode'] = "your files' tags"
+        sources['barcode'] = 'your scans' if from_scans else "your files' tags"
     year = album.get('pressing_year') or album.get('edition_year') or None
     if year:
         sources['year'] = 'the folder name (pressing year)'
@@ -179,14 +185,28 @@ def copy_evidence(album: dict[str, Any] | None) -> dict[str, Any]:
         'packaging': sorted(album.get('packaging') or ()),
         'sacd': album.get('sacd_hint') or '',
         'tags_by_tagger': by_tagger,
+        'scan_codes': list(album.get('scan_codes') or ()),
         'sources': sources,
     }
+
+
+def with_matched_names(album: dict | None, artist: str, title: str) -> bool:
+    """Files with no artist tag (a fresh rip, a cue image): read_album named the album after its
+    folders, which may be anything ("Drummer X / Band - Album"). Picard has matched it, so the
+    matched release's artist and title are searched and scored instead - names, never evidence
+    of the pressing. Returns whether they were used."""
+    if not album or not artist or not title:
+        return False
+    if album.get('track_artists') or any(t.get('artist') for t in album.get('tracks') or ()):
+        return False
+    album['artist'], album['title'] = artist, title
+    return True
 
 
 def has_copy_evidence(ev: dict[str, Any] | None) -> bool:
     """Does your copy say anything about which pressing it is?"""
     return bool(ev and (ev.get('barcodes') or ev.get('catnos') or ev.get('discids')
-                        or ev.get('note_barcodes')))
+                        or ev.get('note_barcodes') or ev.get('scan_codes')))
 
 
 def match_facts(mb_facts: dict[str, str], ev: dict[str, Any] | None) -> dict[str, Any]:
@@ -282,6 +302,8 @@ def evidence_summary(ev: dict[str, Any] | None) -> list[str]:
         out.append(f'ripped in {ev["rip_log_year"]} (rip log)')
     if ev.get('physical'):
         out.append('scans of the physical copy' + (f' ({", ".join(ev["packaging"])})' if ev.get('packaging') else ''))
+    if ev.get('scan_codes'):
+        out.append(f'codes in your scans or documents: {", ".join(ev["scan_codes"][:6])} (searched)')
     if ev.get('tags_by_tagger'):
         out.append("the files' release details came from a tagger, so they are not read as your copy's")
     return out or ['the folder says nothing about the pressing']

@@ -85,10 +85,12 @@ from .discogs_mapping import (
 from .discogs_disc_dialog import CONFIDENT_DISC_SCORE, DiscMappingDialog, auto_map
 from .discogs_evidence import (album_location, contradicts_release, copy_evidence,
                                discid_verdict, evidence_summary, has_copy_evidence, match_facts,
-                               mb_release_discids, read_copy, search_terms)
+                               mb_release_discids, read_copy, search_terms, with_matched_names)
 from .discogs_decide import decide, match_detail, release_row
 from .discogs_decide import explain as explain_verdict
 from .discogs_http_bridge import PicardHttp, Worker
+from .discogs_ocr import merge_scans, scans_summary
+from .discogs_ocr_bridge import OcrBridge, partial_message, unavailable_message
 from . import discogs_mapping as _dm
 from .tm_readers import mb_linked_discogs_ids
 from .discogs_picker_dialog import DiscogsPickerDialog
@@ -854,20 +856,39 @@ def process_album(api, album, metadata, release) -> None:
     all_linked = mb_linked_discogs_ids(release or {})
     webservice = album.tagger.webservice
 
+    matched_artist = metadata.get('albumartist') or metadata.get('artist') or ''
+    matched_title = metadata.get('album') or ''
+    want_ocr = bool(settings.get('ocr_scans', True))
+    max_images = int(settings.get('ocr_max_images') or 15)
+
     def _job():
-        """On the plugin's worker thread: read the folder; when your copy says anything of its
-        pressing, decide as TagMender does (discogs_decide), its requests sent through Picard."""
+        """On the plugin's worker thread: read the folder, and your scans and documents (the
+        OCR helper, on your system's Python); when your copy says anything of its pressing,
+        decide as TagMender does (discogs_decide), its requests sent through Picard."""
         loc = album_location(paths)
         if loc is None:
-            return None, None, None, None
+            return {'loc': None}
         album_d = read_copy(loc)
-        ev = copy_evidence(album_d)
+        named_by = with_matched_names(album_d, matched_artist, matched_title)
+        job = {'loc': loc, 'named_by': named_by, 'ocr': None, 'scans': None, 'merged': {}, 'verdict': None, 'http': None}
+        scans = None
+        if want_ocr:
+            job['ocr'] = probe = OCR.probe()
+            if probe.get('ok'):
+                scans = OCR.read(loc['album_dir'], max_images=max_images,
+                                 have_barcode=bool(album_d.get('barcodes')))
+                if not scans.get('ok'):
+                    job['ocr'] = scans          # (it failed on this album: warned as unavailable)
+        job['scans'] = scans
+        merged = job['merged'] = merge_scans(album_d, loc['album_dir'], scans)
+        ev = job['ev'] = copy_evidence(album_d)
         if not has_copy_evidence(ev):
-            return loc, ev, None, None
-        http = PicardHttp(client, webservice)
-        verdict = decide(album_d, http, _dm, mb_release_id=getattr(album, 'id', '') or '',
-                         mb_discids=mb_discids, linked=all_linked, mb_facts=mb_facts)
-        return loc, ev, verdict, http
+            return job
+        http = job['http'] = PicardHttp(client, webservice)
+        job['verdict'] = decide(album_d, http, _dm, mb_release_id=getattr(album, 'id', '') or '',
+                                mb_discids=mb_discids, linked=all_linked, mb_facts=mb_facts,
+                                ocr_text=merged.get('text') or '', scan_probe=merged.get('probe'))
+        return job
 
     def _apply(release_id, why):
         plugin_log.decision(op, why)
@@ -881,12 +902,20 @@ def process_album(api, album, metadata, release) -> None:
                 plugin_log.event(op, f'reading the album folder or deciding failed: {error!r}')
                 _start()
                 return
-            loc, ev, verdict, http = result
+            loc = result.get('loc')
             if loc is None:
                 plugin_log.decision(op, 'album folder not read: the files are spread over a '
                                         'folder holding other albums too')
                 _start()
                 return
+            ev, verdict, http = result.get('ev'), result.get('verdict'), result.get('http')
+            _warn_ocr(op, result.get('ocr'), album)
+            if result.get('named_by'):
+                plugin_log.detail(op, "your files carry no artist tag: Discogs is searched by the "
+                                      "MusicBrainz release's artist and title")
+            scanned = scans_summary(result.get('scans'), result.get('merged') or {})
+            if scanned:
+                plugin_log.event(op, f'your scans and documents: {scanned}')
             state['ev'] = ev
             plugin_log.event(op, f'your copy ("{loc["album_folder"]}"): ' + '; '.join(evidence_summary(ev)))
             dverdict = discid_verdict(ev, mb_discids)
@@ -938,6 +967,26 @@ def process_album(api, album, metadata, release) -> None:
     Worker.shared().submit(_job, _done)
 
 
+
+
+# the OCR helper: probed once in a while, one album's scans at a time (the worker's)
+OCR = OcrBridge()
+
+
+def _warn_ocr(op, probe, album) -> None:
+    """Every look-up whose scans could not be read says so: the log, and Picard's status bar."""
+    if probe is None:
+        return                                   # (OCR is turned off in the options)
+    msg = unavailable_message(probe) if not probe.get('ok') else partial_message(probe)
+    if not msg:
+        return
+    plugin_log.event(op, msg)
+    log.warning('%s', msg)
+    try:
+        album.tagger.window.set_statusbar_message(msg.replace('%', '%%'), timeout=15000,
+                                                  echo=None, translate=None)
+    except Exception:
+        pass
 
 
 def _log_verdict(op, verdict, http) -> None:
@@ -1234,10 +1283,20 @@ class DiscogsOptionsPage(OptionsPage):
             'barcode of the MusicBrainz release Picard matched - and nothing of your copy is\n'
             'against it. Otherwise this opens the release picker, one album at a time; without it\n'
             'the album gets no Discogs data until you use Search Discogs\u2026')
+        self.ocr_scans_checkbox = QtWidgets.QCheckBox(
+            'Read my scans and PDF booklets (OCR)', self)
+        self.ocr_scans_checkbox.setToolTip(
+            'Barcodes decoded off the album folder\'s scans, and the catalogue numbers, matrix\n'
+            'codes and labels printed on them, as TagMender reads them: proof of the pressing.\n'
+            'Runs on your system\'s Python (tesseract-ocr, python3-pil, python3-pyzbar,\n'
+            'python3-numpy, poppler-utils); a Flatpak Picard needs\n'
+            'flatpak override --user --talk-name=org.freedesktop.Flatpak org.musicbrainz.Picard\n'
+            'A scan is read once (minutes for a full set the first time) and kept in a cache.\n'
+            'While OCR is unavailable every look-up says so.')
         for box in (self.reverse_match_checkbox, self.skip_preview_checkbox,
                     self.auto_disc_map_checkbox, self.use_cache_checkbox,
                     self.split_collab_checkbox, self.folder_evidence_checkbox,
-                    self.picker_when_unsure_checkbox):
+                    self.picker_when_unsure_checkbox, self.ocr_scans_checkbox):
             layout.addWidget(box)
 
         # --- troubleshooting log -----------------------------------------
@@ -1417,6 +1476,7 @@ class DiscogsOptionsPage(OptionsPage):
         self.split_collab_checkbox.setChecked(True)
         self.folder_evidence_checkbox.setChecked(True)
         self.picker_when_unsure_checkbox.setChecked(True)
+        self.ocr_scans_checkbox.setChecked(True)
         _select_by_data(self.style_combo, STYLE_SEPARATE)
         _select_by_data(self.strictness_combo, STRICTNESS_NORMAL)
         _select_by_data(self.log_level_combo, LEVEL_BASIC)
@@ -1454,6 +1514,7 @@ class DiscogsOptionsPage(OptionsPage):
         self.split_collab_checkbox.setChecked(bool(s['split_collaborations']))
         self.folder_evidence_checkbox.setChecked(bool(s['folder_evidence']))
         self.picker_when_unsure_checkbox.setChecked(bool(s['picker_when_unsure']))
+        self.ocr_scans_checkbox.setChecked(bool(s['ocr_scans']))
         _select_by_data(self.style_combo, s['style_mode'] or STYLE_SEPARATE)
         _select_by_data(self.strictness_combo, s['strictness'] or STRICTNESS_NORMAL)
         _select_by_data(self.log_level_combo, s['log_level'] or LEVEL_BASIC)
@@ -1491,6 +1552,7 @@ class DiscogsOptionsPage(OptionsPage):
         s['split_collaborations'] = self.split_collab_checkbox.isChecked()
         s['folder_evidence'] = self.folder_evidence_checkbox.isChecked()
         s['picker_when_unsure'] = self.picker_when_unsure_checkbox.isChecked()
+        s['ocr_scans'] = self.ocr_scans_checkbox.isChecked()
         s['style_mode'] = self.style_combo.currentData()
         s['strictness'] = self.strictness_combo.currentData()
         s['log_level'] = self.log_level_combo.currentData()

@@ -73,14 +73,14 @@ def _undefined_names(path: Path) -> list:
                 bound.add(x.name)
         for x in ast.walk(n):
             if isinstance(x, ast.Name) and isinstance(x.ctx, ast.Load) and x.id not in top | bound \
-                    and not hasattr(builtins, x.id):
+                    and not hasattr(builtins, x.id) and x.id != "__file__":
                 bad.add(x.id)
     return sorted(bad)
 
 
 class Generated(unittest.TestCase):
     def test_no_undefined_names(self):
-        for name in ("tm_readers.py", "tm_match_core.py"):
+        for name in ("tm_readers.py", "tm_match_core.py", "tm_ocr.py"):
             self.assertEqual(_undefined_names(ROOT / name), [], name)
 
     def test_tagmender_state_never_read(self):
