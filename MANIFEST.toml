@@ -21,19 +21,17 @@ track counts, edition markers (Reissue, Remastered, Deluxe), label,
 catalogue number and community have/want counts. A Match column scores each
 candidate against what Picard already knows — barcode, catalogue number,
 year, country and medium — and says which facts agreed. Search by any field
-Discogs supports, or paste a release ID or URL. A search that returns
-nothing widens itself by dropping the most over-specific terms and tells you
-which ones it dropped.
+Discogs supports, or paste a release ID or URL; a search that finds nothing
+widens itself and says how.
 
 **Reads your copy.** The album's folder says which pressing you own:
 catalogue numbers in its name, rip logs and cue sheets whose disc ID fits your
 files, a pressing year, a vinyl or SACD rip, and the barcode and codes printed
 on your scans and PDF booklets (OCR, on your system's Python). Discogs is
-searched by these first, every candidate is scored by TagMender's pressing scorer, and a release
-is applied on its own only when your copy proves it (its disc ID, barcode or
-catalogue number), MusicBrainz links it, or it carries the matched MusicBrainz
-release's barcode, with nothing of your copy against it. Otherwise the release
-picker asks you, one album at a time.
+searched by these first and scored by TagMender's pressing scorer; a release
+is applied on its own only when your copy proves it, MusicBrainz links it, or
+it carries the matched release's barcode, with nothing of your copy against
+it. Otherwise the release picker asks you, one album at a time.
 
 **Four tag sources.** Discogs only, MusicBrainz only, Discogs preferred, or
 MusicBrainz preferred. Each is exact about what it overwrites and what it
