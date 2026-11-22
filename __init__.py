@@ -39,6 +39,7 @@ from .discogs_runtime import bind_api, get_api, log, settings, unbind_api
 # is done through the api object handed to enable(), not by importing
 # register_* functions.
 from picard.plugin3.api import BaseAction, OptionsPage
+from picard.util.thread import run_task
 
 from .discogs_client import DiscogsClient, clear_cache
 from .discogs_logging import (LEVEL_BASIC, LEVEL_DETAILED, LEVEL_OFF,
@@ -83,6 +84,9 @@ from .discogs_mapping import (
     tags_to_clear,
 )
 from .discogs_disc_dialog import CONFIDENT_DISC_SCORE, DiscMappingDialog, auto_map
+from .discogs_evidence import (album_location, contradicts_release, copy_evidence,
+                               discid_verdict, evidence_summary, match_facts,
+                               mb_release_discids, read_copy, search_terms)
 from .discogs_picker_dialog import DiscogsPickerDialog
 from .discogs_preview_dialog import DiscogsPreviewDialog
 from .discogs_search_dialog import DiscogsSearchDialog
@@ -670,14 +674,11 @@ def process_album(api, album, metadata, release) -> None:
             'release %s — using it directly instead of searching', linked_id,
         )
 
-    barcode = metadata.get('barcode') or None
-    catalog_number = metadata.get('catalognumber') or None
     artist = metadata.get('albumartist') or metadata.get('artist') or None
     album_title = metadata.get('album') or None
-
-    if not linked_id and not any([barcode, (catalog_number and artist), (artist and album_title)]):
-        log.debug('Discogs Enrichment: not enough metadata to search Discogs for album %r', album)
-        return
+    # What your copy says of its pressing (discogs_evidence), read from the album folder on a
+    # worker thread before anything is searched. Stays None when the folder is not read.
+    state = {'ev': None}
 
     def _on_release_detail(release_data):
         """Shared by both routes: the MusicBrainz-linked release fetch and
@@ -770,7 +771,7 @@ def process_album(api, album, metadata, release) -> None:
         if not results:
             log.debug('Discogs Enrichment: no Discogs results for album %r', album)
             return
-        ranked = rank_release_candidates(results, _mb_match_facts(metadata))
+        ranked = rank_release_candidates(results, match_facts(_mb_match_facts(metadata), state['ev']))
         best_score, best = ranked[0]
         plugin_log.detail(op, 'candidate scores: ' + '; '.join(
             f"{c.get('id')}={s} [{c.get('year')} {c.get('country')} "
@@ -797,22 +798,87 @@ def process_album(api, album, metadata, release) -> None:
                  resource_url, best_score)
         client.get_release(resource_url, _guard_async(_on_release_detail))
 
-    if linked_id:
-        client.get_release(linked_id, _guard_async(_on_release_detail))
-        return
+    def _search(barcode, catalog_number):
+        if not any([barcode, (catalog_number and artist), (artist and album_title)]):
+            log.debug('Discogs Enrichment: not enough metadata to search Discogs for album %r', album)
+            return
+        log.debug(
+            'Discogs Enrichment: searching Discogs for album %r '
+            '(barcode=%r, catno=%r, artist=%r, title=%r)',
+            album, barcode, catalog_number, artist, album_title,
+        )
+        client.search_releases_cascading(
+            barcode=barcode,
+            catalog_number=catalog_number,
+            artist=artist,
+            release_title=album_title,
+            handler=_guard_async(_on_search_results),
+        )
 
-    log.debug(
-        'Discogs Enrichment: no MusicBrainz->Discogs link, searching for album %r '
-        '(barcode=%r, catno=%r, artist=%r, title=%r)',
-        album, barcode, catalog_number, artist, album_title,
-    )
-    client.search_releases_cascading(
-        barcode=barcode,
-        catalog_number=catalog_number,
-        artist=artist,
-        release_title=album_title,
-        handler=_guard_async(_on_search_results),
-    )
+    def _start():
+        ev = state['ev']
+        # your copy's barcode and catalogue number first, the MusicBrainz release's otherwise
+        terms = search_terms(_mb_match_facts(metadata), ev)
+        if not linked_id:
+            _search(terms['barcode'], terms['catalog_number'])
+            return
+
+        def _on_linked(release_data):
+            # The barcode of your copy beats MusicBrainz's link: a release that does not carry
+            # it is another pressing, whatever MusicBrainz ties to the release Picard matched.
+            why = contradicts_release(ev, release_data)
+            if why:
+                plugin_log.decision(op, f'not using the MusicBrainz link: {why} \u2014 searching '
+                                        f'Discogs by your copy instead')
+                log.info('Discogs Enrichment: %s; searching Discogs by your copy instead', why)
+                _search(terms['barcode'], terms['catalog_number'])
+                return
+            _on_release_detail(release_data)
+
+        client.get_release(linked_id, _guard_async(_on_linked))
+
+    if not settings['folder_evidence']:
+        _start()
+        return
+    paths = [f.filename for f in album.iterfiles() if getattr(f, 'filename', None)]
+    if not paths:
+        plugin_log.detail(op, 'no files on the album yet \u2014 the folder is not read')
+        _start()
+        return
+    mb_discids = mb_release_discids(release)
+
+    def _gather():
+        loc = album_location(paths)
+        return loc, (copy_evidence(read_copy(loc)) if loc else None)
+
+    def _gathered(result=None, error=None):
+        try:
+            if not _album_is_alive(album):
+                return
+            if error is not None:
+                plugin_log.event(op, f'could not read the album folder: {error!r}')
+                log.warning('Discogs Enrichment: could not read the album folder of %r: %r', album, error)
+            else:
+                loc, ev = result
+                if loc is None:
+                    plugin_log.decision(op, 'album folder not read: the files are spread over a '
+                                            'folder holding other albums too')
+                else:
+                    state['ev'] = ev
+                    plugin_log.event(op, f'your copy ("{loc["album_folder"]}"): '
+                                         + '; '.join(evidence_summary(ev)))
+                    verdict = discid_verdict(ev, mb_discids)
+                    if verdict == 'agrees':
+                        plugin_log.decision(op, 'your disc ID is on the MusicBrainz release Picard '
+                                                'matched: that is your pressing')
+                    elif verdict == 'unknown':
+                        plugin_log.detail(op, 'your disc ID is not attached to the MusicBrainz '
+                                              'release Picard matched (MusicBrainz lists few disc IDs)')
+            _start()
+        except Exception:
+            log.error('Discogs Enrichment: folder evidence failed', exc_info=True)
+
+    run_task(_gather, _gathered)
 
 
 
@@ -1041,9 +1107,17 @@ class DiscogsOptionsPage(OptionsPage):
             'then rename artist A\'s page to "A & B". This writes "A" and "B" as separate\n'
             'names, each next to its own ID, on every album (with or without Discogs),\n'
             'so the album is listed under every collaborator.')
+        self.folder_evidence_checkbox = QtWidgets.QCheckBox(
+            'Read the album folder for which pressing you own', self)
+        self.folder_evidence_checkbox.setToolTip(
+            'Reads the album\'s folder and file names, rip logs, cue sheets and notes:\n'
+            'catalogue numbers, barcodes, disc IDs, the pressing year and what the copy was\n'
+            'made from. Discogs is searched by these first and its releases ranked against\n'
+            'them, and a Discogs release MusicBrainz links to is not applied when your\n'
+            'copy\'s barcode is not on it. Nothing in the folder is changed.')
         for box in (self.reverse_match_checkbox, self.skip_preview_checkbox,
                     self.auto_disc_map_checkbox, self.use_cache_checkbox,
-                    self.split_collab_checkbox):
+                    self.split_collab_checkbox, self.folder_evidence_checkbox):
             layout.addWidget(box)
 
         # --- troubleshooting log -----------------------------------------
@@ -1221,6 +1295,7 @@ class DiscogsOptionsPage(OptionsPage):
         _select_by_data(self.cover_art_scope_combo, ART_FRONT)
         self.use_cache_checkbox.setChecked(True)
         self.split_collab_checkbox.setChecked(True)
+        self.folder_evidence_checkbox.setChecked(True)
         _select_by_data(self.style_combo, STYLE_SEPARATE)
         _select_by_data(self.strictness_combo, STRICTNESS_NORMAL)
         _select_by_data(self.log_level_combo, LEVEL_BASIC)
@@ -1256,6 +1331,7 @@ class DiscogsOptionsPage(OptionsPage):
         self._update_art_warning()
         self.use_cache_checkbox.setChecked(bool(s['use_cache']))
         self.split_collab_checkbox.setChecked(bool(s['split_collaborations']))
+        self.folder_evidence_checkbox.setChecked(bool(s['folder_evidence']))
         _select_by_data(self.style_combo, s['style_mode'] or STYLE_SEPARATE)
         _select_by_data(self.strictness_combo, s['strictness'] or STRICTNESS_NORMAL)
         _select_by_data(self.log_level_combo, s['log_level'] or LEVEL_BASIC)
@@ -1291,6 +1367,7 @@ class DiscogsOptionsPage(OptionsPage):
         s['cover_art_scope'] = self.cover_art_scope_combo.currentData()
         s['use_cache'] = self.use_cache_checkbox.isChecked()
         s['split_collaborations'] = self.split_collab_checkbox.isChecked()
+        s['folder_evidence'] = self.folder_evidence_checkbox.isChecked()
         s['style_mode'] = self.style_combo.currentData()
         s['strictness'] = self.strictness_combo.currentData()
         s['log_level'] = self.log_level_combo.currentData()
@@ -1298,6 +1375,34 @@ class DiscogsOptionsPage(OptionsPage):
         _configure_log()
 
 
+
+
+def _selection_paths(objs) -> list[str]:
+    """The paths of the audio files in a selection (albums, clusters, tracks, files)."""
+    out = []
+    for obj in objs or ():
+        if hasattr(obj, 'iterfiles'):
+            out += [f.filename for f in obj.iterfiles() if getattr(f, 'filename', None)]
+        elif getattr(obj, 'filename', None):
+            out.append(obj.filename)
+    return list(dict.fromkeys(out))
+
+
+def _selection_evidence(objs, op):
+    """discogs_evidence.copy_evidence of the selection's album folder, or None (setting off,
+    no files, a folder holding other albums, or a read that failed)."""
+    if not settings['folder_evidence']:
+        return None
+    try:
+        loc = album_location(_selection_paths(objs))
+        if loc is None:
+            return None
+        ev = copy_evidence(read_copy(loc))
+    except Exception:
+        log.warning('Discogs Enrichment: could not read the album folder', exc_info=True)
+        return None
+    plugin_log.event(op, f'your copy ("{loc["album_folder"]}"): ' + '; '.join(evidence_summary(ev)))
+    return ev
 
 
 class _DiscogsSearchBase(BaseAction):
@@ -1399,13 +1504,17 @@ class _DiscogsSearchBase(BaseAction):
                 linked_id = found
                 break
 
+        # What your copy says of its pressing: pre-fills the search and ranks the results.
+        ev = _selection_evidence(objs, self.op)
+        terms = search_terms(_mb_match_facts(metadata), ev)
         date = metadata.get('date') or ''
+        year = str((ev or {}).get('year') or '') or (date[:4] if len(date) >= 4 and date[:4].isdigit() else '')
         defaults = {
             'artist': metadata.get('albumartist') or metadata.get('artist') or '',
             'release_title': metadata.get('album') or '',
-            'year': date[:4] if len(date) >= 4 and date[:4].isdigit() else '',
-            'catalog_number': metadata.get('catalognumber') or '',
-            'barcode': metadata.get('barcode') or '',
+            'year': year,
+            'catalog_number': terms['catalog_number'] or '',
+            'barcode': terms['barcode'] or '',
             # Label and country are deliberately NOT pre-filled. Discogs
             # treats every field as a requirement, and its label naming
             # rarely matches MusicBrainz's ("EMI" vs "EMI Records"), so
@@ -1465,7 +1574,7 @@ class _DiscogsSearchBase(BaseAction):
             match_details: list[dict] = []
             if results:
                 ranked = rank_release_candidates_detailed(
-                    results, _mb_match_facts(metadata))
+                    results, match_facts(_mb_match_facts(metadata), ev))
                 match_details = [detail for detail, _candidate in ranked]
                 results = [candidate for _detail, candidate in ranked]
             if not results:

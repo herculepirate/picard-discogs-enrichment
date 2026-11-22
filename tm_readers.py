@@ -7,37 +7,1608 @@ Copyright (C) the TagMender authors. GPL-2.0-or-later, as this plugin.
 # flake8: noqa
 from __future__ import annotations
 
-import base64
 import contextvars
 import hashlib
 import json
+import marshal
+import mutagen
 import os
 import re
-import shutil
 import sqlite3
-import subprocess
-import sys
-import tempfile
 import threading
 import time
 import unicodedata
-import zipfile
+import zlib
 from collections import Counter
-from contextlib import contextmanager
+from dataclasses import field
+from mutagen.id3 import ID3
+from mutagen.mp4 import MP4, MP4FreeForm
 from pathlib import Path
-
-import mutagen
 
 try:
     from . import tm_match_core as mc
 except ImportError:  # run outside Picard (tests)
     import tm_match_core as mc
 
+class stagetimes:  # stand-in: TagMender's per-stage timing, not kept here
+    import contextlib as _c
+    stage = staticmethod(lambda *_a, **_k: stagetimes._c.nullcontext())
+
+
+# --- exclusions.py:237
+# --------------------------------------------------------------------------
+# Metadata of a file, for the conditions
+# --------------------------------------------------------------------------
+_ID3 = {"TALB": "album", "TIT2": "title", "TPE1": "artist", "TPE2": "albumartist", "TCON": "genre",
+        "TRCK": "tracknumber", "TPOS": "discnumber", "TCMP": "compilation"}
+
+
+# --- exclusions.py:239
+_MP4 = {"\xa9alb": "album", "\xa9nam": "title", "\xa9ART": "artist", "aART": "albumartist", "\xa9gen": "genre",
+        "trkn": "tracknumber", "disk": "discnumber", "cpil": "compilation"}
+
+
+# --- exclusions.py:265
+# While meta_memo() is active (one identification, one album's plan) read_meta remembers each
+# file's metadata by (path, size, mtime, inode, ctime): the gates, the album keys and the
+# planner ask for the same unchanged file over and over, each a full metadata read; a file
+# edited meanwhile has other stamps and is read again.
+# meta_memo(store) keeps them in STORE, a dict that outlives the block (the watcher's passes,
+# the app's List first then Look Up): an unchanged file is not opened again on the next pass.
+# A file whose metadata is large (its pictures as text) is only remembered for one inner
+# meta_memo() block (one identification), never in the long-lived store. prune: on leaving
+# the block (a pass that ended, not one that failed), what it never asked for (files gone or
+# changed) is dropped from the store - every such entry (True), or only those inside the
+# folders the pass read whole (a list of them: PRF-2, a listing of one folder keeps the rest
+# of the library's).
+# PRF-2: an entry is trusted while the file's stamps are the same, pass after pass: a library
+# of 90,000 files on a network share takes over an hour to read, so a store that forgot by
+# the half hour, or held fewer files than the library, had every file opened again on the next
+# pass. The stamps miss some edits: on FAT/exFAT the ctime does not change when a file is
+# written, and a tagger told to keep the modification time (and the size: a padded tag) leaves
+# every stamp as it was. So an entry is still read again after META_STORE_AGE - a working day:
+# the passes of one session read a file once, and such an edit is seen by the next day's.
+# The store holds META_STORE_CAP files at most (the ones stored longest ago are dropped):
+# more than a large library, each kept compressed (well under 1 kB for a typical file's tags:
+# tens of MB for a library, a few hundred at the cap).
+_META_MEMO = contextvars.ContextVar("tagmender_meta_memo", default=None)
+
+
+# --- exclusions.py:266
+META_STORE_MAX = 64 * 1024              # (characters of one file's metadata kept in a store)
+
+
+# --- exclusions.py:267
+META_STORE_AGE = 8 * 3600.0             # (seconds an entry of a long-lived store is trusted)
+
+
+# --- exclusions.py:268
+META_STORE_CAP = 500_000                # (files a long-lived store holds at most)
+
+
+# --- exclusions.py:269
+_META_STORE_LOCK = threading.Lock()     # (the app's store is shared by its worker threads)
+
+
+# --- exclusions.py:279
+def _meta_size(meta) -> int:
+    return sum(len(k) + sum(len(v) for v in vals) for k, vals in meta.items())
+
+
+# --- exclusions.py:328
+def read_meta(path):
+    """{field: [values]} for one file: its tags (all of them, lower-case names)
+    plus filename, folder, path and format. Never raises."""
+    memo = _META_MEMO.get()
+    if memo is None:
+        return _read_meta(path)
+    try:
+        st = os.stat(path)
+        key = (str(path), st.st_size, st.st_mtime_ns, st.st_ino, st.st_ctime_ns)
+    except OSError:
+        return _read_meta(path)
+    if memo.seen is not None:
+        memo.seen.add(key)
+    meta = None
+    if memo.store is not None:
+        # (stored as (when, meta packed); one stored longer than META_STORE_AGE is read again)
+        entry = memo.store.get(key)
+        if entry is not None and time.monotonic() - entry[0] <= META_STORE_AGE:
+            meta = _unpack(entry[1])
+            if meta is not None:
+                return meta                              # (a fresh dict: callers may change theirs)
+    if meta is None and memo.local is not None:
+        meta = memo.local.get(key)
+    if meta is None:
+        meta = _read_meta(path)
+        if memo.store is not None and _meta_size(meta) <= META_STORE_MAX:
+            _store_meta(memo.store, key, meta)
+        elif memo.local is not None:
+            memo.local[key] = meta
+    return {k: list(v) for k, v in meta.items()}       # (a copy: callers may change theirs)
+
+
+# --- exclusions.py:360
+def _pack(meta):
+    """META as a long-lived store keeps it: compressed (PRF-2: a tenth of its size in memory);
+    as it is when it cannot be packed."""
+    try:
+        return zlib.compress(marshal.dumps(meta), 1)
+    except (ValueError, TypeError):
+        return meta
+
+
+# --- exclusions.py:369
+def _unpack(packed):
+    """A fresh {field: [values]} of a stored entry (None when it cannot be read back)."""
+    if isinstance(packed, bytes):
+        try:
+            return marshal.loads(zlib.decompress(packed))
+        except (ValueError, TypeError, EOFError, zlib.error):
+            return None
+    return {k: list(v) for k, v in packed.items()}
+
+
+# --- exclusions.py:379
+def _store_meta(store, key, meta):
+    """Keep META in a long-lived store, as stored now (last in its order), dropping the
+    entries stored longest ago beyond META_STORE_CAP."""
+    with _META_STORE_LOCK:
+        store.pop(key, None)
+        store[key] = (time.monotonic(), _pack(meta))
+        while len(store) > META_STORE_CAP:
+            store.pop(next(iter(store)))
+
+
+# --- exclusions.py:389
+def _read_meta(path):
+    """_read_file_meta, charged to the "tags" stage of an album being timed (stagetimes)."""
+    with stagetimes.stage("tags"):
+        return _read_file_meta(path)
+
+
+# --- exclusions.py:403
+# PRF-2: a picture or other binary item among the tags is no text: its value is "[binary data
+# (N bytes)]" (as mutagen names an ASF one), never the picture's bytes written out as text - an
+# APEv2 cover, an ID3 frame carrying bytes (APIC, GEOB, PRIV: a DJ program's data, UFID, MCDI),
+# an MP4 covr or other non-text bytes, a Vorbis METADATA_BLOCK_PICTURE (base64). Text frames and
+# text in bytes (an MP4 free-form tag's UTF-8) stay text. Nothing reads such data from here
+# (artwork reads the files itself); written out, one picture or DJ frame made a file's
+# metadata too large to be remembered (META_STORE_MAX), so every such track was opened again on
+# each pass.
+_PICTURE_FIELDS = {"metadata_block_picture", "coverart"}
+
+
+# --- exclusions.py:406
+def _binary_text(key, value):
+    """The text a binary tag value stands as ("[binary data (N bytes)]"); None for text."""
+    try:
+        from mutagen.apev2 import APEBinaryValue
+        from mutagen.mp4 import MP4Cover, MP4FreeForm, AtomDataType
+    except ImportError:                              # pragma: no cover
+        return None
+    data = getattr(value, "data", None)
+    if isinstance(value, APEBinaryValue):
+        n = len(value.value)
+    elif isinstance(value, MP4Cover):
+        n = len(value)
+    elif isinstance(data, (bytes, bytearray)) and not hasattr(value, "text"):
+        n = len(data)                                # (an ID3 frame of bytes: APIC, GEOB, PRIV, UFID ...)
+    elif isinstance(value, (bytes, bytearray)):
+        if isinstance(value, MP4FreeForm) and value.dataformat in (AtomDataType.UTF8, AtomDataType.UTF16):
+            return None                              # (a free-form tag's text)
+        try:
+            text = bytes(value).decode("utf-8")
+        except UnicodeDecodeError:
+            text = None
+        if text is not None and not any(c < " " and c not in "\t\n\r" for c in text):
+            return None                              # (text, as bytes)
+        n = len(value)
+    elif isinstance(value, str) and str(key).casefold() in _PICTURE_FIELDS:
+        n = len(value) * 3 // 4                      # (base64: the picture's own size)
+    else:
+        return None
+    return f"[binary data ({n} bytes)]"
+
+
+# --- exclusions.py:437
+def _read_file_meta(path):
+    p = Path(path)
+    meta = {"filename": [p.name], "folder": [p.parent.name], "path": [str(p)],
+            "format": [p.suffix.lower().lstrip(".")]}
+    try:
+        f = mutagen.File(p)
+    except Exception:
+        f = None
+    if f is None:
+        return meta
+    meta["format"].append(type(f).__name__.lower())
+    tags = getattr(f, "tags", None) or {}
+    try:
+        items = list(tags.items())
+    except Exception:
+        items = []
+    for k, v in items:
+        key = str(k)
+        vals = v if isinstance(v, list) else [v]
+        text = []
+        for x in vals:
+            x = getattr(x, "text", x)
+            for y in (x if isinstance(x, list) else [x]):
+                pic = _binary_text(key, y)
+                if pic is not None:
+                    text.append(pic)
+                    continue
+                if isinstance(y, (bytes, bytearray)):
+                    y = y.decode("utf-8", "ignore")
+                if isinstance(y, tuple):
+                    y = "/".join(str(z) for z in y)
+                text.append(str(y))
+        name = _ID3.get(key[:4]) if key[:4] in _ID3 else _MP4.get(key)
+        if key.startswith("TXXX:"):
+            name = key[5:].casefold()
+        elif key.startswith("----:com.apple.iTunes:"):
+            name = key.split(":", 2)[2].casefold()
+        name = name or key.casefold()
+        meta.setdefault(name, []).extend(t for t in text if t)
+    return meta
+
+
+# --- exclusions.py:544
+def album_key(meta):
+    """Files of one album share album + album artist tags; untagged files are
+    grouped by folder until identified."""
+    album = (meta.get("album") or [""])[0].strip().casefold()
+    artist = ((meta.get("albumartist") or meta.get("artist") or [""])[0]).strip().casefold()
+    if album:
+        return ("tags", artist, album)
+    return ("folder", (meta.get("path") or [""])[0].rsplit("/", 1)[0])
+
+
+# --- exclusions.py STATE_DIR (overridden by vendor_tagmender.py)
+STATE_DIR = Path("/nonexistent/tagmender-state-not-read-by-the-plugin")
+
+
+# --- tagio.py:386
+# A read-only memo of opened files, for the planner: one album's plan asks about the same
+# unchanged file a dozen times (read, canonical, file_vars, ...), each a fresh mutagen.File
+# (a metadata read, covers included). Only the read-only helpers below go through
+# _read_only_open; open_file itself never does, so write, fix_opus_pictures, edit_id3 and the
+# executor can never be handed a cached (shared) object. Outside reading() it is open_file.
+_READ_MEMO = contextvars.ContextVar("tagmender_read_memo", default=None)
+
+
+# --- tagio.py:420
+def read_only_mutagen_file(path):
+    """mutagen.File(path) (None for a file mutagen does not know), remembered like
+    _read_only_open while reading() is active. For code that only reads the tags and info."""
+    memo = _READ_MEMO.get()
+    if memo is None:
+        return mutagen.File(path)
+    try:
+        st = os.stat(path)
+        key = ("mutagen.File", os.path.realpath(path), st.st_size, st.st_mtime_ns, st.st_ino, st.st_ctime_ns)
+    except OSError:
+        return mutagen.File(path)
+    if key not in memo:
+        memo[key] = mutagen.File(path)
+    return memo[key]
+
+
+# --- match_albums.py:89
+AUDIO_EXT = {".flac", ".mp3", ".m4a", ".mp4", ".ogg", ".opus", ".oga", ".wv",
+             ".ape", ".wav", ".aif", ".aiff", ".dsf", ".dff", ".wma", ".mpc"}
+
+
+# --- match_albums.py:99
+# --------------------------------------------------------------------------
+# Reading what the files say
+# --------------------------------------------------------------------------
+def _txt(v):
+    if isinstance(v, (list, tuple)):
+        v = v[0] if v else ""
+    if isinstance(v, bytes):
+        v = v.decode("utf-8", "ignore")
+    return str(v).strip()
+
+
+# --- match_albums.py:116
+def _names(v):
+    """All values of a multi-valued artist tag, joined. The Discogs Enrichment
+    plugin writes a collaboration as ONE NAME PER ARTIST (albumartist =
+    ["Max Corbacho", "Bruno Sanfilippo"]); reading only the first value would
+    see half the credit."""
+    vals = v if isinstance(v, (list, tuple)) else [v]
+    out = []
+    for x in vals:
+        if isinstance(x, bytes):
+            x = x.decode("utf-8", "ignore")
+        x = str(x).strip()
+        if x and x not in out:
+            out.append(x)
+    return "; ".join(out)
+
+
+# --- match_albums.py:132
+def _int(v):
+    m = re.match(r"\s*(\d+)", str(v or ""))
+    return int(m.group(1)) if m else 0
+
+
+# --- match_albums.py:137
+_ID_KEYS = ("musicbrainzalbumid", "discogsreleaseid")
+
+
+# --- match_albums.py:138
+_ID_FIELDS = {"musicbrainzalbumid": "musicbrainz_albumid", "discogsreleaseid": "discogs_release_id"}
+
+
+# --- match_albums.py:139
+_LOSSLESS_EXT = {".flac", ".wav", ".aiff", ".aif", ".wv", ".ape", ".alac"}
+
+
+# --- match_albums.py:141
+# a lossless file's codec as Discogs names a download's ("FLAC", "ALAC": match_core.LOSSLESS_CODECS)
+_CODEC_OF_EXT = {".flac": "flac", ".wav": "wav", ".aiff": "aiff", ".aif": "aiff", ".wv": "wavpack",
+                 ".ape": "ape", ".alac": "alac"}
+
+
+# --- match_albums.py:143
+CD_FRAME = 588          # a CD sector holds 588 stereo samples at 44.1 kHz
+
+
+# --- match_albums.py:145
+# catalogue number tag names used by Picard, JRiver (LABELNO), foobar2000, Mp3tag and others
+_CATNO_KEYS = ("catalognumber", "labelno", "catalogno", "catalog", "catno", "catalog#",
+               "cataloguenumber", "catalogue", "catalogueno",
+               # CAT-10: other taggers' and rippers' names for it ("SERIAL_NO", "CAT#", "CATNR")
+               "cat#", "catnr", "catnum", "catalognr", "catalognum", "cataloguenr", "catalogue#",
+               "serialno", "serialnumber", "serial#")
+
+
+# --- match_albums.py:153
+# CAT-10: a whole format word after the number in such a tag, searched without it ("61422-3116-1
+# LP", "TOOL 8391 (2LP)", "XYZ 123 CD"): LP, 2LP / 2xLP, CD, MC, EP, Vinyl - never a digit of the
+# number ("ABC 1 CD" is ABC 1) nor a glued "3CD" (4AD's "CAD 3CD" is the number)
+_CATNO_FORMAT_TAIL = re.compile(r"\s+[(\[]?(?:(?:[2-9]\s*x\s*|[2-9])?LP|CD|MC|EP|vinyl)[)\]]?\s*$", re.I)
+
+
+# --- match_albums.py:156
+# VIN-10: tag names that say what the copy was ripped from ("SOURCE", "SCOURCE", "RIP SOURCE");
+# a name one letter off "source" counts too ("scource", "sorce"), never "course"
+_SOURCE_KEYS = ("source", "sourcemedia", "sourcemedium", "ripsource", "mediasource", "sourceformat",
+                "sourcetype", "ripfrom", "rippedfrom", "lineage")
+
+
+# --- match_albums.py:160
+# ... and tag names that may name a release's media too (another tagger copies them from the
+# release it chose): a weak sign only
+_MEDIA_KEYS = ("media", "medium", "mediatype", "format", "releaseformat")
+
+
+# --- match_albums.py:163
+# barcode tag names: Picard's BARCODE, and the UPC / EAN / "EAN/UPN" other taggers and shops
+# write (compared without spaces, dashes, underscores or slashes)
+_BARCODE_KEYS = ("barcode", "upc", "ean", "eanupn", "eanupc", "upcean", "ean13", "upca", "upccode",
+                 "eancode", "barcodenumber")
+
+
+# --- match_albums.py:165
+_ASIN_KEYS = ("asin", "amazonid", "amazonasin")
+
+
+# --- match_albums.py:167
+# An Amazon product ID: "B0..." or, for older CDs and books, an ISBN-10-like number
+_ASIN = re.compile(r"(?:B0[0-9A-Z]{8}|\d{9}[\dX])")
+
+
+# --- match_albums.py:170
+def _tag_catno_forms(infos) -> tuple:
+    """CAT-10: the catalogue numbers the files' tags hold - (each as written, as searched): a
+    number is compared as written; a whole format word after it ("61422-3116-1 LP") is left out
+    of the search only, never of the number compared."""
+    whole, searched = [], []
+    for _p, i in infos:
+        for c in mc.split_codes(i["catno"]):
+            bare = _CATNO_FORMAT_TAIL.sub("", c).strip() or c
+            if c not in whole:
+                whole.append(c)
+            if bare not in searched:
+                searched.append(bare)
+    return whole, searched
+
+
+# --- match_albums.py:185
+def _one_off(a, b):
+    """A and B differ by one letter added, dropped or changed."""
+    if a == b or abs(len(a) - len(b)) > 1:
+        return a == b
+    if len(a) > len(b):
+        a, b = b, a
+    i = 0
+    while i < len(a) and a[i] == b[i]:
+        i += 1
+    return a[i + (len(a) == len(b)):] == b[i + 1:]
+
+
+# --- match_albums.py:197
+def _source_key(key):
+    """VIN-10: a tag name that says what the copy was ripped from (misspelt too)."""
+    k = _plain_key(key)
+    return k in _SOURCE_KEYS or (k not in ("course", "sources", "sourced", "resource") and _one_off(k, "source"))
+
+
+# --- match_albums.py:206
+# VIN-10: a value naming a record as what was ripped: "VINYL", "Vinyl LP", "2LP", "12\" Vinyl", "7\"",
+# "Vinyl > 24/96" - the record first, never "WEB (vinyl master)", "CD", "Vinyl remaster" (a
+# master's word), "Record Store Day 2019 WEB" (a shop's or a download's word anywhere)
+_VINYL_VALUE = re.compile(r"^\W*(?:\d\s*x\s*|\d\s*)?(?:vinyl|LPs?|12\"|10\"|7\"|record|schallplatte)(?![\w\"])", re.I)
+
+
+# --- match_albums.py:207
+_NOT_VINYL_VALUE = re.compile(r"\b(?:re-?master\w*|master(?:ed)?|web|cd|digital|download\w*|stream\w*|store|shop|"
+                              r"qobuz|tidal|bandcamp|hdtracks|itunes|cassette|tape|reel)\b", re.I)
+
+
+# --- match_albums.py:210
+# a disc number that is a record's side ("A", "B2", "Side C")
+_SIDE_DISC = re.compile(r"^\s*(?:side\s*)?([A-H])\s*\d{0,2}\s*$", re.I)
+
+
+# --- match_albums.py:213
+def _source_tags(t, items):
+    """VIN-10: what the file's tags say it was ripped from - t["source_vinyl"] (a source tag naming
+    the record: strong), t["media_vinyl"] (a media/format tag naming it: weak)."""
+    for k, v in items:
+        val = _txt(v if isinstance(v, (list, tuple)) else [v])
+        if val and (_source_key(k) or _plain_key(k) in _MEDIA_KEYS):
+            t["source_any"] = f"{t.get('source_any', '')} {val}".strip()      # (a tape's word vetoes)
+        if not val or not _VINYL_VALUE.search(val) or _NOT_VINYL_VALUE.search(val):
+            continue
+        if _source_key(k):
+            t["source_vinyl"] = val
+        elif _plain_key(k) in _MEDIA_KEYS:
+            t["media_vinyl"] = val
+
+
+# --- match_albums.py:228
+def _plain_key(key):
+    """A tag name to compare: lower case, letters and digits only ("EAN/UPN" is "eanupn")."""
+    return re.sub(r"[^a-z0-9]", "", str(key).lower())
+
+
+# --- match_albums.py:233
+def _code_tag(t, key, value):
+    """A barcode or ASIN tag under any of its names. BARCODE is kept as Picard wrote it;
+    UPC/EAN spellings only when their check digit is right; an ASIN that is a whole
+    barcode counts as the barcode, one shaped like an Amazon ID is kept as the ASIN only.
+    An empty tag never erases a code read before. t["barcode_from"] names the tag a
+    barcode came from when it is not BARCODE (a shop's UPC is often the download's code).
+    True when the key is one of these names."""
+    name = str(key).upper()
+    key = _plain_key(key)
+    value = str(value or "").strip()
+    digits = re.sub(r"[\s\-]", "", value)
+    if key == "barcode":
+        if value:
+            t["barcode"], t["barcode_from"] = value, ""
+    elif key in _BARCODE_KEYS:
+        if not t["barcode"] and mc.valid_barcode(digits):
+            t["barcode"], t["barcode_from"] = digits, name
+    elif key in _ASIN_KEYS:
+        if mc.valid_barcode(digits):
+            if not t["barcode"]:
+                t["barcode"], t["barcode_from"] = digits, name
+        elif _ASIN.fullmatch(digits.upper()) and not t.get("asin"):
+            t["asin"] = digits.upper()
+    else:
+        return False
+    return True
+
+
+# --- match_albums.py:261
+def labels_from_text(text, limit=3):
+    """Label names a ripper's or shop's notes write out ("Label: Dobles Music / Tidal",
+    "Record label = X", a cue sheet's REM LABEL "X"). Searched with the catalogue number;
+    never evidence by themselves."""
+    out = []
+    found = sorted(list(_LABEL_LINE.finditer(text or "")) + list(_LABEL_CAT_LINE.finditer(text or "")),
+                   key=lambda m: m.start())
+    for m in found:
+        for name in re.split(r"\s+/\s+|\s*;\s*", m.group(1)):
+            name = name.strip(" \t\"'.,")
+            if 2 <= len(name) <= 60 and re.search(r"[^\W\d_]", name) and name not in out:
+                out.append(name)
+    return out[:limit]
+
+
+# --- match_albums.py:278
+# "Label:", "Record label =", a cue's REM LABEL "X", and the Russian trackers' "Лейбл:",
+# "Издатель (лейбл):"
+_LABEL_WORD = r"(?:(?:record[ \t]+)?label|лейбл|издатель(?:[ \t]*\(лейбл\))?)"
+
+
+# --- match_albums.py:279
+_LABEL_LINE = re.compile(r"(?im)^[ \t]*(?:REM[ \t]+)?" + _LABEL_WORD +
+                         r"[ \t]*(?:[:=][ \t]*|[ \t]+(?=\"))(.+?)[ \t]*$")
+
+
+# --- match_albums.py:283
+# the label and catalogue number on one line: "Label / Cat#: Century Media / 77587-2",
+# "Лейбл / Номер по каталогу: Century Media / 77587-2" (the label is the part before the " / ")
+_LABEL_CAT_LINE = re.compile(
+    r"(?im)^[ \t]*" + _LABEL_WORD + r"[ \t]*/[ \t]*(?:cat(?:alog(?:ue)?)?\.?[ \t]*(?:#|no\.?|number)"
+    r"|номер[ \t]+по[ \t]+каталогу|каталожный[ \t]+номер|кат\.?[ \t]*номер)[ \t]*[:=][ \t]*(.+?)[ \t]+/[ \t]+\S.*$")
+
+
+# --- match_albums.py:288
+def search_labels(tag_label, text=""):
+    """Label names to search with the catalogue number: the tags' label (one per ";"),
+    then any the notes name."""
+    out = [x.strip() for x in re.split(r"\s*;\s*", tag_label or "") if x.strip()]
+    return out + [x for x in labels_from_text(text) if x not in out]
+
+
+# --- match_albums.py:295
+_ISRC = re.compile(r"\b([A-Z]{2}[A-Z0-9]{3}\d{7})\b")
+
+
+# --- match_albums.py:301
+# What a shop writes into the files it sells: Bandcamp's "Visit http://band.bandcamp.com"
+# comment, a Tidal track URL, an Amazon Music album URL, Qobuz's name. They say where the
+# FILES came from (a download), not which release they were tagged as, so a blind run
+# keeps them (King Goat - King Goat: whole CD sectors, but bought on Bandcamp).
+_DOWNLOAD_MARKS = (("Bandcamp", re.compile(r"\bvisit\s+https?://[\w-]+\.bandcamp\.com", re.I)),
+                   ("Tidal", re.compile(r"\btidal\.com/(?:browse/)?track/\d+", re.I)),
+                   ("Amazon Music", re.compile(r"\bmusic\.amazon\.[a-z.]+/albums/", re.I)),
+                   ("Qobuz", re.compile(r"(?<![a-z0-9])qobuz(?![a-z0-9])", re.I)))
+
+
+# --- match_albums.py:307
+def download_marker(text):
+    """The shop a file's comments and URLs name as where it was bought, or ""."""
+    return next((shop for shop, rx in _DOWNLOAD_MARKS if rx.search(text or "")), "")
+
+
+# --- match_albums.py:312
+def _source_clues(path, t):
+    """ISRC and every comment, URL and store ID in the tags, as one text, for
+    source_links() to read (Bandcamp/iTunes/Qobuz/Deezer/Spotify/Beatport pages,
+    MusicBrainz and Discogs release links)."""
+    try:
+        f = read_only_mutagen_file(path)
+    except Exception:
+        return
+    tags = getattr(f, "tags", None)
+    if not tags:
+        return
+    parts, isrc = [], ""
+    for k, v in tags.items():
+        key = str(k).lower()
+        if "tagmender" in key:
+            # PRV-1: TagMender's own record (TAGMENDER_SOURCE: the shop page ITS web search found)
+            # is no link the files came with - read back, it would prove the release it led to
+            # ("the shop page your files' tags link to"): what TagMender wrote never corroborates
+            # itself (as REP-1 reads the pressing fields its jobs wrote as they were before)
+            continue
+        vals = v if isinstance(v, list) else [v]
+        text = " ".join(str(getattr(x, "text", x) if not isinstance(x, bytes) else x.decode("utf-8", "ignore"))
+                        for x in vals)
+        if "isrc" in key or key.startswith("tsrc"):
+            isrc = isrc or text.strip().upper().replace("-", "")
+        elif (key == "stamp" or key.endswith(":stamp")) and "Classical Extras" in text:
+            parts.append(text)                                      # (CLS-2: Classical Extras' stamp)
+        elif key in ("plid", "cnid"):                               # iTunes album / track IDs
+            parts.append(f"itunes:{key}:{text.strip()}")
+        elif any(w in key for w in ("comm", "comment", "description", "url", "wxxx", "woaf", "woas", "wors",
+                                    "purl", "website", "source", "qobuz", "deezer", "spotify", "beatport",
+                                    "bandcamp", "itunes", "encoded", "ripp", "\xa9cmt")):
+            parts.append(text)
+    t["isrc"] = isrc if _ISRC.fullmatch(isrc or "") else ""
+    t["clue_text"] = " ".join(parts)[:4000]
+    t["download_marker"] = download_marker(t["clue_text"])
+    # A shop's own track ID, as its downloaders write it (SOURCE=Deezer, SOURCEID=1203751422):
+    # the shop's album page, which MusicBrainz links to the digital release, follows from it.
+    low = {str(k).lower(): v for k, v in tags.items()}
+    src = " ".join(str(x) for x in (low.get("source") or [])) if isinstance(low.get("source"), list) else ""
+    sid = " ".join(str(x) for x in (low.get("sourceid") or [])) if isinstance(low.get("sourceid"), list) else ""
+    if src.strip().lower() == "deezer" and sid.strip().isdigit():
+        t["store_track"] = f"deezer:{sid.strip()}"
+
+
+# --- match_albums.py:357
+_LINK_PATTERNS = (
+    ("musicbrainz", re.compile(r"musicbrainz\.org/release/([0-9a-f-]{36})")),
+    ("discogs", re.compile(r"discogs\.com/(?:[\w-]+/)?release/(\d+)")),
+    ("url", re.compile(r"(https?://[\w-]+\.bandcamp\.com/album/[\w-]+)")),
+    ("url", re.compile(r"(https?://(?:www\.)?deezer\.com/(?:\w{2}/)?album/\d+)")),
+    ("url", re.compile(r"(https?://open\.spotify\.com/album/\w+)")),
+    # with or without the country ("/us/"), the album's name and "id" before the number
+    ("url", re.compile(r"(https?://(?:music|itunes)\.apple\.com/(?:[a-z]{2}/)?album/(?:[^/?#\s]+/)?(?:id)?\d+)")),
+    ("url", re.compile(r"(https?://(?:www\.)?qobuz\.com/[\w/-]*album/[\w/-]+)")),
+    ("url", re.compile(r"(https?://(?:www\.)?beatport\.com/release/[\w-]+/\d+)")),
+)
+
+
+# --- match_albums.py:370
+def source_links(infos):
+    """Release links found in the files' own tags: (MusicBrainz ids, Discogs ids, other URLs)."""
+    text = " ".join(i.get("clue_text", "") for i in infos)
+    mb, dg, urls = set(), set(), []
+    for kind, rx in _LINK_PATTERNS:
+        for m in rx.findall(text):
+            if kind == "musicbrainz":
+                mb.add(m)
+            elif kind == "discogs":
+                dg.add(m)
+            elif m not in urls:
+                urls.append(m)
+    m = re.search(r"itunes:plid:(\d+)", text)
+    if m:
+        urls.append(f"https://music.apple.com/album/{m.group(1)}")
+    return mb, dg, urls
+
+
+# --- match_albums.py:840
+# "01 - Title", "1-03 Title", "A2. Title", "03. Artist - Title": tracks named by file only
+_NAME_NUM = re.compile(r"^(?:(\d)\s*[-.]\s*)?(\d{1,3})\s*(?:[-._)]\s*|\s+)(.+)$")
+
+
+# --- match_albums.py:841
+_NAME_SIDE = re.compile(r"^([A-Ha-h])(\d{1,2})\s*[-._)]?\s+(.+)$")
+
+
+# --- match_albums.py:844
+def names_from_files(infos):
+    """Fill track number, disc and title from the file names where the tags have none."""
+    parsed = []
+    for p, i in infos:
+        stem = Path(p).stem
+        m, side = _NAME_NUM.match(stem), _NAME_SIDE.match(stem)
+        if m:
+            parsed.append((p, i, int(m.group(1) or 0), int(m.group(2)), m.group(3).strip()))
+        elif side:
+            parsed.append((p, i, 0, (ord(side.group(1).upper()) - 64) * 100 + int(side.group(2)), side.group(3).strip()))
+        else:
+            parsed.append((p, i, 0, 0, stem))
+    rests = [r for *_x, r in parsed]
+    heads = {r.split(" - ", 1)[0] for r in rests if " - " in r}
+    common = next(iter(heads)) if len(heads) == 1 and all(" - " in r for r in rests) and len(rests) > 1 else None
+    sides = sorted({n for _p, _i, _d, n, _r in parsed if n >= 100})
+    for p, i, disc, num, rest in parsed:
+        title = rest.split(" - ", 1)[1] if common else rest
+        if re.fullmatch(r"[A-Z0-9-]{1,14}", title) and len(rests) > 1:
+            title = ""                                     # "001.ITKWEDTSIM": initials, not a title
+        if num >= 100 and sides:
+            num = sides.index(num) + 1                     # vinyl sides A1, A2, B1 ... in order
+        if not i.get("num") and num:
+            i["num"] = num
+        elif not i.get("num") and num == 0 and _NAME_NUM.match(Path(p).stem):
+            i["num0"] = True                               # "00 - Hidden": numbered 0
+        if not i.get("disc") and disc:
+            i["disc"] = disc
+        if not i.get("title") and title:
+            i["title"] = title.replace("_", " ").strip()
+
+
+# --- match_albums.py:876
+_MBID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+
+
+# --- match_albums.py:879
+# a bare MBID in a comment (not part of a link: those are read by source_links), and a
+# Discogs release number written out ("Discogs: 1441661", "DISCOGS_RELEASE_ID=1441661")
+_BARE_MBID = re.compile(r"(?<![0-9a-zA-Z/=-])(" + _MBID.pattern + r")(?![0-9a-zA-Z-])", re.I)
+
+
+# --- match_albums.py:880
+_BARE_DISCOGS = re.compile(r"\bdiscogs[ _-]?(?:release[ _-]?(?:id)?\s*[:#=]?|(?:id)?\s*[:#=]|r)\s*r?(\d{3,10})\b", re.I)
+
+
+# --- match_albums.py:883
+def _release_id(t, key, value):
+    """A release ID tag: the files were tagged before. Kept as a candidate to look up
+    and score like any other, never as proof (the tags may be wrong)."""
+    t["has_ids"] = True
+    value = str(value or "").strip()
+    # (TAG-3: the value as it stands, whatever its spelling - "r123", "[r123]" - for the
+    # plan's one release per file: engine._one_release reads it normalised)
+    if value:
+        t["id_tags"] = dict(t.get("id_tags") or {}, **{_ID_FIELDS[key]: value})
+    if key == "musicbrainzalbumid" and _MBID.fullmatch(value.lower()):
+        t["mb_albumid"] = value.lower()
+    elif key == "discogsreleaseid" and value.isdigit():
+        t["discogs_releaseid"] = value
+
+
+# --- match_albums.py:905
+# REP-1: the pressing details (and the album title holding the edition) a job of TagMender's
+# wrote, read again as they were before it when its own album is planned again
+# (not ISRCs: they name the recordings, shared by every pressing, and never pick one - Q4)
+# ... and the disc and track numbers it gave them (from the release's media: a bonus disc
+# numbered 3 after a DVD the files lack), which lay out the discs it is matched by
+# (and their totals, so restored numbers never sit beside TagMender's totals; MP4's trkn/disk
+# pairs are not restored: read as they are)
+REPLAN_FIELDS = ("barcode", "catalognumber", "label", "releasecountry", "media", "date", "album", "asin", "isrc",
+                 "discnumber", "tracknumber", "totaltracks", "totaldiscs")
+
+
+# --- match_albums.py:908
+# Vorbis names TagMender writes a field under besides its own (TOTALTRACKS and TRACKTOTAL)
+_VORBIS_ALIASES = {"totaltracks": ("tracktotal",), "totaldiscs": ("disctotal",)}
+
+
+# --- match_albums.py:910
+# ... where read_file finds them in ID3 and MP4 files (Vorbis comments: by the field's name)
+_ID3_FIELD = {"TPUB": "label", "TMED": "media", "TDRC": "date", "TDRL": "date", "TALB": "album",
+              "TPOS": "discnumber", "TRCK": "tracknumber"}
+
+
+# --- match_albums.py:912
+_ID3_TXXX_FIELD = {"catalognumber": "catalognumber", "barcode": "barcode", "asin": "asin",
+                   "musicbrainzalbumreleasecountry": "releasecountry"}
+
+
+# --- match_albums.py:914
+_MP4_FIELD = {"\xa9alb": "album", "\xa9day": "date", "catalognumber": "catalognumber", "barcode": "barcode",
+              "asin": "asin"}
+
+
+# --- match_albums.py:918
+# ... and in ASF (WMA) files, their WM/ names (as read_file's other keys see them: spaces,
+# "_" and "-" dropped, lower case), beside the field's own name
+_ASF_FIELD = {"catalognumber": "wm/catalogno", "label": "wm/publisher", "media": "wm/media",
+              "barcode": "wm/barcode", "date": "wm/year", "album": "wm/albumtitle",
+              "releasecountry": "musicbrainz/albumreleasecountry"}
+
+
+# --- match_albums.py:922
+# TagMender's own jobs, parsed once per plan file: {job: (plan.json mtime, albums)}
+_OWN_JOBS = {}
+
+
+# --- match_albums.py:924
+# the path index built from them: (signature of the job history, {path: (MusicBrainz ids, Discogs ids)})
+_OWN_INDEX = [None, {}]
+
+
+# --- match_albums.py:925
+_OWN_LOCK = threading.Lock()
+
+
+# --- match_albums.py:928
+def _own_job_files(job):
+    """[(source folder, exact, [(src, dst, op, MusicBrainz ids, Discogs ids)])] for each album
+    of a job's plan. The IDs are those the file holds afterwards that TagMender may own: the
+    ones it wrote of the release it identified exactly, or (no ID changed) any ID of that
+    release the file kept; never a preserved ID of another release. Cached per plan file."""
+    path = STATE_DIR / "jobs" / str(job) / "plan.json"
+    try:
+        mtime = path.stat().st_mtime
+    except OSError:
+        return []
+    with _OWN_LOCK:
+        hit = _OWN_JOBS.get(job)
+        if hit and hit[0] == mtime:
+            return hit[1]
+    albums = []
+    try:
+        plan = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        plan = {}
+    for a in plan.get("albums") or ():
+        ident = a.get("identification") or {}
+        exact = ident.get("tier") == "exact"
+        rid = str(ident.get("release_id") or "").lower()
+        chosen = frozenset(({rid} | set(_MB_DISCOGS_RE.findall(str(ident.get("url") or "")))) - {""})
+        # REP-1: a release identified by both databases ("musicbrainz+discogs") names one of
+        # them by its URL; the other's ID the job wrote came from that same pick (its field's
+        # provenance is that database), so it is TagMender's too
+        providers = set(str(ident.get("provider") or "").split("+")) - {""}
+        prov = ident.get("provenance") or {}
+        files = []
+        for fe in a.get("files") or ():
+            if not fe.get("dst"):
+                continue
+            rows = [r for r in fe.get("diff") or () if r.get("field")]
+            # (an ID row whose value the job left as it was - "kept (confidence below replace
+            # threshold)", preserved, locked - is no ID it wrote: the file kept the one it had)
+            after = {r.get("field"): str((r.get("after") or [""])[0] or "") for r in rows
+                     if r.get("field") in ("musicbrainz_albumid", "discogs_release_id")
+                     and _norm_values(r.get("before")) != _norm_values(r.get("after"))}
+            ids = []
+            for field in ("musicbrainz_albumid", "discogs_release_id"):
+                if field in after:          # written: only an ID of the release it identified
+                    v = after[field].lower() if field == "musicbrainz_albumid" else after[field]
+                    mine = chosen | ({v} if prov.get(field) in providers else set())
+                    ids.append(frozenset({v}) & mine)
+                else:                       # kept: the file's own ID, when it is that release's
+                    ids.append(chosen)
+            # REP-1: the pressing details the job wrote, as they were before it and as it left them
+            wrote = {r["field"]: (tuple(str(x) for x in r.get("before") or ()),
+                                  tuple(str(x) for x in r.get("after") or ()))
+                     for r in rows if r["field"] in REPLAN_FIELDS or pressing_field(r["field"])
+                     or credit_field(r["field"]) or r["field"] in ("tagmender", "tagmender_reason")}
+            # REP-1: the file named a release before this job: an ID row whose value before is not
+            # empty (whose, _own_index decides). Never inferred from a missing row: a job writes
+            # none for an ID it left alone, held or not (a preserved empty field, a source left out)
+            named = any(r.get("before") for r in rows if r["field"] in ("musicbrainz_albumid", "discogs_release_id"))
+            # (which IDs the job left as the file had them: an earlier job's own ID stays its own)
+            kept = tuple(f not in after for f in ("musicbrainz_albumid", "discogs_release_id"))
+            files.append((str(fe.get("src") or fe["dst"]), str(fe["dst"]), fe.get("op"), *ids, wrote, named, kept))
+        # REP-1 / TAG-1: what decided the pressing in this job ("pressing chosen by catalogue
+        # number 636834 on the scans", "... by track lengths closest ..."), or "": a later plan
+        # asks whether your copy still shows it (match_core._still_decides)
+        # (CHG-1: a release you chose is recorded as yours, whatever other clue the job also had)
+        said = [str(e) for e in ident.get("evidence") or () if str(e).startswith("pressing chosen by ")]
+        decided = "pressing chosen by you" if "pressing chosen by you" in said else (said[0] if said else "")
+        # (DSC-12a / DSC-14b / DSC-16: a held box or disc you ticked is your choice - kept by a later
+        # run as a release you chose is, unless a barcode or catalogue number of yours disagrees)
+        if a.get("held") and a.get("held_ok") and set(ident.get("reason_codes") or ()) & {
+                "disc_not_proven", "disc_id_box_disc", "lengths_box_disc"}:
+            decided = "pressing chosen by you"
+        albums.append((a.get("source_dir"), exact, files, decided))
+    with _OWN_LOCK:
+        _OWN_JOBS[job] = (mtime, albums)
+    return albums
+
+
+# --- match_albums.py:1004
+def _own_index():
+    """{file path: (MusicBrainz ids, Discogs ids)} TagMender's jobs own, built once per process
+    and again only when the job history changed (state.db, its WAL, its job rows)."""
+    db_path = STATE_DIR / "state.db"
+    try:
+        st = db_path.stat()
+    except OSError:
+        return {}
+    try:
+        wal = os.stat(str(db_path) + "-wal")
+        wal = (wal.st_mtime_ns, wal.st_size)
+    except OSError:
+        wal = None
+    try:
+        db = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=10)
+        try:
+            # the newest job and album row (job_albums is only ever appended to: its newest
+            # rowid is enough), and how many jobs were undone (jobs: one row per job, few)
+            sig = (str(db_path), st.st_mtime_ns, st.st_size, wal,
+                   db.execute("SELECT MAX(rowid), COUNT(*), SUM(status LIKE 'undone%') FROM jobs").fetchone(),
+                   db.execute("SELECT MAX(rowid) FROM job_albums").fetchone())
+            with _OWN_LOCK:
+                if _OWN_INDEX[0] == sig:
+                    return _OWN_INDEX[1]
+            rows = db.execute("SELECT a.job, a.album FROM job_albums a JOIN jobs j ON j.job = a.job "
+                              "WHERE a.status IN ('done', 'unchanged') AND COALESCE(j.status, '') NOT LIKE 'undone%' "
+                              "ORDER BY a.ts").fetchall()
+        finally:
+            db.close()
+    except sqlite3.Error:
+        return {}
+    done, last = {}, {}
+    for i, (job, folder) in enumerate(rows):
+        done.setdefault(job, set()).add(folder)
+        last[job] = i
+    owned, wrote, why = {}, {}, {}
+    # Jobs in order: a file a job moved carries what was owned at its old path to the new one
+    # (a copy to both); an album identified exactly owns the IDs that job left in its files.
+    # REP-1: wrote[path] = (the album folder the file was in before TagMender's first job on
+    # it, {field: (value before TagMender, value it left)}): the earliest job's "before" stands
+    for job in sorted(done, key=last.get):
+        for folder, exact, files, decided in _own_job_files(job):
+            if folder not in done[job]:
+                continue
+            for src, dst, op, mb, dg, fields, named, kept in files:
+                carried = owned.get(src)
+                # (release IDs the file had before this job that were not TagMender's: another
+                # tagger's - what it wrote beside them stays another tagger's word, REP-1)
+                foreign = bool(named) and carried is None
+                if src != dst and carried is not None:
+                    if op != "copy":
+                        owned.pop(src, None)
+                    owned[dst] = carried
+                if src != dst and src in why:
+                    why[dst] = why.pop(src) if op != "copy" else why[src]
+                if exact and (mb or dg) and decided:
+                    why[dst] = decided           # (a job that only kept the release keeps its reason)
+                elif exact and (mb or dg) and not all(kept):
+                    why.pop(dst, None)           # (a release chosen anew, its reason not recorded)
+                if exact and (mb or dg):
+                    # REP-1: an ID an earlier job of TagMender's wrote, which this job left as it
+                    # was (its pick below the replace threshold kept it), is still TagMender's own -
+                    # never another tagger's because a later job did not write it again
+                    was = carried or (frozenset(), frozenset())
+                    owned[dst] = (mb | (was[0] if kept[0] else frozenset()),
+                                  dg | (was[1] if kept[1] else frozenset()))
+                prior = wrote.get(src)
+                if src != dst and prior is not None and op != "copy":
+                    wrote.pop(src, None)
+                # (the folder the file lay in itself before TagMender's first job on it: the
+                # album folder only when that is the job's own folder, not one disc folder of a
+                # set the job planned under its first disc's name)
+                first_folder, first_dir, earlier, was_foreign = prior if prior else (folder, os.path.dirname(src), {},
+                                                                                     foreign)
+                # the earliest job's "before" stands while the chain is unbroken; a later job that
+                # found the field otherwise than the earlier one left it (you edited it in between)
+                # starts it again from what it found
+                merged = {f: (earlier[f][0] if f in earlier and _same_values(earlier[f][1], b) else b, a)
+                          for f, (b, a) in fields.items()}
+                merged.update({f: v for f, v in earlier.items() if f not in merged})
+                wrote[dst] = (first_folder, first_dir, merged, was_foreign)
+    with _OWN_LOCK:
+        _OWN_INDEX[:] = [sig, owned, wrote, why]
+    return owned
+
+
+# --- match_albums.py:1090
+def tagmender_decided(paths) -> str:
+    """REP-1 / TAG-1: what decided the pressing when TagMender's own job chose the release these
+    files carry ("pressing chosen by ..."), the same for every file; "" when no job recorded one
+    (a job before this was kept, a pick no clue of your copy decided) or the files disagree."""
+    if not paths:
+        return ""
+    _own_index()
+    with _OWN_LOCK:
+        why = _OWN_INDEX[3] if len(_OWN_INDEX) > 3 else {}
+    found = {why.get(str(p)) or why.get(os.path.realpath(str(p))) or "" for p in paths}
+    return found.pop() if len(found) == 1 else ""
+
+
+# --- match_albums.py:1103
+def tagmender_wrote(files):
+    """True when TagMender itself wrote the release IDs these files carry: for every file
+    [(path, MusicBrainz id, Discogs id)], a job of TagMender's (not undone) that ended done
+    or unchanged identified that release exactly and left that very ID in that file (written,
+    or kept as it was), and every later job of TagMender's that moved the file carried it to
+    this path. Read from the state database's job history and the jobs' plans (read only).
+    Re-processing such an album (a watched folder given a profile that moves it) keeps its
+    release IDs as TagMender's own (TAG-1); the pressing details its job wrote are read as they
+    were before it (REP-1, tagmender_originals).
+    False when any file's IDs are not TagMender's (another tagger, or edited since), or the
+    history is gone (pruned jobs, the album moved by hand since)."""
+    if not files:
+        return False
+    owned = _own_index()
+    if not owned:
+        return False
+    for path, mb, dg in files:
+        own = owned.get(str(path)) or owned.get(os.path.realpath(str(path)))
+        if not own or not (mb or dg) or (mb and str(mb).lower() not in own[0]) or (dg and str(dg) not in own[1]):
+            return False
+    return True
+
+
+# --- match_albums.py:1126
+def tagmender_originals(paths):
+    """REP-1: what TagMender's own jobs changed in these files, to read them as the copy was
+    before TagMender tagged it: (the album folder name before TagMender's first job on them,
+    {path: {field: (value before TagMender, value it left)}}, {path: whether that file named
+    another tagger's release before TagMender's first job on it}). read_file uses a value before
+    only where the field still holds what TagMender left (a field edited since is yours, and
+    read as it is). Only when TagMender's jobs tagged every one of the files; else ("", {})."""
+    if not paths:
+        return "", {}, {}
+    _own_index()
+    with _OWN_LOCK:
+        wrote = _OWN_INDEX[2] if len(_OWN_INDEX) > 2 else {}
+    folders, out, foreign = set(), {}, {}
+    for p in paths:
+        hit = wrote.get(str(p)) or wrote.get(os.path.realpath(str(p)))
+        if hit is None:
+            return "", {}, {}
+        folder, first_dir, fields, by_tagger = hit
+        foreign[str(p)] = bool(by_tagger)
+        # (a folder name only when every file lay in the job's own album folder or a disc folder
+        # inside it: never a disc folder of a set side by side, "Album CD1" / "Album CD2", whose
+        # job is named after its first disc - DSC-1)
+        top, own = os.path.normpath(str(folder or "")), os.path.normpath(str(first_dir or ""))
+        folders.add(os.path.basename(top) if own == top or own.startswith(top + os.sep) else None)
+        out[str(p)] = {f: v for f, v in fields.items() if f in REPLAN_FIELDS}
+    one = folders.pop() if len(folders) == 1 else None
+    return one or "", out, foreign
+
+
+# --- match_albums.py:1158
+# TAG-3: the fields of one pressing a job of TagMender's may have written (its release IDs, its
+# release track IDs, barcode, catalogue number, label, country, media, ASIN, the Discogs
+# plugin's fields of one release): what an album found album only again takes back
+RESTORE_FIELDS = ("musicbrainz_albumid", "musicbrainz_trackid", "discogs_release_id", "barcode", "catalognumber",
+                  "label", "releasecountry", "media", "asin")
+
+
+# --- match_albums.py:1160
+DG_ALBUM_FIELDS = ("discogs_master_id", "discogs_artist_id", "discogs_albumartist_id", "discogs_style")
+
+
+# --- match_albums.py:1163
+def pressing_field(field) -> bool:
+    """TAG-3: a field of one pressing (RESTORE_FIELDS, or a Discogs field of one release)."""
+    f = str(field or "")
+    return f in RESTORE_FIELDS or (f.startswith("discogs_") and f not in DG_ALBUM_FIELDS)
+
+
+# --- match_albums.py:1172
+# REP-2: the credit and performer roles of a track (Picard's names, the Discogs plugin's
+# discogs_credit_*): what a later identification of the same album may no longer give a file
+# (CRD-1 scoped Discogs credits to their tracks), taken back where TagMender's own job wrote it
+CREDIT_FIELDS = ("composer", "lyricist", "writer", "arranger", "conductor", "producer", "engineer", "mixer",
+                 "remixer", "djmixer", "orchestra", "chorusmaster")
+
+
+# --- match_albums.py:1176
+def credit_field(field) -> bool:
+    """REP-2: a credit or performer role (performer:*, producer, engineer, discogs_credit_* ...)."""
+    f = str(field or "").lower()
+    return f in CREDIT_FIELDS or f.startswith(("performer:", "discogs_credit_"))
+
+
+# --- match_albums.py:1224
+def _norm_values(values):
+    return tuple(str(v).strip() for v in values or () if str(v).strip())
+
+
+# --- match_albums.py:1229
+# how formats store several values in one (ID3v2.3 "/", APEv2 a NUL, some taggers "; ")
+_JOINS = ("/", "\x00", "; ", ";", " / ")
+
+
+# --- match_albums.py:1232
+def _same_values(current, written):
+    """The field holds what was written: the same values, or them joined as one (an ID3v2.3
+    frame "IOM 290/SPV 79690 CD", an APE item joined by NUL)."""
+    cur, want = _norm_values(current), _norm_values(written)
+    if cur == want:
+        return True
+    if len(cur) == 1 and len(want) > 1:
+        return cur[0] in {j.join(want) for j in _JOINS}
+    if len(want) == 1 and len(cur) > 1:
+        return want[0] in {j.join(cur) for j in _JOINS}
+    return False
+
+
+# --- match_albums.py:1247
+# TRK-8: the tags naming a file's MusicBrainz recording ("MUSICBRAINZ_TRACKID") or track
+# ("MUSICBRAINZ_RELEASETRACKID") - keys without spaces, dashes or underscores, lower-case
+_TRACK_ID_KEYS = ("musicbrainztrackid", "musicbrainzrecordingid", "musicbrainzreleasetrackid")
+
+
+# --- match_albums.py:1250
+def _track_id(t, value):
+    """TRK-8: add a MusicBrainz recording or track ID a file's tag gives to t["track_ids"]."""
+    v = str(value or "").strip().lower()
+    if re.fullmatch(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", v) and v not in t["track_ids"]:
+        t["track_ids"].append(v)
+
+
+# --- match_albums.py:1257
+def tag_release_ids(infos):
+    """(MusicBrainz ids, Discogs ids) the files' tags and comments name as their release."""
+    mb, dg = set(), set()
+    for i in infos:
+        if i.get("mb_albumid"):
+            mb.add(i["mb_albumid"])
+        if i.get("discogs_releaseid"):
+            dg.add(i["discogs_releaseid"])
+        text = i.get("clue_text") or ""
+        mb |= {m.lower() for m in _BARE_MBID.findall(text)}
+        dg |= set(_BARE_DISCOGS.findall(text))
+    return mb, dg
+
+
+# --- match_albums.py:1271
+def _before_tagmender(before, field, current):
+    """REP-1: the value a field had before TagMender's job wrote it, when it still holds what
+    the job left (`before`: {field: (before, after)}); else None (read the field as it is)."""
+    hit = (before or {}).get(field)
+    if hit is None or not _same_values(current, hit[1]):
+        return None
+    return list(hit[0])
+
+
+# --- match_albums.py:1280
+def read_file(path, before=None):
+    """The tags and audio facts of one file. `before` (REP-1, tagmender_originals): the
+    pressing details TagMender's own job wrote, read as they were before it."""
+    t = {"title": "", "num": 0, "disc": 0, "album": "", "artist": "", "track_artist": "", "year": 0,
+         "barcode": "", "barcode_from": "", "asin": "", "catno": "", "secs": 0.0,
+         "label": "", "country": "", "media": "", "date": "",   # pressing details in the tags
+         "country_plain": "",                                   # (CAT-10: a plain COUNTRY tag)
+         "rate": 0, "bits": 0, "samples": 0, "lossless": False,  # the audio itself
+         "has_ids": False,      # already carries a MusicBrainz or Discogs release ID
+         "mb_albumid": "", "discogs_releaseid": "",    # ... and which (a candidate, not evidence)
+         "id_tags": {},         # ... as written: {field: value} (TAG-3, engine._one_release)
+         "audio_md5": 0,        # FLAC's checksum of the decoded audio (0 = unknown)
+         "isrc": "", "clue_text": "",   # ISRC, and comments/URLs/store IDs left by shops and rippers
+         "download_marker": "",         # the shop those comments name (kept when blind)
+         "tracktotal": 0,               # the album's track count, as the tags have it
+         "write_failed_total": 0,       # TagMender's own "write_failed: ... 10 of 12" marker: the 12
+         "cdtoc": "",                   # the ripper's CDTOC tag: the whole disc's TOC ("20+96+1937+...")
+         "credit": "",                  # who the files say performed/wrote it: track artist, copyright, composer
+         "track_ids": []}               # TRK-8: the MusicBrainz recording and track IDs it is tagged with
+    try:
+        _source_clues(path, t)
+        # PRV-1: ISRCs TagMender's job wrote (from the release it chose) are read as they were
+        # before it - read back they would prove that release's recordings as the album's
+        hit = (before or {}).get("isrc")
+        if hit is not None and t.get("isrc"):
+            def _k(v):
+                return str(v or "").strip().upper().replace("-", "")
+            if t["isrc"] in {_k(v) for v in hit[1] or ()}:
+                was = [_k(v) for v in hit[0] or () if _k(v)]
+                t["isrc"] = was[0] if was and _ISRC.fullmatch(was[0]) else ""
+        if path.suffix.lower() in (".m4a", ".mp4"):
+            f = MP4(path)
+            t["secs"] = f.info.length
+            for k, v in (f.tags or {}).items():
+                nk = re.sub(r"[\s_\-]", "", (k.decode() if isinstance(k, bytes) else k).lower()
+                            .replace("----:com.apple.itunes:", ""))
+                field = _MP4_FIELD.get(k) or _MP4_FIELD.get(nk) if before else None
+                if field:
+                    cur = [x.decode("utf-8", "ignore") if isinstance(x, bytes) else str(x) for x in v]
+                    was = _before_tagmender(before, field, cur)
+                    if was is not None:
+                        v = was
+                if k == "\xa9nam": t["title"] = _txt(v)
+                elif k == "\xa9alb": t["album"] = _txt(v)
+                elif k == "aART": t["artist"] = _names(v)
+                elif k == "\xa9ART":
+                    t["track_artist"] = _txt(v)
+                    t["artist"] = t["artist"] or _txt(v)
+                elif k == "\xa9day": t["year"] = _int(v[0] if v else "")
+                elif k == "trkn" and v:
+                    t["num"], t["tracktotal"] = v[0][0], (v[0][1] if len(v[0]) > 1 else 0)
+                    # (trkn (0, N) is the total alone, no number: a file numbered 0 only when
+                    # its name says 00 too, names_from_files)
+                elif k == "disk" and v: t["disc"] = v[0][0]
+                elif _plain_key(nk) in _BARCODE_KEYS + _ASIN_KEYS: _code_tag(t, nk, _txt(v))
+                elif nk in _CATNO_KEYS and not t["catno"]: t["catno"] = _txt(v)
+                elif nk in _ID_KEYS: _release_id(t, nk, _txt(v))
+                elif nk in _TRACK_ID_KEYS: _track_id(t, _txt(v))
+                if nk in ("tagmender", "tagmenderreason"): t["tm_mark"] = True
+                if k in ("\xa9ART", "cprt", "\xa9wrt"): t["credit"] += " " + _txt(v)
+            return t
+        f = read_only_mutagen_file(path)
+        if f is None:
+            return t
+        t["secs"] = getattr(f.info, "length", 0.0) or 0.0
+        t["audio_md5"] = getattr(f.info, "md5_signature", 0) or 0
+        t["rate"] = getattr(f.info, "sample_rate", 0) or 0
+        t["bits"] = getattr(f.info, "bits_per_sample", 0) or 0
+        t["samples"] = getattr(f.info, "total_samples", 0) or 0
+        t["channels"] = getattr(f.info, "channels", 0) or 0
+        t["lossless"] = path.suffix.lower() in _LOSSLESS_EXT
+        t["codec"] = _CODEC_OF_EXT.get(path.suffix.lower(), "")
+        if t["lossless"] and not t["samples"] and t["rate"]:
+            t["samples"] = round(t["secs"] * t["rate"])        # WAV/AIFF/WavPack: from the length
+        tags = f.tags
+        if tags is None:
+            return t
+        if isinstance(tags, ID3) or tags.__class__.__module__.startswith("mutagen.id3"):
+            def fr(fid):
+                x = tags.getall(fid)
+                cur = [str(s) for s in x[0].text] if x else []
+                if fid in ("TRCK", "TPOS") and before:
+                    # (the number with its total, "5/11": TagMender wrote the number alone, "5", and
+                    # the total as its own field; the total read back is the job's or the one before)
+                    num = [c.split("/")[0].strip() for c in cur]
+                    field = _ID3_FIELD[fid]
+                    total = "totaltracks" if fid == "TRCK" else "totaldiscs"
+                    was = _before_tagmender(before, field, num)
+                    if was is not None:
+                        tot = _before_tagmender(before, total, [c.split("/")[1] for c in cur if "/" in c])
+                        tot = tot if tot is not None else [c.split("/")[1] for c in cur if "/" in c]
+                        return _txt([f"{was[0]}/{tot[0]}" if was and tot and tot[0] else (was[0] if was else "")])
+                    return _txt(cur)
+                was = _before_tagmender(before, _ID3_FIELD.get(fid, ""), cur) if before else None
+                return _txt(was if was is not None else cur)
+            def names(fid):
+                x = tags.getall(fid)
+                return _names([str(s) for s in x[0].text]) if x else ""
+            t["track_artist"] = names("TPE1")
+            t.update(title=fr("TIT2"), album=fr("TALB"), artist=names("TPE2") or names("TPE1"),
+                     year=_int(fr("TDRC")), num=_int(fr("TRCK")), disc=_int(fr("TPOS")),
+                     label=fr("TPUB"), media=fr("TMED"), date=fr("TDRL") or fr("TDRC"),
+                     credit=" ".join(fr(x) for x in ("TPE1", "TCOP", "TCOM", "TPE3")))
+            for frame in tags.getall("TXXX"):
+                nk = re.sub(r"[\s_\-]", "", frame.desc.lower())
+                if before and nk in _ID3_TXXX_FIELD:
+                    was = _before_tagmender(before, _ID3_TXXX_FIELD[nk], [str(x) for x in frame.text])
+                    if was is not None:
+                        frame = type("Frame", (), {"desc": frame.desc, "text": was})()
+                if _plain_key(nk) in _BARCODE_KEYS + _ASIN_KEYS: _code_tag(t, nk, _txt(frame.text))
+                elif nk in ("musicbrainzalbumreleasecountry", "releasecountry"): t["country"] = _txt(frame.text)
+                elif nk in _CATNO_KEYS and not t["catno"]: t["catno"] = _txt(frame.text)
+                elif nk in _ID_KEYS: _release_id(t, nk, _txt(frame.text))
+                elif nk in _TRACK_ID_KEYS: _track_id(t, _txt(frame.text))
+                elif nk == "tagmenderreason": _write_failed(t, _txt(frame.text))
+                if nk in ("tagmender", "tagmenderreason"): t["tm_mark"] = True
+                elif nk == "cdtoc": t["cdtoc"] = _txt(frame.text)
+            for frame in tags.getall("UFID"):            # (the recording's ID, as MusicBrainz taggers write it)
+                if "musicbrainz" in str(getattr(frame, "owner", "")).lower():
+                    _track_id(t, (frame.data or b"").decode("ascii", "ignore"))
+            t["tracktotal"] = _total(fr("TRCK"))
+            t["num0"] = _numbered_zero(fr("TRCK"))
+            t["disc_raw"] = fr("TPOS")                # (VIN-10: a record's side, "A", "B2")
+            _source_tags(t, [(fr_.desc, fr_.text) for fr_ in tags.getall("TXXX")])
+            return t
+        low = {}
+        for k, v in tags.items():
+            low.setdefault(re.sub(r"[\s_\-]", "", str(k).lower()), v)
+        for key in _TRACK_ID_KEYS:
+            if key in low:
+                _track_id(t, _txt(low[key] if isinstance(low[key], (list, tuple)) else [low[key]]))
+        every = {}                    # (FLAC/Ogg list one value per item: every value of a field)
+        for k, v in tags.items() if before else ():
+            every.setdefault(re.sub(r"[\s_\-]", "", str(k).lower()), []).extend(
+                v if isinstance(v, (list, tuple)) else [v])
+        for field in before or ():
+            for key in (re.sub(r"[\s_\-]", "", field.lower()), _ASF_FIELD.get(field), *_VORBIS_ALIASES.get(field, ())):
+                if not key or (key != field and key not in every):
+                    continue
+                was = _before_tagmender(before, field, [str(x) for x in every.get(key) or ()])
+                if was is not None:
+                    if was:
+                        low[key] = was
+                    else:
+                        low.pop(key, None)
+        t["has_ids"] = any(k in low for k in _ID_KEYS)
+        for k in _ID_KEYS:
+            if k in low:
+                _release_id(t, k, _txt(low[k]))
+        g = lambda k: _txt(low.get(k, ""))  # noqa: E731
+        n = lambda k: _names(low.get(k, ""))  # noqa: E731
+        t["track_artist"] = n("artist")              # (VAR-1: each file's own, beside a "Various" album artist)
+        t.update(title=g("title"), album=g("album"), artist=n("albumartist") or n("artist"),
+                 year=_int(g("date") or g("year")), num=_int(g("tracknumber")),
+                 disc=_int(g("discnumber")), barcode=g("barcode"),
+                 catno=next((g(k) for k in _CATNO_KEYS if g(k)), ""),
+                 label=g("label") or g("organization") or g("publisher"),
+                 country=g("releasecountry"), media=g("media"), date=g("date"),
+                 # (CAT-10: a plain COUNTRY tag, "U.S.A.": a vinyl copy's positive clue only)
+                 country_plain=g("country"),
+                 credit=" ".join(g(k) for k in ("artist", "copyright", "composer", "performer", "conductor")))
+        t["tracktotal"] = _int(g("tracktotal") or g("totaltracks")) or _total(g("tracknumber"))
+        t["num0"] = _numbered_zero(g("tracknumber"))
+        t["disc_raw"] = g("discnumber")               # (VIN-10: a record's side, "A", "B2")
+        _source_tags(t, low.items())
+        _write_failed(t, g("tagmenderreason"))
+        t["tm_mark"] = bool(g("tagmender") or g("tagmenderreason"))     # (REP-1: may be TagMender's)
+        t["cdtoc"] = g("cdtoc")
+        t["sacd_area"] = g("sacdarea")                 # an SACD rip's area: "Stereo", "Multichannel"
+        for k, v in low.items():                     # UPC / EAN / ASIN under their other names
+            if k != "barcode" and _plain_key(k) in _BARCODE_KEYS + _ASIN_KEYS:
+                _code_tag(t, k, _txt(v))
+    except Exception as exc:
+        t["_error"] = str(exc)
+    return t
+
+
+# --- match_albums.py:1457
+def _numbered_zero(number):
+    """A track number of 0 written out ("0", "00", "0/12"): the hidden track before track 1
+    (HTOA), as Picard numbers a release's pregap track. Not a missing number."""
+    return bool(re.fullmatch(r"\s*0+\s*(?:/\s*\d*\s*)?", str(number or "")))
+
+
+# --- match_albums.py:1463
+def _total(number):
+    """The track count of a "3/12" track number, or 0."""
+    m = re.match(r"\s*\d+\s*/\s*(\d+)", str(number or ""))
+    return int(m.group(1)) if m else 0
+
+
+# --- match_albums.py:1469
+def _write_failed(t, reason):
+    """TagMender's own marker on files it could not finish ("write_failed: saved 10 of 12
+    files"): the album has 12 tracks, though only some may be in this folder."""
+    m = re.search(r"\b(\d+)\s+of\s+(\d+)\b", str(reason or ""))
+    if m and "write_failed" in str(reason) and int(m.group(1)) <= int(m.group(2)):
+        t["write_failed_total"] = int(m.group(2))
+
 
 # --- match_albums.py:1477
 def _natural_key(text):
     """'2 - x' before '10 - x' (plain string order puts 10 and 11 before 2)."""
     return [int(t) if t.isdigit() else t.casefold() for t in re.split(r"(\d+)", str(text))]
+
+
+# --- match_albums.py:1483
+# When the same album sits in a folder twice in different formats, keep one copy.
+_FORMAT_PREFERENCE = [".flac", ".wav", ".aiff", ".aif", ".ape", ".wv", ".dsf", ".dff",
+                      ".m4a", ".mp4", ".mp3", ".ogg", ".oga", ".opus", ".mpc", ".wma"]
+
+
+# --- match_albums.py:1489
+# Copies of the same audio differ in length by hundredths of a second (encoder
+# padding); different tracks are practically never this close.
+_SAME_AUDIO_S = 0.25
+
+
+# --- match_albums.py:1492
+def _same_copy(g1, g2, info):
+    """Two file groups hold the same recording when they have the same number
+    of tracks, the lengths agree track by track (within _SAME_AUDIO_S) AND the titles - or failing that the file names -
+    agree. Lengths alone are not enough: two discs of one 60-minute piece each
+    can be equally long."""
+    if len(g1) != len(g2) or not g1:
+        return False
+    if _layouts(g1, info) != _layouts(g2, info):
+        return False                     # (stereo and multichannel: two versions, not two copies)
+    close = sum(1 for a, b in zip(g1, g2)
+                if abs(info[a]["secs"] - info[b]["secs"]) <= _SAME_AUDIO_S)
+    if close / len(g1) < 0.9:
+        return False
+
+    def name(p):
+        t = info[p]["title"].strip().casefold()
+        return t or re.sub(r"\W+", " ", p.stem).strip().casefold()
+    same = sum(1 for a, b in zip(g1, g2) if name(a) == name(b))
+    return same / len(g1) >= 0.8
+
+
+# --- match_albums.py:1513
+def _layouts(files, info):
+    """The channel layouts of these files: their folder's name ("2.0", "Stereo") and their
+    audio's channel count or SACD_AREA tag. Two groups whose layouts differ are two versions."""
+    out = {mc.layout_of_channels(info[p].get("channels"), info[p].get("sacd_area")) for p in files}
+    out |= {mc.version_layout(p.parent.name) for p in files}
+    out.discard("")
+    return out
+
+
+# --- match_albums.py:1522
+def _drop_duplicate_copies(files, info, album_dir):
+    """Folders with the same album twice - FLAC + Opus side by side, or the
+    same format in two folders ('16-44/' and '24-96/') - count once. Real
+    discs (different tracks) are never merged, whatever their format.
+    Keeps the preferred format, then the larger (higher-resolution) copy."""
+    groups = {}
+    for p in files:
+        groups.setdefault((p.parent, p.suffix.lower()), []).append(p)
+    for k in groups:
+        groups[k].sort(key=lambda p: (info[p]["num"] or 9999, _natural_key(p.name)))
+    rank = {k: (not any(info[p]["has_ids"] for p in g),   # the copy already tagged
+                _FORMAT_PREFERENCE.index(k[1]) if k[1] in _FORMAT_PREFERENCE else 99,
+                -sum(p.stat().st_size for p in g)) for k, g in groups.items()}
+    keys = sorted(groups, key=lambda k: _natural_key(f"{k[0]}{k[1]}"))
+    removed = []
+    for i, k1 in enumerate(keys):
+        if k1 in removed:
+            continue
+        for k2 in keys[i + 1:]:
+            if k2 in removed or not _same_copy(groups[k1], groups[k2], info):
+                continue
+            loser = k2 if rank[k1] <= rank[k2] else k1
+            removed.append(loser)
+            if loser == k1:
+                break
+    if not removed:
+        return files, []
+    gone = {p for k in removed for p in groups[k]}
+    label = [f"{(Path(os.path.relpath(k[0], album_dir)).as_posix() + '/') if k[0] != Path(album_dir) else ''}"
+             f"*{k[1]}" for k in removed]
+    return [p for p in files if p not in gone], label
+
+
+# --- match_albums.py:1555
+def _track_key(p, i):
+    """What identifies a track for duplicate detection: its title tag, or the
+    file name without the leading track number ("001.ACAaM" and "01.ACAAM"
+    are the same track saved by two versions of a naming script)."""
+    t = i["title"].strip()
+    if not t:
+        t = re.sub(r"^[\d\s._\-]+", "", p.stem)
+    # (TRK-10: a featured artist in brackets and accents apart - "Le Détenteur [feat. Youri Raymond]"
+    # beside "Le Detenteur", the same length: one track saved twice, Beyond Creation - The Aura)
+    t = re.sub(r"\s*[\(\[]\s*(?:feat|ft|featuring)\b\.?[^\)\]]*[\)\]]", "", t, flags=re.I)
+    t = "".join(c for c in unicodedata.normalize("NFKD", t) if unicodedata.category(c) != "Mn") or t
+    return re.sub(r"\W+", " ", t).strip().casefold()
+
+
+# --- match_albums.py:1569
+def _other_disc(a, b, info) -> bool:
+    """a and b are on two different discs of a set: both carry a disc tag and the two
+    differ, or they sit in two different disc folders ("Disc 1", "Disc 2"). A file without
+    a disc tag fits any disc ("01 Song.flac" tagged disc 1 and its MP3 copy untagged)."""
+    def num(i):
+        try:
+            return int(str(i.get("disc") or 0).split("/")[0])
+        except ValueError:
+            return 0
+    da, db = num(info[a]), num(info[b])
+    if da and db and da != db:
+        return True
+    if a.parent == b.parent:
+        return False
+    if mc.version_layout(a.parent.name) and mc.version_layout(b.parent.name) and \
+            _layouts([a], info) != _layouts([b], info):
+        return True                                   # ("2.0/" and "5.0/": a version each)
+    pass  # (vendored: the names it imported are this module's)
+    return is_disc_dir(a.parent) or is_disc_dir(b.parent)
+
+
+# --- match_albums.py:1590
+def _other_audio(a, b, info) -> bool:
+    """a and b are two FLAC files whose decoded audio has a checksum each, and the two differ:
+    two recordings, however alike their titles and lengths (a suite played twice on one CD,
+    its "Gnomus" 2:43 both times). A file without one (another format, a FLAC whose encoder
+    left it empty) says nothing."""
+    ma_, mb_ = info[a].get("audio_md5"), info[b].get("audio_md5")
+    return bool(ma_ and mb_ and ma_ != mb_)
+
+
+# --- match_albums.py:1601
+# DSC-20: a set's own notes - a text file at its root (.txt, .nfo, .md) - never a rip log, cue
+# sheet, DR or auCDtect report, checksum list or spectrogram note beside the audio
+_NOTES_EXT = (".txt", ".nfo", ".md")
+
+
+# --- match_albums.py:1602
+_NOT_NOTES = re.compile(r"foo_dr|\bdr\b|aucdtect|audiochecker|\blog\b|ripping|\beac\b|\bxld\b|"
+                        r"accurip|cuetools|ffp|md5|sfv|sha1|spectr|checksum", re.I)
+
+
+# --- match_albums.py:1604
+_LOG_TEXT = re.compile(r"Exact Audio Copy V|X Lossless Decoder version|foo_dr|auCDtect|"
+                       r"Dynamic Range Meter|Used drive", re.I)
+
+
+# --- match_albums.py:1606
+_DASHES = re.compile(r"[‐-―−﹘﹣－]")
+
+
+# --- match_albums.py:1610
+# DSC-20: a folder named only by a disc word and its number ("CD1", "Disc 2", "CD-01", "02"): a
+# notes line naming it is any tracklist's header, never the set's own list of its parts
+_BARE_DISC = re.compile(r"^(?:(?:cd|disc|disk|dvd|sacd|bd|lp|part|pt|vol|volume|side)\s*[-_.#]?\s*)?"
+                        r"(?:\d{1,3}|[ivx]{1,5}|[a-d])$", re.I)
+
+
+# --- match_albums.py:1614
+def noted_line(text) -> str:
+    """DSC-20: a line of a set's notes, or a folder's name, as the two are compared: case,
+    whitespace, dash kinds and trailing punctuation aside."""
+    t = unicodedata.normalize("NFKC", str(text or ""))
+    t = _DASHES.sub("-", t).casefold()
+    t = re.sub(r"\s+", " ", t).strip()
+    return re.sub(r"[\s.,;:!?]+$", "", t)
+
+
+# --- match_albums.py:1623
+def set_notes(folder) -> list:
+    """DSC-20: the notes files at FOLDER's root, each as its lines (noted_line), read tolerantly
+    (a cp1252 byte in a UTF-8 file is no reason to ignore it): [[line, ...], ...]."""
+    out = []
+    try:
+        names = sorted(os.listdir(folder))
+    except OSError:
+        return out
+    for n in names:
+        p = Path(folder) / n
+        if Path(n).suffix.lower() not in _NOTES_EXT or _NOT_NOTES.search(Path(n).stem) or not p.is_file():
+            continue
+        try:
+            if p.stat().st_size > 2_000_000:
+                continue
+            raw = p.read_bytes()
+        except OSError:
+            continue
+        try:
+            text = raw.decode("utf-8-sig")
+        except UnicodeDecodeError:
+            text = raw.decode("cp1252", errors="replace")
+        if _LOG_TEXT.search(text[:4000]):
+            continue                                     # (a rip log or DR report, whatever its name)
+        out.append([noted_line(x) for x in text.splitlines()])
+    return out
+
+
+# --- match_albums.py:1651
+def noted_set_discs(folder, dirs) -> dict:
+    """DSC-20: {audio folder: its disc number} of a set whose own notes list its parts: a folder
+    whose name says it is a set (engine.says_box's words or a CD count) with no tracks of its own,
+    its audio folders DIRS each at its root or one level deeper beneath a folder holding no audio
+    ("Bonus/"), none a version folder, and one notes file at its root naming every audio folder by
+    its own name on a line of its own, each once: the discs numbered in the notes' order. {} when
+    any of that fails."""
+    pass  # (vendored: the names it imported are this module's)
+    folder, dirs = Path(folder), sorted({Path(d) for d in dirs})
+    if len(dirs) < 2 or not (says_box(folder.name) or box_cd_count(folder.name)) or folder in dirs:
+        return {}
+    for d in dirs:
+        if d.parent != folder and not (d.parent.parent == folder and d.parent not in dirs):
+            return {}
+        if mc.version_layout(d.name):
+            return {}
+    names = {d: noted_line(d.name) for d in dirs}
+    if len(set(names.values())) != len(dirs) or not all(names.values()):
+        return {}
+    if any(_BARE_DISC.match(n) for n in names.values()):
+        return {}                                    # ("CD1", "Disc 2": a tracklist's headers name no part)
+    for lines in set_notes(folder):
+        at = {}
+        for d, n in names.items():
+            hits = [i for i, x in enumerate(lines) if x == n]
+            if len(hits) != 1:
+                break
+            at[d] = hits[0]
+        else:
+            order = sorted(dirs, key=lambda d: at[d])
+            return {d: i for i, d in enumerate(order, 1)}
+    return {}
+
+
+# --- match_albums.py:1685
+def _drop_duplicate_tracks(files, info):
+    """The same track twice in one album - same title (or same name apart
+    from the number) and the same length (within _SAME_AUDIO_S), in any folder
+    of it and in any format - counts once. Two different tracks that merely
+    share a title differ in length; the same title on two discs (two disc
+    tags, or two disc folders) is another disc's track (a remaster on disc 1,
+    its remix on disc 2), never a copy unless the audio itself is the same
+    (its checksum, below)."""
+    buckets = {}
+    for p in files:
+        key = _track_key(p, info[p])
+        if key:
+            buckets.setdefault(key, []).append(p)
+
+    def preference(p):
+        # Keep the copy that already carries release IDs (the one Picard
+        # saved last), then the preferred format, then the newest file.
+        ext = p.suffix.lower()
+        st = p.stat()
+        return (not info[p]["has_ids"],
+                _FORMAT_PREFERENCE.index(ext) if ext in _FORMAT_PREFERENCE else 99,
+                -st.st_mtime, -st.st_size, _natural_key(p.name))
+    # FLAC files whose decoded audio has the same checksum are the same
+    # recording, whatever their names or titles say.
+    for p in files:
+        md5 = info[p].get("audio_md5")
+        if md5:
+            buckets.setdefault(f"md5:{md5:x}", []).append(p)
+    # (TRK-10: a folder whose track numbers repeat with other titles is a set's discs side by side,
+    # no disc tags - its track 1s are each disc's, never another encode of one track)
+    by_num = {}
+    for p in files:
+        if info[p].get("num"):
+            by_num.setdefault((p.parent, info[p]["num"]), set()).add(_track_key(p, info[p]))
+    flat_set = any(len(keys) > 1 for keys in by_num.values())
+    gone = []
+    for key, group in buckets.items():
+        group = [p for p in group if p not in gone]
+        if len(group) < 2:
+            continue
+        kept = []
+        by_title = not str(key).startswith("md5:")
+        def close(p, k):
+            # (TRK-10: the same title and the same track number - another encode of one track - within
+            # 1.5 s; otherwise copies of the same audio, within hundredths)
+            d = abs(info[p]["secs"] - info[k]["secs"])
+            if d <= _SAME_AUDIO_S:
+                return True
+            # (another encode: another format or folder, or both on one disc by their disc tags -
+            # never two files of one flat folder without disc tags, a two-disc set's track 1s)
+            apart = p.suffix.lower() != k.suffix.lower() or p.parent != k.parent or \
+                (info[p].get("disc") and info[p].get("disc") == info[k].get("disc")) or not flat_set
+            return bool(by_title and apart and info[p].get("num") and
+                        info[p].get("num") == info[k].get("num") and d <= 1.5)
+        for p in sorted(group, key=preference):
+            if any(close(p, k)
+                   and not (by_title and (_other_disc(p, k, info) or _other_audio(p, k, info)))
+                   for k in kept):
+                gone.append(p)
+            else:
+                kept.append(p)
+    if not gone:
+        return files, []
+    gone_set = set(gone)
+    return [p for p in files if p not in gone_set], sorted(p.name for p in gone_set)
+
+
+# --- match_albums.py:1752
+BLIND_KEYS = ("barcode", "barcode_from", "asin", "catno", "label", "country", "media", "date", "isrc", "clue_text", "credit",
+              "mb_albumid", "discogs_releaseid", "id_tags")
 
 
 # --- match_albums.py:1756
@@ -132,6 +1703,130 @@ def codes_from_notes(text):
     return catnos[:3], barcodes[:2]
 
 
+# --- match_albums.py:1960
+# DSC-9: a set's volume folder ("Volume 1", "Vol. II", "Volume Two", "Volume 2 - 1978-1985"); its number
+_VOLUME_DIR = re.compile(r"^vol(?:ume)?\.?\s*[-_.]?\s*(?P<n>\d{1,2}|[ivx]{1,4}|one|two|three|four|five|six|"
+                         r"seven|eight|nine|ten)(?![\w])(?:\s*[-–:.,]\s+.*|\s*[\(\[].*)?$", re.I)
+
+
+# --- match_albums.py:1962
+_NUMBER_WORDS = {w: i + 1 for i, w in enumerate(("one", "two", "three", "four", "five", "six", "seven",
+                                                 "eight", "nine", "ten"))}
+
+
+# --- match_albums.py:1964
+_ROMAN = {"i": 1, "ii": 2, "iii": 3, "iv": 4, "v": 5, "vi": 6, "vii": 7, "viii": 8, "ix": 9, "x": 10}
+
+
+# --- match_albums.py:1966
+# a folder's name naming the volumes it holds: "Volume I & II", "Vol. 1-2", "1 + 2" ...
+_VOLUME_RANGE = re.compile(r"(?<![\w.])(?P<a>1|i|one)\s*(?:&|\+|-|–|/|and|to)\s*(?:vol(?:ume)?s?\.?\s*)?"
+                           r"(?P<b>\d{1,2}|[ivx]{1,4}|two|three|four|five|six|seven|eight|nine|ten)(?![\w])", re.I)
+
+
+# --- match_albums.py:1969
+# ... or their count: "(2 Hybrid SACD MFSL 2017)", "2CD", "2-CD", "2 Discs", "3xLP"
+_VOLUME_DISCS = re.compile(r"(?<![\w.\-])(?P<n>\d{1,2})\s*[x×-]?\s*(?:[a-z][\w\-]*\s+){0,2}?"
+                           r"(?:cds?|discs?|disks?|sacds?|lps?)(?![a-z0-9])", re.I)
+
+
+# --- match_albums.py:1973
+def _volume_word(text) -> int:
+    t = str(text or "").casefold()
+    if t.isdigit():
+        return int(t)
+    return _NUMBER_WORDS.get(t) or _ROMAN.get(t) or 0
+
+
+# --- match_albums.py:1980
+def volume_number(d) -> int:
+    """DSC-9: the number of a volume folder ("Volume 2" -> 2, "Vol. II" -> 2), else 0."""
+    m = _VOLUME_DIR.match(Path(d).name)
+    return _volume_word(m["n"]) if m else 0
+
+
+# --- match_albums.py:1986
+def named_volume_count(name) -> int:
+    """DSC-9: how many volumes a folder's name says it holds - every range ("Volume I & II", "Vol 1-3")
+    and disc count ("2 Hybrid SACD", "2CD") in it saying the same k, at least two; else 0 ("Hits 1 & 2
+    (3CD)" says two things)."""
+    name = str(name or "")
+    said = {_volume_word(m["b"]) for m in _VOLUME_RANGE.finditer(name) if _volume_word(m["a"]) == 1}
+    said |= {int(m["n"]) for m in _VOLUME_DISCS.finditer(name)}
+    return said.pop() if len(said) == 1 and min(said) >= 2 else 0
+
+
+# --- match_albums.py:1996
+def names_volumes(name, k) -> bool:
+    """DSC-9: a folder's name says it holds volumes 1 to k (named_volume_count)."""
+    return named_volume_count(name) == k >= 2
+
+
+# --- match_albums.py:2001
+def volume_discs(album_dir, folders) -> dict:
+    """DSC-9: {volume folder: its disc} when the album's folders are all volume folders of
+    album_dir numbered 1 to k and album_dir's name says it holds k volumes; else {}."""
+    album_dir = Path(album_dir)
+    nums = {d: volume_number(d) for d in folders}
+    if len(nums) < 2 or any(d.parent != album_dir for d in nums) or \
+            sorted(nums.values()) != list(range(1, len(nums) + 1)) or not names_volumes(album_dir.name, len(nums)):
+        return {}
+    return nums
+
+
+# --- match_albums.py:2029
+# "2019 - The Heretics (Deluxe Edition)" beside "2019 - The Heretics": the deluxe tracks
+# saved apart from the rest of the album
+_DELUXE_DIR = r"\s*[\(\[]\s*deluxe(?:\s+edition)?\s*[\)\]]\s*$"
+
+
+# --- match_albums.py:2032
+def _audio_files(d):
+    try:
+        return sorted(p for p in Path(d).iterdir()
+                      if p.is_file() and p.suffix.lower() in AUDIO_EXT and not p.name.startswith("."))
+    except OSError:
+        return []
+
+
+# --- match_albums.py:2040
+def deluxe_named(album_name, name) -> bool:
+    """NAME is "<album_name> (Deluxe Edition)" or "[Deluxe]": the name deluxe_sibling looks for
+    (engine._splits asks the same, so the two never disagree)."""
+    return re.fullmatch(re.escape(album_name) + _DELUXE_DIR, name, re.I) is not None
+
+
+# --- match_albums.py:2046
+def deluxe_sibling(album_dir):
+    """The sibling folder holding the rest of this album, or None: "<this folder's name>
+    (Deluxe Edition)", whose files have the same album artist and the same track total
+    (the tags' TRACKTOTAL or TagMender's "write_failed: ... 10 of 12" marker) as these,
+    the two folders together holding exactly that many tracks, none twice (Rotting Christ -
+    The Heretics: tracks 1-10 here, 11 and 12 in the deluxe folder)."""
+    album_dir = Path(album_dir)
+    try:
+        # (the name first: a stat for each sibling is slow in a large folder, once per album there)
+        sib = next((d for d in (album_dir.parent / n for n in sorted(
+            n for n in os.listdir(album_dir.parent) if deluxe_named(album_dir.name, n)))
+            if d != album_dir and d.is_dir()), None)
+    except OSError:
+        return None
+    if sib is None:
+        return None
+    mine, theirs = _audio_files(album_dir), _audio_files(sib)
+    if not mine or not theirs:
+        return None
+    tags = [read_file(p) for p in mine + theirs]
+    artists = {mc.fold(t["artist"]) for t in tags}
+    totals = {t["tracktotal"] or t["write_failed_total"] for t in tags}
+    nums = [t["num"] for t in tags]
+    if (len(artists) != 1 or "" in artists or len(totals) != 1 or totals == {0}
+            or len(tags) != next(iter(totals)) or 0 in nums or len(set(nums)) != len(nums)
+            or any(t["disc"] > 1 for t in tags)):
+        return None
+    return sib
+
+
 # --- match_albums.py:2076
 def vinyl_marks(album_dir, audio_names, sides_count=True):
     """Why the folder looks ripped from vinyl whatever its name says ("[WEB]"), or "": side
@@ -186,6 +1881,132 @@ def enhanced_marks(album_dir, logs=()):
     return ""
 
 
+# --- match_albums.py:2130
+# The original names a checker logged (audiochecker, auCDtect): "Artist - Album - 01 Title.flac"
+# is how Bandcamp names its downloads (Hypno5e - Des Deux L'Une Est L'Autre)
+_BANDCAMP_NAME = re.compile(r"^\s*(.+?) - (.+?) - \d{2} (?![-.\s]).+\.(?:flac|wav|aiff?|mp3|m4a|alac)\s*$", re.I)
+
+
+# --- match_albums.py:2133
+def bandcamp_names(album_dir, artist, n_tracks):
+    """True when a checker's log under the folder names most tracks as Bandcamp does, under
+    this album's artist."""
+    found = 0
+    for p in Path(album_dir).rglob("*.log"):
+        if not re.search(r"audiochecker|aucdtect", p.name, re.I):
+            continue
+        try:
+            text = _read_log(p)
+        except OSError:
+            continue
+        names = [seg for line in text.splitlines() for seg in re.split(r"-=-|[\\/]|\t", line)]
+        found = max(found, sum(1 for seg in names for m in [_BANDCAMP_NAME.match(seg)]
+                               if m and mc.fold(m.group(1)) == mc.fold(artist)))
+    return found >= 2 and found * 2 >= n_tracks
+
+
+# --- match_albums.py:2168
+_ALBUM_DISC = re.compile(r"^(.*?)[\s\-\u2013\u2014:,_]*[(\[]?\s*(?:cd|disc|disk)\s*[-_.#]?\s*(\d{1,2})"
+                         r"(?:\s*(?:of|/)\s*\d{1,2})?\s*[)\]]?\s*$", re.I)
+
+
+# --- match_albums.py:2172
+def album_tag_discs(infos) -> tuple:
+    """({path: disc}, title) when the files without a disc tag name their disc in their album
+    tags ("The Principle Of Doubt (Compilation) CD 1" and "... CD 2"): every one of them does,
+    all name the same album, and at least two discs. Else ({}, "")."""
+    untagged = [(p, i) for p, i in infos if not i.get("disc")]
+    if len(untagged) < 2:
+        return {}, ""
+    found, bases = {}, set()
+    for p, i in untagged:
+        m = _ALBUM_DISC.match(i.get("album") or "")
+        if not m or not m.group(1).strip() or not int(m.group(2)):
+            return {}, ""
+        found[p] = int(m.group(2))
+        bases.add(m.group(1).strip())
+    if len({b.casefold() for b in bases}) != 1 or len(set(found.values())) < 2:
+        return {}, ""
+    return found, min(bases)
+
+
+# --- match_albums.py:2191
+_CREDIT_SPLIT = re.compile(r"\s*(?:,|;|/|&|\band\b|\bfeat\.?|\bwith\b)\s*", re.I)
+
+
+# --- match_albums.py:2194
+def set_artist(infos, folder="") -> str:
+    """DSC-2d: the artist a set whose discs credit different album artists is compared and searched
+    by - the one name every disc's album artist credits ("Francesco Tristano, Frederic Chopin, ...;
+    Alice Sara Ott" and "Johann Sebastian Bach, John Field, ...; Alice Sara Ott" -> "Alice Sara
+    Ott"), as written - only the name the album's FOLDER is named after ("Alice Sara Ott - Echoes of
+    Life - 2023"), so a composer on every disc ("Chilly Gonzales") is none. "" when the files credit
+    one album artist, or the folder's artist is not credited by every disc."""
+    credits = {str(i.get("artist") or "") for _p, i in infos} - {""}
+    if len({c.casefold() for c in credits}) < 2 or len({i["disc_eff"] for _p, i in infos}) < 2:
+        return ""
+    shared, spelled = None, {}
+    for c in credits:
+        names = {}
+        for x in _CREDIT_SPLIT.split(re.sub(r"[\(\[][^\)\]]*[\)\]]", " ", c)):
+            if x.strip():
+                names.setdefault(mc.fold(x), x.strip())
+        spelled.update(names)
+        shared = set(names) if shared is None else shared & set(names)
+    shared = {n for n in shared or () if n}
+    # (only a set its folder names after that performer: "Alice Sara Ott - Echoes of Life - 2023";
+    # never an ordinary album whose discs credit "Bob Marley & The Wailers" and "Bob Marley")
+    head = mc.fold(str(folder or "").partition(" - ")[0]) if " - " in str(folder or "") else ""
+    shared = {head} & shared
+    return spelled[next(iter(shared))] if len(shared) == 1 else ""
+
+
+# --- match_albums.py:2220
+def _set_title(infos, folder_title) -> str:
+    """DSC-2: the title a set is searched by when its disc folders each carry an album title of
+    their own ("Holy Diver [2022 Barresi RMX]", "Holy Diver Live In Fresno CA 1983", ...): the
+    words they all begin with ("Holy Diver"), else the folder's title. "" when the files are
+    no such set (one folder, or one album title)."""
+    by_dir = {}
+    for p, i in infos:
+        if i.get("album"):
+            by_dir.setdefault(p.parent, set()).add(i["album"])
+    if len(by_dir) < 2 or any(len(v) != 1 for v in by_dir.values()):
+        return ""
+    titles = [next(iter(v)) for v in by_dir.values()]
+    if len({t.casefold() for t in titles}) < 2:
+        return ""
+    words = [re.findall(r"[^\s\[\]\(\)\{\}:,\-–]+", t) for t in titles]
+    common = []
+    for ws in zip(*words):
+        if len({w.casefold() for w in ws}) != 1:
+            break
+        common.append(ws[0])
+    shared = " ".join(common)
+    if len(shared) >= 4:
+        return shared                                     # (never "The" alone)
+    # DSC-10: the folder's title without the artist and year before it and the brackets after it
+    # ("Band - 1994 - A Voyage [FLAC]" -> "A Voyage"), as the set's release is titled
+    # (only "Artist - ...": "Queen II", "Chicago 17", "Led Zeppelin IV (Deluxe)" are titles whole)
+    t = str(folder_title or "")
+    for a in sorted({str(i.get("albumartist") or i.get("artist") or "") for _p, i in infos} - {""}, key=len,
+                    reverse=True):
+        m = re.match(re.escape(a) + r"\s+[-–]\s+(.+)$", t, re.I)
+        if m:
+            t = m.group(1)
+            break
+    else:
+        return folder_title
+    t = re.sub(r"^\s*(?:19|20)\d\d\s*[-–]\s*", "", t)
+    while True:
+        cut = re.sub(r"\s*[\[\(\{][^\]\)\}]*[\]\)\}]\s*$", "", t)
+        if cut == t:
+            break
+        t = cut
+    t = t.strip()
+    return t if len(t) >= 4 and not re.fullmatch(r"[\dIVXLC\s.#-]+", t) else folder_title
+
+
 # --- match_albums.py:2265
 _DISC_HEAD = re.compile(r"[\(\[]?\s*(?:cd|disc|disk|dvd|lp|side|vol(?:ume)?|part|pt)\.?\s*[-_.#]?\s*"
                         r"(?:\d{1,3}|[ivx]{1,4}|[a-d])?\s*[\)\]]?", re.I)
@@ -231,6 +2052,854 @@ def folder_reading(album_folder):
     return head, rest, year
 
 
+# --- match_albums.py:2307
+def with_reading(album, reading):
+    """FLD-2: ALBUM read under its folder name's reading (read_album's "folder_reading"): its
+    artist and title, and its year when the files and folder gave none. The same ALBUM when
+    READING is empty."""
+    if not reading:
+        return album
+    out = dict(album, artist=reading["artist"], title=reading["title"], read_from_folder=reading["folder"])
+    if not out.get("year") and reading.get("year"):
+        out["year"] = reading["year"]
+    return out
+
+
+# --- match_albums.py:2349
+def read_album(album_dir, artist_folder, album_folder, exclude=(), blind=False):
+    """blind=True (validate.py): the files were tagged already, so their release IDs,
+    ISRCs, label, catalogue number, barcode, country, date and year came FROM a release
+    and would only confirm it. They are ignored; what is left is what an untagged copy
+    has: names, track lengths, the audio, the disc TOC, the scans and the folder name."""
+    files = []
+    exclude = {str(x) for x in exclude}
+    album_dir = Path(album_dir)
+    sibling = deluxe_sibling(album_dir)        # the deluxe tracks saved in a folder of their own
+    for top_dir in (album_dir, sibling) if sibling else (album_dir,):
+        for dirpath, _d, names in os.walk(top_dir):
+            for n in names:
+                p = Path(dirpath) / n
+                if p.suffix.lower() in AUDIO_EXT and str(p) not in exclude:
+                    files.append(p)
+    info = {p: read_file(p) for p in files}
+    title_written, before_by_tagger, before, own_decided = [], {}, {}, ""
+    if not blind:
+        # REP-1: an album TagMender tagged (and perhaps renamed) before is read as the copy was
+        # before it: the pressing details its job wrote (and nobody changed since) as they were,
+        # the folder under the name it had. What the job wrote came from the release it chose
+        # and says nothing new; read back, it would vote for the other pressings sharing it (a
+        # catalogue number on every one, the year of the edition its naming put in the folder
+        # name). The release IDs stay as written: TAG-1 keeps that release when nothing tells
+        # the pressings apart. Anything new beside the files (scans, a rip log) counts as ever.
+        # (only files that may be TagMender's: release IDs or its TAGMENDER marker - the job
+        # history is not read for an album never tagged)
+        maybe = any(i.get("has_ids") or i.get("tm_mark") for i in info.values())
+        first_folder, before, before_by_tagger = tagmender_originals(files) if maybe else ("", {}, {})
+        own_decided = tagmender_decided(files) if maybe else ""
+        if before:
+            # (the media tag as TagMender wrote it stays what names each version folder's disc - a
+            # DVD's "Stereo/" and "5.1/" lost their disc word to the naming: it points at the release
+            # TagMender chose, never at another pressing)
+            written = {p: info[p].get("media") for p in files}
+            # (and the album title as the files have it: an outage keeps the version mark it holds,
+            # engine._kept_own_version)
+            title_written = Counter(i.get("album") for i in info.values() if i.get("album")).most_common(1)
+            info = {p: read_file(p, before[str(p)]) if before.get(str(p)) else info[p] for p in files}
+            for p in files:
+                info[p]["media_written"] = written[p]
+            if first_folder and album_folder == album_dir.name and first_folder != album_folder:
+                album_folder = first_folder
+    names_from_files([(p, info[p]) for p in files])
+    # the release IDs the tags' track total was written with (read by _total_miscounted only).
+    # Empty when blind: the IDs are the validation's truth, and a waiver that fires only when
+    # the pick is the hidden release would turn an agreeing review into an agreeing auto
+    # (a blind run reads the total against the databases' own count of the pick's pressing).
+    total_releases = (set(), set()) if blind else tag_release_ids(info.values())
+    if blind:
+        for i in info.values():
+            for k in BLIND_KEYS:
+                i[k] = ""
+            i["year"] = 0                                  # the folder's year is used instead
+    files, dropped_formats = _drop_duplicate_copies(files, info, album_dir)
+    files, dropped_tracks = _drop_duplicate_tracks(files, info)
+    infos = [(p, info[p]) for p in files]
+
+    # Files without a disc tag take their disc from their folder: "CD1/",
+    # "CD2/" ... in natural order. Without this, two disc folders that each
+    # start at track 1 interleave (1-1, 2-1, 1-2, 2-2 ...).
+    # (the deluxe sibling's tracks continue the album's disc, after its own)
+    def rel(p):
+        return p.relative_to(album_dir).as_posix() if album_dir in p.parents else "\uffff" + p.name
+    folders = sorted({p.parent for p in files if album_dir in p.parents},
+                     key=lambda d: _natural_key(d.relative_to(album_dir).as_posix()))
+    folder_disc = {d: i + 1 for i, d in enumerate(folders)} if len(folders) > 1 else {}
+    # DSC-20: a set whose own notes list its parts ("Joy Division - Complete Studio Recordings
+    # (MRB-001 v1)": 15 session folders, then "Bonus/<date> - ..."): each folder one disc, in the
+    # notes' order, whatever disc tag its files carry (a bonus folder's "1 of 1")
+    if len(folders) > 1:
+        pass  # (vendored: the names it imported are this module's)
+        noted = noted_set_order(album_dir, [p for p in files if album_dir in p.parents])
+    else:
+        noted = {}
+    if noted:
+        folder_disc = noted
+        for p, i in infos:
+            i["disc"] = 0
+    # versions of the album in folders of their own ("2.0/", "5.0/": an SACD's stereo and
+    # multichannel areas): each folder its own disc, whatever disc tag the files carry (each
+    # version's files say disc 1)
+    versions = version_folders(infos, folders)
+    kinds = {d: version_kind(v[2], [(p, i) for p, i in infos if p.parent == d]) for d, v in versions.items()}
+    if len(versions) > 1 and any(k == ("video", "audio") for k in kinds.values()) and \
+            not mc._VIDEO_FOLDER.search(str(album_folder or "")) and sacd_marks(album_dir, album_folder):
+        # MED-13 / MED-22c: an SACD rip by its folder's name or its SACD ripper's log, its areas
+        # converted to 24/96 PCM (Kodo - One Earth Tour Special, sacd_log.txt, "Stereo/" and
+        # "Multichannel/"): the rate alone made them a DVD's; nothing names a video disc (a folder
+        # "[SACD + DVD-A]" may hold the DVD's mixes: as before)
+        kinds = {d: (("sacd", "sacd mark") if k == ("video", "audio") else k) for d, k in kinds.items()}
+    if len(versions) == 1 and next(iter(kinds.values()))[1] == "audio":
+        # one layout-named folder alone ("Stereo 24-96/" of a download): a version of a disc only
+        # when its name's disc word, an SACD_AREA tag, DSD or its media tag says which disc
+        versions, kinds = {}, {}
+    # Files of one folder without disc tags whose album tags name their disc ("Title CD 1" and
+    # "Title CD 2", as EAC writes each disc of a set): that disc. Without it, the two discs'
+    # tracks 1, 1, 2, 2 ... interleave and are lined up with the wrong tracks of the release.
+    tag_disc, tag_title = ({}, "") if versions else album_tag_discs(infos)
+    # DSC-6: folders each tagged as a disc of their own album ("1977 - The Stranger" and "1983 -
+    # An Innocent Man" of a twofer, each "disc 1 of 1"): their disc tags repeat across folders and
+    # say nothing of the set - the folders number its discs
+    # (the album's own folders only: a deluxe sibling's tracks continue the album's disc)
+    # (and their track numbers overlap - each its own 1, 2, 3...: a "Bonus/" folder numbered on from
+    # the album's tracks, both "disc 1", is the album's one disc still)
+    per_folder, nums = {}, {}
+    for p, i in infos:
+        if p.parent in folder_disc:
+            per_folder.setdefault(p.parent, set()).add(i["disc"] or 0)
+            nums.setdefault(p.parent, set()).add(i["num"])
+    overlap = len(nums) > 1 and all(len(a & b) for a in nums.values() for b in nums.values() if a is not b)
+    if not versions and overlap and all(len(v) == 1 and 0 not in v for v in per_folder.values()) \
+            and len({next(iter(v)) for v in per_folder.values()}) < len(per_folder):
+        for p, i in infos:
+            if p.parent in folder_disc:
+                i["disc"] = 0
+    # DSC-9: a set's volume folders ("Volume 1", "Volume II" in "Hits Volume I & II (2CD)"): the
+    # volume is the disc, whatever disc tag its files carry (engine.volume_set joined them only where
+    # their disc tags agree, or are no one numbering of the set: "1/2" beside an earlier job's "3/4")
+    vols = {} if versions or noted else volume_discs(album_dir, folders)
+    if vols:
+        folder_disc = vols
+        for p, i in infos:
+            if p.parent in vols:
+                i["disc"] = 0
+    for p, i in infos:
+        i["disc_eff"] = folder_disc.get(p.parent, 1) if versions else \
+            i["disc"] or folder_disc.get(p.parent) or tag_disc.get(p, 1)
+    # DSC-18: albums ripped from fewer CDs than they are ("Seven Classic Albums [4CD]": 7 album
+    # folders, 4 rip logs): each file is the track of the CD its place in the folders' order gives
+    split = None if versions or noted else cd_split(album_dir, infos)
+    if split:
+        for p, i in infos:
+            i["disc_eff"], i["num"] = split[p]
+            i["disc"] = split[p][0]
+    # (or, filed already as discs of their release, by the layout each disc's tags name)
+    if versions:
+        found = {(folder_disc.get(d, 1) if folder_disc else 1): v for d, v in versions.items()}
+        kinds = {(folder_disc.get(d, 1) if folder_disc else 1): k for d, k in kinds.items()}
+    else:
+        found = version_discs_by_tags(infos)
+        kinds = {d: version_kind(v[2], [(p, i) for p, i in infos if i["disc_eff"] == d]) for d, v in found.items()}
+    version_discs = {d: v[0] for d, v in found.items()}
+    version_labels = {d: v[1] for d, v in found.items()}
+    version_kinds = {d: k[0] for d, k in kinds.items()}
+    # DSC-8: in a set of several discs, a barcode or catalogue number tagged on some of its discs
+    # only is that disc's own album's ("An Innocent Man" tagged with the 1983 CD's CK 38837 beside
+    # "The Stranger" untagged, in the 1992 twofer): the set's it is not, so neither agrees nor differs
+    # (only when its discs are tagged as different albums: a set ripped with its barcode on disc
+    # 1's files alone keeps it)
+    # (the discs different albums: their titles, brackets and disc words aside - "Gamma (Disc 1)"
+    # and "Gamma (Bonus Disc)" are one - two or more, neither holding the other)
+    disc_only_codes = []
+    discs_all = {i["disc_eff"] for _p, i in infos}
+
+    def bare_title(t):
+        t = re.sub(r"[\(\[\{][^\)\]\}]*[\)\]\}]", " ", str(t or ""))
+        m = _ALBUM_DISC.match(t)
+        t = m.group(1) if m else t
+        return re.sub(r"[\W_]+", " ", t.casefold()).strip()
+    bare = {bare_title(i.get("album")) for _p, i in infos} - {""}
+    different = len(bare) > 1 and not any(a != b and (a in b or b in a) for a in bare for b in bare)
+    # (nor one set's discs with subtitles of their own: "Gamma: Dawn to Dusk" and "Gamma: Twilight to
+    # Starlight" begin alike - an article aside, "The Stranger" and "The Nylon Curtain" do not)
+    firsts = {next((w for w in t.split() if w not in ("the", "a", "an", "le", "la", "les", "der", "die", "das",
+                                                         "el", "il")), "") for t in bare}
+    if len(firsts) == 1 and "" not in firsts:
+        different = False
+    # (nor a box's own code on the discs titled as the box: "Original Album Classics" on discs 1-2,
+    # "Songs in the Attic (Original Album Classics)" on the rest - a title is the set's name when
+    # it is the whole of the brackets of two or more other discs, a set number after it aside
+    # ("... (Original Album Classics #2)" - "#2", "No. 2", "Vol. 2", never a year), or the title of
+    # two or more discs and in another disc's brackets or the set's folder (its year aside): never
+    # one disc's word alone, so a twofer of two discs names no set; the code is kept only when every
+    # disc carrying it is titled so - "Live" beside "Beta (Live)" with either's barcode stays theirs)
+    def _fold(t):
+        return re.sub(r"[\W_]+", " ", str(t or "").casefold()).strip()
+    bracket_discs = {}
+    for _p, i in infos:
+        for b in re.findall(r"[\(\[\{]([^\)\]\}]*)[\)\]\}]", str(i.get("album") or "")):
+            b = _fold(re.sub(r"\s*(?:#|no\.?|vol\.?|volume)\s*\d+\s*$", "", b, flags=re.I))
+            if b:
+                bracket_discs.setdefault(b, set()).add(i["disc_eff"])
+    title_discs = {}
+    for _p, i in infos:
+        title_discs.setdefault(bare_title(i.get("album")), set()).add(i["disc_eff"])
+    folder_name = _fold(re.sub(r"^\s*\d{4}\s*-\s*", "", str(album_folder or "")))
+    set_names = {t for t in bare
+                 if len(bracket_discs.get(t, set()) - title_discs[t]) >= 2
+                 or (len(title_discs[t]) >= 2 and (t == folder_name or bracket_discs.get(t, set()) - title_discs[t]))}
+    set_discs = {i["disc_eff"] for _p, i in infos if bare_title(i.get("album")) in set_names}
+    if len(discs_all) > 1 and different:
+        for field in ("barcode", "catno"):
+            on = {}
+            for _p, i in infos:
+                if i.get(field):
+                    on.setdefault(mc.norm_code(i[field]), set()).add(i["disc_eff"])
+            partial = {code for code, ds in on.items() if ds != discs_all and not (ds <= set_discs)}
+            for _p, i in infos:
+                if i.get(field) and mc.norm_code(i[field]) in partial:
+                    i[field] = ""
+            disc_only_codes += sorted(partial)
+    # (a file numbered 0, "00 - Hidden.flac": the hidden track before track 1, first on its disc)
+    infos.sort(key=lambda x: (x[1]["disc_eff"], x[1]["num"] or (0 if x[1].get("num0") else 9999),
+                              _natural_key(rel(x[0]))))
+
+    def top(key):
+        c = Counter(i[key] for _p, i in infos if i[key])
+        return c.most_common(1)[0][0] if c else ""
+
+    m = re.match(r"\s*(\d{4})\s*-\s*(.*)", album_folder)
+    year = top("year") or (int(m.group(1)) if m else 0)
+    title = tag_title or _set_title(infos, m.group(2) if m else album_folder) or top("album") or \
+        (m.group(2) if m else album_folder)
+    # FLD-2: a folder named "Artist - Album" (a flat layout: "Music/Radiohead - OK Computer", or
+    # inside its artist's folder). Its head the artist we know already (the folder above, or the
+    # files' artist tag): the album is the rest. Its head another name, and the files naming no
+    # artist: kept as a second reading, which the lookup tries too (process) - never proof of a
+    # release, only a name to search.
+    reading = folder_reading(album_folder)
+    folder_read = None
+    if reading:
+        head, rest, r_year = reading
+        untitled = not (tag_title or top("album"))
+        if mc.fold(head) in {mc.fold(artist_folder), mc.fold(top("artist"))} - {""}:
+            if untitled:
+                title = rest
+                year = year or r_year
+        elif not top("artist"):
+            folder_read = {"artist": head, "title": rest if untitled else title, "year": r_year or None,
+                           "folder": str(album_folder)}
+    n_discs =len({i["disc_eff"] for _p, i in infos}) or 1
+    # VIN-2 / TAG-2: the folder's own name is your copy's word; a catalogue number in the album
+    # tag's brackets only stands in for it where the folder name names none - an album title
+    # another tagger (or an earlier name) wrote, "Hemispheres [Vinyl Rip ... 9100 059]", never
+    # outvotes the folder's "[Vinyl Rip Fran Solo SRM-1-3743]"
+    # (held aside, not dropped: where no candidate carries the folder's own number - a false
+    # folder hint, "[Unit 731 101-1]" - the album tag's number counts again, mc.settle_title_numbers)
+    own_hints = mc.catno_hints(album_folder)
+    own_norm = {mc.norm_code(h) for h in mc.catno_hints(album_folder, variants=True)}
+    title_all = mc.catno_hints(title, variants=True)
+    held_title = {mc.norm_code(h) for h in title_all} - own_norm if own_hints else set()
+    title_hints = [h for h in mc.catno_hints(title) if not own_hints or mc.norm_code(h) in own_norm]
+    folder_hints = own_hints + [h for h in title_hints if h not in own_hints]
+    folder_match = set(mc.catno_hints(album_folder, variants=True)) | {
+        h for h in title_all if not own_hints or mc.norm_code(h) in own_norm}
+    # a Japanese set's numbers as a range with "-" ("SICP 10151-4"): the "~" form MusicBrainz
+    # and Discogs list it by is the folder's too, and searched as well (never its single numbers:
+    # mc.catno_range)
+    tilde = [f for h in folder_hints for f in mc.catno_range_forms(h)]
+    folder_match |= set(tilde)
+    folder_hints += [f for f in tilde if f not in folder_hints]
+    # An EAC/XLD log: the copy was ripped from a CD. Only a log whose TOC fits the files
+    # counts; one that fits no disc was made of another rip (R10), and its TOC, title and
+    # paths say nothing of these files.
+    logs, foreign_logs = fitting_logs(infos, rip_logs(album_dir))
+    log_toc = {}
+    for log in logs:
+        if log["toc"] and log["toc"] not in log_toc.values():
+            log_toc[len(log_toc) + 1] = log["toc"]
+    notes = notes_text(album_dir)
+    note_catnos, note_barcodes = codes_from_notes(notes)
+    # catalogue numbers the ripper typed: the edition its notes name, the folders its log
+    # ripped to, the log's own name. Read as the folder name's (R3). Only a rip log whose TOC
+    # fits the files: a checker's log (audiochecker, auCDtect) or one without a TOC may name
+    # the downloader's own folders.
+    ripped = [log for log in logs if log["toc"]]
+    log_codes = [c for log in ripped for c in log["codes"]]
+    typed = {mc.norm_code(c) for c in note_catnos + log_codes}
+    typed_search = [c for c in note_catnos + log_codes if c not in folder_hints]
+    tags_barcodes = {mc.norm_code(i["barcode"]) for _p, i in infos if i["barcode"]}
+    tag_codes, tag_search = _tag_catno_forms(infos)          # CAT-10
+    sacd_disc = sacd_disc_catnos(album_dir, album_folder)
+    headers = [log["header"] for log in ripped if log.get("header")]
+    # DAT-3: the year your files were ripped, from a dated EAC/XLD log that is of these files
+    log_year, log_year_from = rip_log_year(album_dir, logs)
+    cdtocs = tag_tocs(infos)
+    cue_toc = cue_tocs(album_dir, infos)
+    tocs = merge_tocs(infos, log_toc, cue_toc, cdtocs)
+    # TOC-1: the discs whose TOC fits their files to the sector (a log made of another rip or
+    # pressing does not): only their disc ID speaks for the files' own lengths
+    tocs_fit = sorted(d for d, t in tocs.items()
+                      if toc_fits_audio(t, [i for _p, i in infos if i.get("disc_eff", 1) == d]))
+    hint, hint_from = _media_hint(album_dir, album_folder, files, infos, top("artist") or artist_folder,
+                                  bool(log_toc), notes,
+                                  # (MED-21: a TOC that fits the files, or whole CD sectors, says CD)
+                                  bool(tocs_fit) or audio_evidence([i for _p, i in infos])["cd_frames"])
+    box_tags = "" if hint else _tags_box_count(infos)
+    # The files name a release in their ID tags, and TagMender did not write them: another
+    # tagger did (Picard, an older tool, the shop). Their barcode, ISRCs, country, date and
+    # label came FROM that release and only confirm it; they never outrank the folder name
+    # (match_core: TAGS_BARCODE, classify's "tags name" review). Release IDs TagMender wrote
+    # itself (tagmender_wrote: its job history) are not another tagger's: they keep their
+    # release in a tie (TAG-1); the pressing details beside them were read above as they were
+    # before TagMender's job (REP-1).
+    # A MusicBrainz or Discogs release link in the tags (a comment, a URL tag) names a
+    # release the same way: whoever tagged the files wrote it.
+    id_files, foreign_ids = [], False
+    for p, i in infos:
+        link_mb, link_dg, _urls = source_links([i])
+        mbs = ({i["mb_albumid"]} if i.get("mb_albumid") else set()) | link_mb
+        dgs = ({i["discogs_releaseid"]} if i.get("discogs_releaseid") else set()) | link_dg
+        if len(mbs) > 1 or len(dgs) > 1:
+            foreign_ids = True             # links to another release than its ID tag: not TagMender's
+        if mbs or dgs:
+            id_files.append((p, min(mbs) if mbs else "", min(dgs) if dgs else ""))
+    by_tagger = bool(id_files) and not blind and (foreign_ids or not tagmender_wrote(id_files))
+    tag_mb_links, tag_discogs_links, tag_urls = source_links([i for _p, i in infos])
+    tag_release_mb, tag_release_discogs = tag_release_ids([i for _p, i in infos])
+    return {
+        "tags_by_tagger": by_tagger,
+        # TAG-1 / REP-1: what decided the pressing when TagMender's job chose the release your
+        # files carry (its evidence line), while those IDs are still TagMender's own
+        "own_decided": own_decided if (id_files and not by_tagger) else "",
+        # REP-1: the pressing details were read as before TagMender, and then they stood beside
+        # another tagger's release IDs: they are that tagger's word still (weak, as the first
+        # plan read them), while TagMender's own IDs keep their release in a tie (TAG-1)
+        # (file by file: only when every file whose details were read so stood beside another
+        # tagger's IDs - one bonus track another tagger tagged does not make the rest his)
+        "tag_values_by_tagger": by_tagger or (any(before.values()) and all(
+            before_by_tagger.get(k) for k, v in before.items() if v)),
+        # REP-1: the album title the files hold now, when it was read as before TagMender ("")
+        "title_written": title_written[0][0] if title_written else "",
+        "artist": set_artist(infos, album_folder) or top("artist") or artist_folder, "title": title,
+        # QRY-5: the title the folder name gives, when it is not the album tag's (searched too)
+        "folder_title": _folder_title_of(album_folder, title, set_artist(infos, album_folder) or top("artist") or artist_folder),
+        # VAR-1: the files' own track artists, in order, when the album artist is "Various"
+        "track_artists": (list(dict.fromkeys(i.get("track_artist") for _p, i in infos if i.get("track_artist")))
+                          if _VARIOUS_HEAD.fullmatch((top("artist") or "").strip()) else []),
+        "year": year or None, "discs": n_discs,
+        "dropped_formats": dropped_formats, "dropped_tracks": dropped_tracks,
+        "tracks": [{"disc": i["disc_eff"], "disc_tag": i["disc"] or 0, "num": i["num"], "title": i["title"],
+                    "secs": i["secs"], "path": str(_p), "artist": i.get("artist") or "",
+                    # TRK-8: the recording and track IDs the file is tagged with (never when blind)
+                    "ids": [] if blind else list(i.get("track_ids") or ()),
+                    # (MED-22: which layer of a hybrid SACD each disc is, engine._layer_prefer)
+                    "audio": {"rate": i.get("rate") or 0, "bits": i.get("bits") or 0,
+                              "channels": i.get("channels") or 0, "sacd_area": i.get("sacd_area") or ""}}
+                   for _p, i in infos],
+        # the tags' barcode, else one the ripper's notes name ("Barcode: 5013929020160")
+        "barcodes": tags_barcodes,
+        "tag_barcodes": set(tags_barcodes),
+        "disc_only_codes": disc_only_codes,                     # (DSC-8: one disc's album's, not the set's)
+        # a barcode the ripper's notes name ("Barcode: 5013929020160"): typed, perhaps from another
+        # edition's page, so never the tags' barcode; the documents step searches it as read print
+        "note_barcodes": sorted({mc.norm_code(b) for b in note_barcodes} - tags_barcodes),
+        # the tags a barcode came from when it is not Picard's BARCODE (UPC, EAN, ASIN)
+        "barcode_sources": sorted({i["barcode_from"] for _p, i in infos if i["barcode"] and i.get("barcode_from")}),
+        "asins": sorted({i["asin"] for _p, i in infos if i.get("asin")}),
+        # catalogue numbers from the tags, plus any written in the folder name
+        # or album title ("[20bit RM DOMO 71063-2]")
+        "catnos": ({mc.norm_code(c) for c in tag_codes}
+                   | {mc.norm_code(h) for h in folder_match} | typed | {mc.norm_code(c) for c in sacd_disc}),
+        # MED-13: the number an SACD extraction log read off the disc itself: your copy's own
+        "catnos_sacd_disc": sorted({mc.norm_code(c) for c in sacd_disc}),
+        "catnos_from_folder": {mc.norm_code(h) for h in folder_match} | typed,
+        # VIN-2: the album tag's bracket numbers the folder's own number differs from, held aside
+        "catnos_title_held": sorted(held_title),
+        "catnos_folder_own": sorted(own_norm),
+        # VIN-5: a US record's number with its format suffix -> the bare number read with it
+        "catnos_suffix_bare": {mc.norm_code(h): mc.norm_code(h.rsplit(" ", 1)[0]) for h in own_hints
+                               if re.search(r"\s[A-Z]-\d$", h)},
+        # CAT-3: of which one-digit label codes ("RHEADCDX 1"), not in the tags or notes too
+        "catnos_cat3": ({mc.norm_code(h) for h in folder_match if mc.cat3_hint(h)} - typed
+                        - {mc.norm_code(c) for c in tag_codes}),
+        # ... and those from the tags (mc.tagger_catno: another tagger's word only)
+        "tag_catnos": {mc.norm_code(c) for c in tag_codes},
+        # ... of which the ripper typed in notes or a log (told apart from the folder's in the notes)
+        "catnos_typed": typed - {mc.norm_code(h) for h in folder_match},
+        "catnos_from_logs": sorted({mc.norm_code(c) for c in log_codes}),
+        "catno_search": sorted(set(tag_search) | set(folder_hints)
+                               | set(typed_search) | set(sacd_disc)),
+        "pressing_year": mc.pressing_year(album_folder) or mc.pressing_year(title) or _log_year(album_dir, logs),
+        # CTY-3: "Press 1986", "Re2015": a preference between pressings only (match_core.press_year)
+        "press_year": mc.press_year(album_folder),
+        "media_hint": hint, "media_hint_from": hint_from,
+        # VIN-10: a vinyl rip's sides, by its names, disc numbers, pictures or notes (0: none shown)
+        "vinyl_sides": vinyl_sides(album_dir, [p.name for p in files], infos, notes) if hint == "vinyl" else 0,
+        # MED-14: a CD count in every disc's album tag - weaker than the folder name and the
+        # audio (copy_source, match_core.copy_kind, file_clues): no media hint of its own
+        "tags_media": "cd" if box_tags else "", "tags_media_from": box_tags,
+        "sacd_hint": sacd_marks(album_dir, album_folder),     # MED-13
+        # EDN-2: the labels your copy names as its edition's: the folder name's edition bracket
+        # ("(2017 AP ISO)"), an SACD-Ripper log's disc image ("Analogue Productions - Title.iso")
+        "edition_year": mc.edition_year(album_folder),
+        "copy_labels": list(dict.fromkeys(mc.edition_labels(album_folder) + iso_labels(
+            album_dir, album_folder, [title, m.group(2) if m else album_folder]))),
+        # the album named in the rip logs' headers ("Jesu / Conqueror (Japanese Bonus Disc)"):
+        # searched too when the folder's title finds nothing sure (one disc of a box)
+        "log_titles": [h for h in headers if mc.fold(h[1]) != mc.fold(title)],
+        "foreign_logs": [Path(log["path"]).name for log in foreign_logs],
+        # cue sheets whose tracks fit no disc of the files: their CATALOG is typed, not print
+        "foreign_cues": foreign_cues(album_dir, infos),
+        "enhanced": enhanced_marks(album_dir, logs),
+        "tracktotal": _track_total(infos),
+        "folder": album_folder, "artist_folder": artist_folder,
+        # FLD-2: the folder name's own "Artist - Album" reading, when the files name no artist
+        # and its head is not the folder above (with_reading; None otherwise)
+        "folder_reading": folder_read,
+        "tag_label": top("label"), "tag_country": top("country"),
+        # CAT-10: a plain COUNTRY tag of a vinyl copy (an artist's country as often): told, never weighed
+        "tag_country_plain": top("country_plain") if hint == "vinyl" else "",
+        # labels to search with the catalogue number: the tags', then the ripper's notes'
+        "search_labels": search_labels(top("label"), notes),
+        "tag_media": mc.media_kind(top("media")), "tag_date": top("date"),
+        "audio": audio_evidence([i for _p, i in infos]),
+        # per disc: the rip log's TOC first (the disc itself, its pregaps and the data track
+        # of an Enhanced CD), then a cue sheet's, then the one rebuilt from the tracks' lengths
+        "tocs": tocs,
+        # TAG-3: the discs whose TOC was READ - from a rip log, or a cue sheet carrying more than
+        # the files' lengths (an image's track starts, its pregaps) - and fits their files: the
+        # disc's real TOC, pregaps and all. A TOC rebuilt from the files' lengths always fits
+        # them and may lack the pregaps a rip left out: never evidence against a disc ID
+        "tocs_read": tocs_read(tocs, tocs_fit, log_toc, cue_toc, disc_tocs(infos)),
+        "tocs_fit": tocs_fit,
+        "rip_log_toc": bool(log_toc),
+        # DAT-3: a rip log of these files dated this year: no pressing first out later is your copy
+        "rip_log_year": log_year, "rip_log_year_from": log_year_from,
+        # discs whose hidden track before track 1 (a file numbered 0) a rip log's or CDTOC tag's
+        # TOC shows in its first pregap: the disc itself has it (match_core.with_pregap)
+        "htoa_toc_discs": htoa_toc_discs(infos, list(log_toc.values()) + list(cdtocs.values())),
+        "scans": scan_evidence(album_dir),
+        "packaging": packaging_evidence(album_dir),
+        "isrcs": [i.get("isrc") for _p, i in infos if i.get("isrc")],
+        "store_tracks": sorted({i["store_track"] for _p, i in infos if i.get("store_track")}),
+        "credit_text": " ".join(sorted({i.get("credit") or "" for _p, i in infos})) + " " + notes,
+        # shop pages the files came from: MusicBrainz's /url lookup ties them to a release
+        # (link_releases: "source link")
+        "tag_mb_links": tag_mb_links, "tag_discogs_links": tag_discogs_links, "tag_urls": tag_urls,
+        # release IDs the files were tagged with, and the release links in their tags (another
+        # tagger's word, like the ID tags): fetched and scored, not evidence
+        # TAG-3: the release ID tags the files hold, as written ({field: [values]}; empty when
+        # blind): what the plan would leave beside the release it writes (engine._one_release)
+        "file_release_ids": {f: sorted({i["id_tags"][f] for _p, i in infos if (i.get("id_tags") or {}).get(f)})
+                             for f in _ID_FIELDS.values()},
+        "tag_release_mb": tag_release_mb | tag_mb_links,
+        "tag_release_discogs": tag_release_discogs | tag_discogs_links,
+        "total_releases": total_releases,
+        # {disc: "stereo" | "multichannel" | "atmos" | "mono"}: the album's discs are versions of
+        # one disc in folders named after their channel layout (match_core.version_view)
+        "version_discs": version_discs,
+        # {disc: "Stereo" | "5.1" | "Quad" | "Atmos" ...}: each version's name (%_version%)
+        "version_labels": version_labels,
+        # {disc: "sacd" | "video" | "cd" | ""}: the kind of disc each version's folder name or
+        # audio says it was ripped from (_audio_kind); "" when nothing says
+        "version_kinds": version_kinds,
+        # {disc: "name" | "media" | "tags" | "audio"}: what says so (version_kind) - "audio" (the rate,
+        # depth and channels alone) never proves which disc a version is (match_core.version_view)
+        "version_kind_by": {d: k[1] for d, k in kinds.items()},
+        # {disc: release IDs its files' tags name (MusicBrainz, Discogs)}: a media tag counts as the
+        # disc's evidence only when they name the release it is scored against (version_view)
+        "version_release_ids": {d: sorted({str(x) for _p, i in infos if i["disc_eff"] == d
+                                          for x in (i.get("mb_albumid"), i.get("discogs_releaseid")) if x})
+                                for d in kinds},
+        # {disc: True} for a disc whose audio is no CD's (an SACD_AREA tag, hi-res or DSD audio,
+        # more than two channels, a DVD or Blu-ray word in its folder name)
+        "version_hires": {d: version_kinds[d] in ("sacd", "video") or
+                          all(_not_cd_audio(p, i) for p, i in infos if i["disc_eff"] == d) for d in version_discs},
+    }
+
+
+# --- match_albums.py:2810
+def version_folders(infos, folders=()):
+    """{folder: (layout, label, disc kind)} (match_core.parse_version) when the album's files are
+    versions of one disc in folders named after their channel layout ("2.0/" and "5.0/",
+    "Stereo 24-96/" and "DTS 5.1/"; or the album folder itself when it is one and holds them
+    all): every folder holding its files is one, each a different version, and no file's
+    channel count or SACD_AREA tag says otherwise. {} otherwise. folders: the album's
+    subfolders holding files (read_album)."""
+    dirs = sorted({p.parent for p, _i in infos})
+    if not dirs or (len(dirs) > 1 and set(dirs) != set(folders or ())):
+        return {}
+    out = {}
+    for d in dirs:
+        got = mc.parse_version(d.name)
+        if not got or any(mc.fold(i.get("album") or "") == mc.fold(d.name) for _p, i in infos):
+            return {}                    # (an album called "Stereo" in its own folder)
+        lay = got[0]
+        mine = [i for p, i in infos if p.parent == d]
+        if len({i.get("disc") for i in mine if i.get("disc")}) > 1:
+            return {}                    # (a whole set in one version's folder: its discs stand)
+        heard = {mc.layout_of_channels(i.get("channels"), i.get("sacd_area")) for i in mine}
+        heard.discard("")
+        if lay == "mono" and not any(i.get("sacd_area") for i in mine):
+            heard.discard("stereo")     # (mono as two identical channels)
+        if lay == "atmos":
+            heard.discard("multichannel")   # (an immersive mix's bed, as ripped)
+        if heard and heard != {lay}:
+            return {}                    # (the audio is another layout than the folder's name)
+        out[d] = got
+    if len({mc.fold(v[1]) for v in out.values()}) != len(out):
+        return {}
+    return out
+
+
+# --- match_albums.py:2843
+def version_discs_by_tags(infos):
+    """{disc: (layout, label, "")} when every file of each disc names its layout in its
+    SACD_AREA tag ("Stereo", "Multichannel") or its media tag ("Hybrid SACD (SACD layer, 2
+    channels)", as TagMender wrote it), a different one each: versions of one disc already
+    filed as discs of their release ("Disc 02/", "Disc 03/"). {} otherwise; never from the
+    channel count alone."""
+    by, plain = {}, {}
+    for _p, i in infos:
+        media = i.get("media_written", i.get("media"))
+        lay = mc.layout_of_channels(0, i.get("sacd_area")) or mc.medium_layout(media)
+        by.setdefault(i["disc_eff"], set()).add(lay)
+        # (stereo read only off a CD's or a format description's media tag, no SACD area)
+        plain.setdefault(i["disc_eff"], set()).add(
+            lay == "stereo" and not i.get("sacd_area") and mc.medium_type(media) not in ("sacd", "video"))
+    if not by or any(len(v) != 1 or "" in v for v in by.values()):
+        return {}
+    out = {d: next(iter(v)) for d, v in by.items()}
+    # MIX-2: one disc whose CD media tag says "Stereo" (Discogs's format "CD, Album, Limited
+    # Edition, Stereo", as TagMender wrote it: Spock's Beard - Day For Night) is the album, not
+    # a version of a disc; a lone SACD area, an SACD layer or a DVD-Audio mix stays a version
+    if len(out) == 1 and all(plain.get(d) == {True} for d in out):
+        return {}
+    if len(set(out.values())) != len(out):
+        return {}
+    return {d: (lay, lay.title(), "") for d, lay in out.items()}
+
+
+# --- match_albums.py:2870
+def version_kind(name_kind, files):
+    """(kind, what says so) of the disc a version's files were ripped from: the disc word in
+    its folder's name ("DVD 5.1", "BD Stereo": "name"), else the media tag every file carries
+    ("DVD-Video", "Blu-ray", "Hybrid SACD (SACD layer, ...)" as TagMender wrote it: "media"),
+    else the audio (_audio_kind: "tags" for an SACD_AREA tag or DSD, "audio" otherwise)."""
+    if name_kind:
+        return name_kind, "name"
+    media = {mc.medium_type(i.get("media_written", i.get("media"))) for _p, i in files}
+    if len(media) == 1 and next(iter(media)):
+        return media.pop(), "media"
+    kind = _audio_kind(files)
+    sure = any(i.get("sacd_area") for _p, i in files) or any(Path(p).suffix.lower() in (".dsf", ".dff")
+                                                            for p, _i in files)
+    return kind, ("tags" if sure else "audio")
+
+
+# --- match_albums.py:2886
+def _audio_kind(files):
+    """The kind of disc these files' audio says they were ripped from: "sacd" (an SACD_AREA tag,
+    DSD, a 44.1 kHz-family rate past a CD's), "video" (a 48 kHz-family rate with more than a
+    CD's depth or channels, or past 48 kHz: a DVD or Blu-ray), "cd" (16-bit/44.1 kHz stereo)
+    or "" (48 kHz/16-bit stereo, mixed: nothing says)."""
+    if not files:
+        return ""
+    infos = [i for _p, i in files]
+    if any(i.get("sacd_area") for i in infos) or any(Path(p).suffix.lower() in (".dsf", ".dff") for p, _i in files):
+        return "sacd"
+    rates = {int(i.get("rate") or 0) for i in infos}
+    if len(rates) != 1 or not next(iter(rates)):
+        return ""
+    rate = rates.pop()
+    deep = any((i.get("bits") or 0) > 16 for i in infos)
+    wide = any((i.get("channels") or 0) > 2 for i in infos)
+    if rate % 44100 == 0 and rate > 44100:
+        return "sacd"
+    if rate % 48000 == 0 and (rate > 48000 or deep or wide):
+        return "video"
+    if rate == 44100 and not deep and not wide:
+        return "cd"
+    return ""
+
+
+# --- match_albums.py:2911
+def _not_cd_audio(p, i):
+    """The file's audio is no CD's: an SACD_AREA tag, a DSD file, a sample rate or depth past a
+    CD's, or more than two channels."""
+    return bool(i.get("sacd_area") or Path(p).suffix.lower() in (".dsf", ".dff")
+                or (i.get("rate") or 0) > 48000 or (i.get("bits") or 0) > 16 or (i.get("channels") or 0) > 2)
+
+
+# --- match_albums.py:2918
+def _log_year(album_dir, logs):
+    """The edition year a ripper typed into the folder a rip log wrote to ("[2006 - reissue]"),
+    from a log without a TOC that a CUETools report proves is of these files (a log with a
+    TOC that fits is read for codes, not years). None otherwise; the folder name's year
+    always comes first."""
+    for log in logs:
+        if not log["toc"] and log.get("out_parts") and accurip_confirms(album_dir, log):
+            for part in log["out_parts"]:
+                y = mc.pressing_year(part)
+                if y:
+                    return y
+    return None
+
+
+# --- match_albums.py:2935
+# MED-21: a vinyl rip in the ripper's words: "Vinyl Rip", "vinyl 24/96 rip", "ripped from vinyl",
+# "needle drop", "VinylRip", "LP rip", and a tracker's "Source: Vinyl" / "Lineage: Vinyl > ..." (vinyl
+# and rip at most a few words apart, within one sentence; never "vinyl" alone)
+_SEP = r"[^\w.,;:!?()\[\]\n]+"           # (between words, within one clause or bracket)
+
+
+# --- match_albums.py:2936
+_VINYL_RIP = re.compile(rf"\b(?:vinyl|LP)(?:{_SEP}\w+){{0,2}}?{_SEP}rip(?:ped)?\b|\bvinyl-?rip\b"
+                        rf"|\brip(?:ped)?{_SEP}(?:from|of|off){_SEP}(?:\w+{_SEP}){{0,4}}?(?:vinyl|LP)\b"
+                        r"|\bneedle[ _-]?drop|^[ \t]*(?:source|lineage|media|medium)[ \t]*[:=][ \t]*vinyl\b", re.I | re.M)
+
+
+# --- match_albums.py:2941
+# (a vinyl rip denied or of another copy: "the 7\" vinyl was not ripped", "not the vinyl rip",
+# "other versions: vinyl rip by X", "ripped from the CD")
+_NOT_THIS = re.compile(r"\b(?:not|no|never|other|another|also|alternative|unlike)\b(?:\W+\w+){0,3}?\W*$", re.I)
+
+
+# --- match_albums.py:2942
+_DENIED_AFTER = re.compile(r"^\W*(?:\w+\W+){0,2}?(?:not\W+(?:ripped|used|included|this|mine)\b|from\W+(?:(?:the|an?|my)\W+)?"
+                           r"(?:CD|CDs|WEB|digital|download|stream|streaming|tape|cassette|files?|SACD|DVD|discogs)\b)", re.I)
+
+
+# --- match_albums.py:2944
+_DENIED_WITHIN = re.compile(r"\b(?:not|never|no)\b|n't\b", re.I)
+
+
+# --- match_albums.py:2947
+def _vinyl_rip_in(text) -> bool:
+    for m in _VINYL_RIP.finditer(text or ""):
+        line_start = text.rfind("\n", 0, m.start()) + 1
+        before = re.split(r"[.,;!?(\[]", text[line_start:m.start()])[-1]
+        after = re.split(r"[.;!?)\]\n]", text[m.end():m.end() + 60])[0]
+        if not _NOT_THIS.search(before) and not _DENIED_AFTER.search(after) \
+                and not _DENIED_WITHIN.search(m.group(0)):
+            return True
+    return False
+
+
+# --- match_albums.py:2958
+def vinyl_rip_said(infos, notes) -> str:
+    """MED-21: where the ripper says the files are a vinyl rip, or "": a closing bracket mark
+    of every file's album tag, or the rip notes (.txt/.nfo beside the music)."""
+    marks = []
+    for _p, i in infos:
+        m = re.search(r"[\(\[]([^\(\)\[\]]*)[\)\]]\s*$", str(i.get("album") or ""))
+        marks.append(bool(m and _vinyl_rip_in(m.group(1))))
+    if infos and all(marks):
+        return "the album tags say vinyl rip"
+    if _vinyl_rip_in(notes or ""):
+        return "the rip notes say vinyl rip"
+    return ""
+
+
+# --- match_albums.py:2976
+# VIN-10: the record player a rip's notes name on a labelled line - its turntable ("TT:",
+# "Turntable:"; never "TT: 44:12", a total time), its tonearm ("Tonearm:", "Arm:"), its cartridge
+# ("Cartridge:", "Stylus:", "Needle:") and its phono stage ("Phono preamp:", "Phonopreamplifier:",
+# "Phono stage:", "RIAA:"). Never "Deck:": a tape deck is one too.
+_GEAR_LINE = (("turntable", re.compile(r"(?im)^[ \t*•-]*(?:TT|turntable)[ \t]*[:=][ \t]*(?!\d{1,3}[:.]\d\d\b)\S")),
+              ("tonearm", re.compile(r"(?im)^[ \t*•-]*(?:tone[ \t-]?arm|arm)[ \t]*[:=][ \t]*\S")),
+              ("cartridge", re.compile(r"(?im)^[ \t*•-]*(?:cartridge|stylus|needle)[ \t]*[:=][ \t]*\S")),
+              ("phono stage", re.compile(r"(?im)^[ \t*•-]*(?:phono[ \t-]*(?:pre[ \t-]*)?(?:amp(?:lifier)?|stage|pre)|riaa"
+                                         r"(?:[ \t]+(?:pre[ \t-]*)?amp(?:lifier)?|[ \t]+stage)?)[ \t]*[:=][ \t]*\S")))
+
+
+# --- match_albums.py:2982
+# VIN-10: a record's sides the notes list on lines of their own ("Side A  EX / NM", "Side C: ...")
+_SIDE_LINE = re.compile(r"(?im)^[ \t*•-]*side[ \t]*([A-H])\b(?![\w'’])")
+
+
+# --- match_albums.py:2984
+# VIN-10: a tape's words - in the notes, the tags or a picture's name - veto vinyl from own evidence
+_TAPE_WORD = re.compile(r"\b(?:cassettes?|tapes?|tape[ \t-]?deck|reel(?:[ \t-]?to[ \t-]?reel)?|dolby|j-?card|nakamichi)\b", re.I)
+
+
+# --- match_albums.py:2986
+# (a disc folder of a set: its side pictures are its own record's - "Disc1/side A", "LP 2/side B")
+_DISC_DIR = re.compile(r"^(?:cd|disc|disk|lp|record|vinyl)[ _-]*\d{1,2}\b", re.I)
+
+
+# --- match_albums.py:2989
+def rip_gear(notes) -> list:
+    """VIN-10: which parts of a record player the rip notes name on labelled lines
+    ("turntable", "tonearm", "cartridge", "phono stage")."""
+    return [what for what, rx in _GEAR_LINE if rx.search(str(notes or ""))]
+
+
+# --- match_albums.py:2995
+_SIDE_WORD = r"(?<![a-z])side[ _-]*([a-h])(?![a-z0-9])"
+
+
+# --- match_albums.py:2998
+def _side_pictures(album_dir) -> dict:
+    """The record sides the folder's pictures are named for ("side A.JPG", "_side B.jpg"), by the
+    disc folder they lie in ("" for any other folder: artwork/, scans/ are one record's set)."""
+    pics = {}
+    for dirpath, _d, fnames in os.walk(album_dir):
+        disc = next((part for part in Path(dirpath).relative_to(album_dir).parts if _DISC_DIR.match(part)), "")
+        for n in fnames:
+            m = re.search(_SIDE_WORD, Path(n).stem, re.I) if Path(n).suffix.lower() in IMAGE_EXT else None
+            if m:
+                pics.setdefault(disc.casefold(), set()).add(m.group(1).upper())
+    return pics
+
+
+# --- match_albums.py:3011
+def _image_names(album_dir) -> list:
+    out = []
+    for _dirpath, _d, fnames in os.walk(album_dir):
+        out += [n for n in fnames if Path(n).suffix.lower() in IMAGE_EXT]
+    return out
+
+
+# --- match_albums.py:3018
+def vinyl_sides(album_dir, audio_names, infos, notes="") -> int:
+    """VIN-10: how many sides of records the copy shows - side letters of its audio files' names
+    ("A1 ..."), its disc numbers ("A" .. "D"), its pictures of each side ("side A.JPG" ..
+    "side D.JPG") or its notes' lines ("Side A  EX / NM"): the most of these (0 when none). Sides
+    are counted per disc - by the files' disc numbers, the pictures' disc folders - and summed:
+    "Disc 1/side A, B" and "Disc 2/side A, B" are 4 sides."""
+    names = {}
+    for k, (p, i) in enumerate(infos):
+        n = Path(p).name if p else (audio_names[k] if k < len(audio_names) else "")
+        m = re.search(r"^([a-h])\d{1,2}(?=[ ._)-])", Path(n).stem, re.I) or re.search(_SIDE_WORD, Path(n).stem, re.I)
+        if m:
+            disc = i.get("disc_eff") or (str(i.get("disc_raw") or "").split("/")[0].strip() if
+                                         not _SIDE_DISC.match(str(i.get("disc_raw") or "")) else "") or 1
+            names.setdefault(str(disc), set()).add(m.group(1).upper())
+    if not infos:
+        for n in audio_names:
+            m = re.search(r"^([a-h])\d{1,2}(?=[ ._)-])", Path(n).stem, re.I) or re.search(_SIDE_WORD, Path(n).stem, re.I)
+            if m:
+                names.setdefault("1", set()).add(m.group(1).upper())
+    discs = {m.group(1).upper() for _p, i in infos for m in [_SIDE_DISC.match(str(i.get("disc_raw") or ""))] if m}
+    lines = {m.group(1).upper() for m in _SIDE_LINE.finditer(str(notes or ""))}
+    return max(sum(len(v) for v in names.values()), len(discs),
+               sum(len(v) for v in _side_pictures(album_dir).values()), len(lines))
+
+
+# --- match_albums.py:3043
+def vinyl_own_evidence(album_dir, audio_names, infos, notes="") -> str:
+    """VIN-10: why the copy's own evidence says it is a vinyl rip, whatever its folder is called,
+    or "". Strong alone: the rip notes naming two parts of a record player on labelled lines (a
+    turntable, tonearm, cartridge, phono stage: "TT: Clearaudio Emotion", "Cartridge: ..."), or
+    every file's source tag naming the record ("SOURCE=Vinyl", "SCOURCE=VINYL"). Weak, two of
+    them needed: one part of a record player alone, pictures of two sides or more ("side A.JPG"),
+    the notes' lines of three sides or more ("Side C  EX / NM"), every file's disc number a side letter ("A", "B2"),
+    every file's media or format tag naming the record (another tagger copies those from the
+    release it chose). A tape's word anywhere - the notes, the tags, a picture's name
+    ("cassette", "tape deck", "reel", "Dolby", "J-card", "Nakamichi") - says none of it."""
+    infos = [i for _p, i in infos]
+    tag_text = " ".join(str(i.get(k) or "") for i in infos
+                        for k in ("album", "media", "source_any", "comment_text"))
+    if _TAPE_WORD.search(str(notes or "")) or _TAPE_WORD.search(tag_text) or \
+            any(_TAPE_WORD.search(Path(n).stem.replace("_", " ")) for n in _image_names(album_dir)):
+        return ""
+    gear = rip_gear(notes)
+    if len(gear) >= 2:
+        return f"the rip notes name the {' and '.join(gear[:2])}"
+    if infos and all(i.get("source_vinyl") for i in infos):
+        return f"the files' source tag says {infos[0]['source_vinyl']}"
+    weak = []
+    if gear:
+        weak.append(f"the rip notes name the {gear[0]}")
+    pics = set().union(*_side_pictures(album_dir).values()) if _side_pictures(album_dir) else set()
+    lines = {m.group(1).upper() for m in _SIDE_LINE.finditer(str(notes or ""))}
+    if len(pics) >= 2:
+        weak.append(f"pictures of {len(pics)} vinyl sides")
+    elif len(lines) >= 3:
+        # (three sides at least: a tape's notes list sides A and B, and lyrics sheets do too)
+        weak.append(f"the rip notes list {len(lines)} vinyl sides")
+    if infos and all(_SIDE_DISC.match(str(i.get("disc_raw") or "")) for i in infos):
+        weak.append("disc numbers that are vinyl sides")
+    if infos and all(i.get("media_vinyl") or mc.media_kind(i.get("media")) == "vinyl" for i in infos):
+        weak.append("the media tags say vinyl")
+    return " and ".join(weak) if len(weak) >= 2 else ""
+
+
+# --- match_albums.py:3097
+def _media_hint(album_dir, album_folder, files, infos, artist, rip_log, notes="", cd_said=False):
+    """What the copy was made from, and what says so: the folder name first ("[Vinyl Rip]",
+    "[2CD]"), then signs the files carry whatever the folder is called (R4). Vinyl signs
+    (sides, needle-drop pictures) outrank a "[WEB]" folder; a shop's comments in the tags or
+    Bandcamp's original names in a checker's log make a download, unless a rip log that
+    fits the files says it came off a CD. A rip log that fits the files outranks the vinyl
+    signs too, and sides alone (named "A1 ...", "side A.jpg") make vinyl only of a folder
+    named "[WEB]": a tape has sides, and side pictures may be scans of another pressing."""
+    hint = mc.media_hint(album_folder)
+    if hint in ("", "digital") and not rip_log:
+        vinyl = vinyl_marks(album_dir, [p.name for p in files], sides_count=hint == "digital")
+        if vinyl:
+            return "vinyl", vinyl
+        # MED-21: the ripper's own word, when the folder name has none: a closing mark in every
+        # file's album tag ("Saturdays = Youth [Vinyl Rip 24bit 96khz]") or the rip notes beside
+        # them ("Vinyl 24bit/96khz rip") - a rip of vinyl, never a mention of it ("also on vinyl")
+        if not hint and not cd_said:
+            said = vinyl_rip_said(infos, notes)
+            if said:
+                return "vinyl", said
+        # VIN-10: the copy's own evidence of a record ripped - a record player in the rip notes,
+        # a source tag naming the record, sides (pictures, disc numbers) beside another sign;
+        # never against a TOC or whole CD sectors
+        if not hint and not cd_said:
+            own = vinyl_own_evidence(album_dir, [p.name for p in files], infos, notes)
+            if own:
+                return "vinyl", own
+    if hint or rip_log:
+        return hint, ("folder name" if hint else "")
+    shops = Counter(i.get("download_marker") for _p, i in infos if i.get("download_marker"))
+    if shops and shops.most_common(1)[0][1] * 2 >= len(infos):
+        return "digital", f"{shops.most_common(1)[0][0]} comments or URLs in the tags"
+    if bandcamp_names(album_dir, artist, len(infos)):
+        return "digital", "Bandcamp's file names in a checker's log"
+    return "", ""
+
+
+# --- match_albums.py:3136
+# MED-14: a set's disc count in the closing mark of each disc's album tag ("First Album [2020 The
+# Recordings 10CD Box]")
+_BOX_COUNT = re.compile(r"(?<![A-Za-z0-9])(\d{1,2})\s*-?\s*CDs?(?![A-Za-z0-9])", re.I)
+
+
+# --- match_albums.py:3139
+def _tags_box_count(infos) -> str:
+    """MED-14: why the copy is a CD set by its own album tags, or "": every file's album tag
+    ends in a mark naming one count of CDs ("[... 10CD Box]", "(3 CD)") and that count is the
+    number of discs the files make (two or more). A weak clue (album tags are copied with the
+    titles): read only when the folder name says nothing, and below a rip log, the CD sectors
+    and the audio (hi-res or not whole sectors: never a CD). Never a release ID, and no count
+    the copy's own layout does not have."""
+    counts, discs = set(), set()
+    for _p, i in infos:
+        m = re.search(r"[\(\[]([^\(\)\[\]]*)[\)\]]\s*$", str(i.get("album") or ""))
+        found = _BOX_COUNT.findall(m.group(1)) if m else []
+        if len(found) != 1:
+            return ""
+        counts.add(int(found[0]))
+        discs.add(i.get("disc_eff") or i.get("disc") or 1)
+    if len(counts) != 1 or len(discs) < 2 or counts != {len(discs)}:
+        return ""
+    return f"{len(discs)}CD in every disc's album tag"
+
+
 # --- match_albums.py:3159
 _SACD_NAME = re.compile(r"(?<![A-Za-z0-9])(?:SACD|DS[DT]\d+)(?![A-Za-z])", re.I)   # ("DSD64", never "DST")
 
@@ -265,6 +2934,257 @@ def sacd_marks(album_dir, album_folder) -> str:
         if _SACD_TOOL.search(text):
             return f"an SACD rip log ({p.name})"
     return ""
+
+
+# --- match_albums.py:3192
+# sacd_extract's report of the disc ("sacd_extract -P > sacd_log.txt"): the disc's own master
+# TOC, its catalogue number among it ("Disc Information: ... Catalog Number: SICL-10001")
+_SACD_DISC_INFO = re.compile(r"^\s*Disc Information:\s*$(.*?)^\s*(?:Album Information:|Area count:)", re.M | re.S)
+
+
+# --- match_albums.py:3193
+_SACD_CATALOG = re.compile(r"^\s*Catalog Number:[ \t]*(\S[^\r\n]*?)[ \t]*$", re.M)
+
+
+# --- match_albums.py:3196
+def sacd_disc_catnos(album_dir, album_folder) -> list:
+    """MED-13, CAT-7: the catalogue number an SACD extraction log (sacd_extract's report, which
+    SACD-Ripper and ISO2DSD print too) reads off the disc's own master TOC - "Disc Information:
+    ... Catalog Number: SICL-10001" (Kodo - One Earth Tour Special): the disc's own number,
+    as a CD's CATALOG in its cue is its barcode. In the album's folder, or for one version
+    folder of the disc ("Stereo/" read with the set's name) in the disc's folder beside it.
+    Only the disc's block (the album's "Catalog Number:" of a set is often empty), only small
+    text files named for the SACD or a log."""
+    album_dir = Path(album_dir)
+    # (a version folder planned alone - "Stereo/", "Multichannel/" - is one area of the disc
+    # whose log sits beside it)
+    version = bool(mc.version_layout(album_dir.name))
+    tops = [album_dir] + ([album_dir.parent] if (album_folder and album_folder != album_dir.name) or version else [])
+    out = []
+    for top in tops:
+        try:
+            found = sorted(p for p in top.iterdir() if p.is_file() and p.suffix.lower() in (".log", ".txt")
+                           and ("sacd" in p.name.lower() or p.suffix.lower() == ".log"))[:20]
+        except OSError:
+            continue
+        for p in found:
+            try:
+                if p.stat().st_size > 512 * 1024:
+                    continue
+                raw = p.read_bytes()[:64 * 1024]
+            except OSError:
+                continue
+            text = raw.decode("utf-16", "ignore") if raw[:2] in (b"\xff\xfe", b"\xfe\xff") else raw.decode("utf-8", "ignore")
+            text = text.replace("\r\n", "\n").replace("\r", "\n")
+            m = _SACD_DISC_INFO.search(text)
+            if not m or not re.search(r"^\s*Area count:", text, re.M):
+                continue
+            for c in _SACD_CATALOG.findall(m.group(1)):
+                c = c.strip()
+                core = re.sub(r"\W", "", c)
+                # (a TOC field the mastering left filled with one character, "0000000000000000" or
+                # "----", is no number)
+                if len(set(core.casefold())) <= 1 or not re.sub(r"[\W0]", "", c):
+                    continue
+                if len(core) >= 5 and re.search(r"\d", c) and c not in out:
+                    out.append(c)
+        if out:
+            break
+    return out
+
+
+# --- match_albums.py:3244
+# SACD-Ripper's line naming the disc image it wrote: "Queuing raw: /dev_usb000/Analogue
+# Productions - Child Is Father To The Man.iso, start_lsn: ..." (or a Windows path)
+_ISO_QUEUED = re.compile(r"Queuing raw:[ \t]*([^\r\n]*?)\.iso\b", re.I)
+
+
+# --- match_albums.py:3247
+def iso_labels(album_dir, album_folder, titles) -> list:
+    """EDN-2: the label an SACD-Ripper log names its disc image after ("<Label> - <Title>.iso"),
+    in the album's folder - or, for one version or disc of a set read with the set's name
+    (album_folder is not album_dir's own name), in the set's folder beside it. Only the
+    "<Label> - <Title>.iso" form whose title is the album's, and only a label EDITION_LABELS
+    knows ("Analogue Productions", "MFSL", "MoFi"): an artist, alias or catalogue number in
+    that place ("Blood, Sweat & Tears - ...", "Various - ...") names no label."""
+    album_dir = Path(album_dir)
+    tops = [album_dir] + ([album_dir.parent] if album_folder and album_folder != album_dir.name else [])
+    found = []
+    for top in tops:
+        try:
+            found += sorted(p for p in top.iterdir() if p.is_file() and p.suffix.lower() in (".log", ".txt"))[:20]
+        except OSError:
+            continue
+    want = {mc.fold(mc.strip_edition(mc.drop_trailing_brackets(t or ""))) for t in titles} - {""}
+    out = []
+    for p in found:
+        try:
+            if p.stat().st_size > 512 * 1024:
+                continue
+            text = p.read_bytes()[:64 * 1024].decode("utf-8", "ignore")
+        except OSError:
+            continue
+        if not _SACD_TOOL.search(text):
+            continue
+        for path in _ISO_QUEUED.findall(text):
+            name = re.split(r"[/\\]", path)[-1]
+            if " - " not in name:
+                continue
+            label, iso_title = name.split(" - ", 1)
+            label = mc.edition_label_of(label)
+            if label and mc.fold(iso_title) in want and label not in out:
+                out.append(label)
+    return out
+
+
+# --- match_albums.py:3284
+def _track_total(infos):
+    """The album's track count as the tags have it: TRACKTOTAL ("3/12"), every file of a disc
+    agreeing, summed over discs whose numbering starts again (1-10, 1-10: 20), counted once
+    when the numbers run on over the discs (1-10, 11-20, each saying 20); else TagMender's
+    write_failed marker ("saved 10 of 12 files"), which counts the whole album's files and is
+    stamped on each, taken once. 0 when the files do not say, or say it in a way that adds up
+    to neither."""
+    per_disc = {}
+    for _p, i in infos:
+        per_disc.setdefault(i.get("disc_eff", 1), []).append(i)
+    totals = {d: {i.get("tracktotal") or 0 for i in fs} for d, fs in per_disc.items()}
+    if per_disc and all(len(v) == 1 and 0 not in v for v in totals.values()):
+        total = {d: next(iter(v)) for d, v in totals.items()}
+        nums = {d: [i.get("num") or 0 for i in fs] for d, fs in per_disc.items()}
+        discs = sorted(per_disc)
+        # One album-wide total over discs numbered from 1 (Voivod - The Wake: 1-8 and 1-11,
+        # every file saying 19). Only when the per-disc reading cannot hold: discs of
+        # different track counts, each numbered 1..n without a gap. Discs of equal counts
+        # (1-5 and 1-5 saying 10) are Picard's per-disc totals with files missing: summed.
+        # (DSC-4: or three discs and more, some of equal counts, adding up to it exactly - a
+        # box's 2, 9, 6, ... 13 tracks each saying 74 - which per disc would be 740 tracks)
+        counts = [len(nums[d]) for d in discs]
+        if (len(discs) > 1 and len(set(total.values())) == 1 and (len(set(counts)) == len(counts) or len(discs) >= 3)
+                and all(sorted(nums[d]) == list(range(1, len(nums[d]) + 1)) for d in discs)
+                and sum(counts) == total[discs[0]]):
+            return total[discs[0]]
+        runs_on = len(discs) > 1 and all(min(nums[b]) > max(nums[a]) for a, b in zip(discs, discs[1:]))
+        if runs_on and len(set(total.values())) == 1 and max(max(n) for n in nums.values()) <= total[discs[0]]:
+            return total[discs[0]]                 # numbered straight through: the album's total
+        if len(discs) == 1 or (not runs_on and all(max(nums[d]) <= total[d] for d in discs)):
+            return sum(total.values())
+        return 0
+    if any(i.get("tracktotal") for _p, i in infos):
+        return 0                                   # the tags disagree, or some have none
+    return max((i.get("write_failed_total") or 0 for _p, i in infos), default=0)
+
+
+# --- match_albums.py:3366
+def audio_evidence(infos):
+    """What the audio itself says about its source.
+
+    hires: more than 16 bits or 48 kHz, so not from a CD (a vinyl rip or a download).
+    sacd: every file is DSD, an SACD area, or 88.2/176.4 kHz (an SACD's DSD64 converted: MED-3).
+    cd_frames: every lossless track at 44.1 kHz is a whole number of CD sectors
+    (588 samples), which a CD rip is and a download almost never is."""
+    lossless = [i for i in infos if i.get("lossless") and i.get("rate")]
+    hires = bool(infos) and any(i.get("bits", 0) > 16 or i.get("rate", 0) > 48000 for i in infos)
+    cd_frames = (len(lossless) >= 2 and len(lossless) == len(infos)
+                 and all(i["rate"] == 44100 and i.get("bits", 16) <= 16 and i["samples"]
+                         and i["samples"] % CD_FRAME == 0 for i in lossless))
+    # lossless CD-quality tracks that are NOT whole sectors: not a CD rip, so a download
+    not_cd = (len(lossless) >= 2 and len(lossless) == len(infos) and not hires
+              and all(i["rate"] == 44100 and i["samples"] for i in lossless)
+              and sum(1 for i in lossless if i["samples"] % CD_FRAME == 0) == 0)
+    # MED-3: an SACD's audio - DSD, an SACD_AREA tag, or DSD64 converted to 88.2 or 176.4 kHz
+    sacd = bool(infos) and all(i.get("sacd_area") or i.get("rate") in (88200, 176400)
+                               or (i.get("rate") or 0) >= 2822400 for i in infos)
+    # every file lossless (FLAC, ALAC, WAV...): a download sold only as MP3 is not this copy
+    every_lossless = bool(infos) and all(i.get("lossless") for i in infos)
+    # the files' one lossless codec ("flac"), when every file is in it (CPT-1)
+    kinds = {i.get("codec") or "" for i in infos}
+    codecs = kinds if len(kinds) == 1 and "" not in kinds else set()
+    # MED-12: whole PAL video frames too (1764 samples at 44.1 kHz, 3 sectors): a concert
+    # DVD's sound cut at its chapters is whole sectors as well (a CD rip: by chance, rarely)
+    pal_frames = cd_frames and all(i["samples"] % (3 * CD_FRAME) == 0 for i in lossless)
+    return {"hires": hires, "cd_frames": cd_frames, "not_cd": not_cd, "sacd": sacd, "lossless": every_lossless,
+            "pal_frames": pal_frames, "codecs": sorted(codecs)}
+
+
+# --- match_albums.py:3397
+def disc_tocs(infos):
+    """The table of contents of each disc, rebuilt from the tracks' exact
+    lengths (as freeDB/MusicBrainz disc IDs are), for CD rips only:
+    {disc: "1 N leadout offset1 ... offsetN"} in MusicBrainz's toc form."""
+    out = {}
+    discs = {}
+    for _p, i in infos:
+        discs.setdefault(i.get("disc_eff", 1), []).append(i)
+    for d, tracks in discs.items():
+        if not tracks or len(tracks) > 99:
+            continue
+        if not all(i.get("lossless") and i.get("rate") == 44100 and i.get("samples")
+                   and i["samples"] % CD_FRAME == 0 for i in tracks):
+            continue
+        offsets, pos = [], 150
+        hidden = htoa_file(tracks)
+        if hidden is not None:
+            # a hidden track before track 1 (a file numbered 0): the first track's pregap
+            pos += hidden["samples"] // CD_FRAME
+            tracks = [i for i in tracks if i is not hidden]
+        for i in tracks:
+            offsets.append(pos)
+            pos += i["samples"] // CD_FRAME
+        out[d] = " ".join(str(x) for x in [1, len(tracks), pos] + offsets)
+    return out
+
+
+# --- match_albums.py:3424
+def merge_tocs(infos, *sources):
+    """One table of contents per disc: those of the rip logs and cue sheets (in the order
+    given, the first wins) where they fit a disc, the ones rebuilt from the tracks'
+    lengths for the other discs. A log or cue TOC goes to the disc with as many tracks
+    (logs and cue sheets do not say which disc they are; of discs with as many, the one
+    closest in length), else to a disc that has no TOC yet. One that fits no disc is left
+    out: that disc's own TOC stands."""
+    counts, sectors, per_disc = {}, {}, {}
+    for _p, i in infos:
+        d = i.get("disc_eff", 1)
+        counts[d] = counts.get(d, 0) + 1
+        per_disc.setdefault(d, []).append(i)
+        sectors[d] = sectors.get(d, 0) + (i.get("secs") or 0) * 75
+    out = dict(disc_tocs(infos))
+    taken = set()
+    for source in sources:
+        for toc in (source or {}).values():
+            same = [d for d, t in out.items() if t == toc]
+            if same:                                   # the log agrees with the disc's lengths
+                taken.update(same)
+                continue
+            n, leadout = (int(x) for x in toc.split()[1:3])
+            free = [d for d in sorted(counts) if d not in taken]
+            fits = [d for d in free if counts[d] == n]
+            disc = min(fits, key=lambda d: abs(sectors[d] + 150 - leadout)) if fits else None
+            if disc is None:
+                # a disc whose files fit their own tracks of it, the rest missing (the TOC
+                # rebuilt from those files is no disc's)
+                disc = next((d for d in free if toc_fits_slots(toc, per_disc[d])), None)
+            if disc is None:
+                # a disc with a hidden track before track 1 ripped to a file numbered 0: the
+                # TOC lists one track fewer (without_htoa)
+                disc = next((d for d in free if counts[d] == n + 1 and htoa_file(per_disc[d]) is not None
+                             and toc_fits_disc(toc, per_disc[d])), None)
+            if disc is None:
+                disc = next((d for d in free if d not in out), None)
+            if disc is not None:
+                out[disc] = toc
+                taken.add(disc)
+    return out
+
+
+# --- match_albums.py:3466
+def tocs_read(tocs, fit, logs, cues, rebuilt):
+    """TAG-3: {disc: TOC} of the discs whose TOC fits their files and was read from a rip log,
+    or from a cue sheet whose TOC is not the one the files' lengths give (read_album)."""
+    logs = set((logs or {}).values())
+    cues = set((cues or {}).values()) - set((rebuilt or {}).values())
+    return {d: tocs[d] for d in fit or () if tocs.get(d) and (tocs[d] in logs or tocs[d] in cues)}
 
 
 # --- match_albums.py:3476
@@ -508,6 +3428,110 @@ def accurip_confirms(album_dir, log):
     return hit
 
 
+# --- match_albums.py:3681
+def _toc_lengths(toc):
+    """Each track's length in sectors from a TOC string ("1 N leadout off1 ... offN")."""
+    nums = [int(x) for x in toc.split()]
+    n, leadout, offsets = nums[1], nums[2], nums[3:]
+    return [b - a for a, b in zip(offsets, offsets[1:] + [leadout])][:n]
+
+
+# --- match_albums.py:3688
+def toc_fits_audio(toc, tracks):
+    """Does a rip log's TOC fit these files (one disc, in order)? Each lossless 44.1 kHz
+    track must be the TOC's length within one sector (588 samples); any other file within
+    0.1 s. A one-file image is compared as a whole. A log that does not fit was made of
+    another rip or another pressing (Cynic - Traced in Air: a 2008 CD log beside the 2019
+    download), so its disc ID is not your files'."""
+    lengths = _toc_lengths(toc)
+    if not tracks or not lengths:
+        return False
+    if len(tracks) == 1 and len(lengths) > 1:
+        lengths = [sum(lengths)]
+    if len(tracks) != len(lengths):
+        return False
+    for i, sectors in zip(tracks, lengths):
+        if i.get("lossless") and i.get("rate") == 44100 and i.get("samples"):
+            if abs(i["samples"] / CD_FRAME - sectors) > 1:
+                return False
+        elif abs((i.get("secs") or 0) - sectors / 75) > 0.1:
+            return False
+    return True
+
+
+# --- match_albums.py:3710
+def toc_fits_slots(toc, tracks):
+    """A TOC with more tracks than these files (some are missing from the folder): does each
+    file fit the TOC's track of its own number, as toc_fits_audio compares lengths? Every
+    file needs a number of its own within the TOC."""
+    lengths = _toc_lengths(toc)
+    nums = [i.get("num") or 0 for i in tracks]
+    if (not tracks or len(tracks) >= len(lengths) or len(set(nums)) != len(nums)
+            or any(n < 1 or n > len(lengths) for n in nums)):
+        return False
+    for i, n in zip(tracks, nums):
+        sectors = lengths[n - 1]
+        if i.get("lossless") and i.get("rate") == 44100 and i.get("samples"):
+            if abs(i["samples"] / CD_FRAME - sectors) > 1:
+                return False
+        elif abs((i.get("secs") or 0) - sectors / 75) > 0.1:
+            return False
+    return True
+
+
+# --- match_albums.py:3729
+def htoa_file(tracks):
+    """The disc's hidden track before track 1 (HTOA: the first track's pregap, ripped to a
+    file of its own numbered 0), or None: the one file numbered 0, first on the disc, every
+    other file numbered from 1. (read_album puts a file numbered 0 by its tags or its name,
+    "00 - ...", first on its disc, and one without a number last: that is never one.)"""
+    zero = [i for i in tracks if not i.get("num")]
+    if (len(zero) != 1 or tracks[0] is not zero[0] or len(tracks) < 2
+            or any((i.get("num") or 0) < 1 for i in tracks[1:])):
+        return None
+    return zero[0]
+
+
+# --- match_albums.py:3741
+def without_htoa(toc, tracks):
+    """The disc's files without its hidden track before track 1 (htoa_file) when that file
+    fits in the TOC's first pregap (its length at most the first track's offset less the
+    150-sector lead-in): a TOC lists no track 0. Else the files as they are."""
+    first = htoa_file(tracks) if toc else None
+    if first is None:
+        return tracks
+    try:
+        pregap = (int(toc.split()[3]) - 150) / 75
+    except (IndexError, ValueError):
+        return tracks
+    if pregap <= 0 or (first.get("secs") or 0) > pregap + 0.1:
+        return tracks
+    return [i for i in tracks if i is not first]
+
+
+# --- match_albums.py:3757
+def htoa_toc_discs(infos, tocs):
+    """The discs whose hidden track before track 1 (htoa_file) is in the first pregap of one
+    of these TOCs (a rip log's, a CDTOC tag's) that fits the disc: the disc was read with that
+    pregap, so the track is the disc's own, not just a file as long as a release's pregap."""
+    discs = {}
+    for _p, i in infos:
+        discs.setdefault(i.get("disc_eff", 1), []).append(i)
+    return sorted(d for d, tracks in discs.items()
+                  if htoa_file(tracks) is not None
+                  and any(toc and len(without_htoa(toc, tracks)) < len(tracks) and toc_fits_disc(toc, tracks)
+                          for toc in tocs))
+
+
+# --- match_albums.py:3770
+def toc_fits_disc(toc, tracks):
+    """The TOC is this disc's: every track there (toc_fits_audio), or the files there fit
+    their own tracks of it (toc_fits_slots). A hidden track before track 1 ripped to a file
+    numbered 0 is left out when it fits the TOC's first pregap (without_htoa)."""
+    tracks = without_htoa(toc, tracks)
+    return toc_fits_audio(toc, tracks) or toc_fits_slots(toc, tracks)
+
+
 # --- match_albums.py:3778
 _CDTOC_TAG = re.compile(r"^\s*([0-9A-Fa-f]{1,2})((?:\+[0-9A-Fa-f]+)+)\s*$")
 
@@ -525,6 +3549,79 @@ def cdtoc_tag_toc(value):
     if not 1 <= n <= 99 or len(nums) != n + 1 or nums != sorted(nums):
         return ""
     return " ".join(str(x) for x in [1, n, nums[-1]] + nums[:-1])
+
+
+# --- match_albums.py:3795
+def tag_tocs(infos):
+    """The TOCs the files' CDTOC tags hold, one per disc, where it fits that disc's files."""
+    discs = {}
+    for _p, i in infos:
+        discs.setdefault(i.get("disc_eff", 1), []).append(i)
+    out = {}
+    for d, tracks in sorted(discs.items()):
+        tocs = {cdtoc_tag_toc(i.get("cdtoc")) for i in tracks} - {""}
+        if len(tocs) == 1 and toc_fits_disc(next(iter(tocs)), tracks):
+            out[len(out) + 1] = next(iter(tocs))
+    return out
+
+
+# --- match_albums.py:3808
+def cd_split(album_dir, infos):
+    """DSC-18: {file: (CD, track)} for albums filed as the original records they were (one folder
+    each: Buddy Rich - Seven Classic Albums [4CD], "Disc 1" .. "Disc 7" each an LP of its own) but
+    ripped from fewer CDs, whose rip logs say so: two or more logs with a table of contents, fewer
+    than the folders (three at least), each lying in a folder that holds a track of its CD, their
+    track counts adding up to the files - and, the files taken in the folders' order (each
+    folder's tracks by number), every CD's run of files fits its log's table of contents to the
+    sector (toc_fits_audio), at least one CD's run crossing from one folder into the next. None
+    otherwise (the folders are the discs, as before)."""
+    album_dir = Path(album_dir)
+    folders = sorted({p.parent for p, _i in infos if album_dir in p.parents},
+                     key=lambda d: _natural_key(d.relative_to(album_dir).as_posix()))
+    if len(folders) < 3 or len(folders) != len({p.parent for p, _i in infos}):
+        return None
+    logs, seen = [], set()
+    for log in rip_logs(album_dir):
+        if log["toc"] and log["toc"] not in seen:
+            seen.add(log["toc"])
+            logs.append(log)
+    if not 2 <= len(logs) < len(folders):
+        return None
+    counts = [len(_toc_lengths(log["toc"])) for log in logs]
+    if sum(counts) != len(infos):
+        return None
+    place = {d: k for k, d in enumerate(folders)}
+    seq = sorted(infos, key=lambda x: (place[x[0].parent], x[1].get("num") or 9999, _natural_key(x[0].name)))
+    out, at, crosses = {}, 0, False
+    for k, (log, n) in enumerate(zip(logs, counts), 1):
+        part = seq[at:at + n]
+        at += n
+        dirs = {p.parent for p, _i in part}
+        if Path(log["path"]).parent not in dirs | {album_dir}:
+            return None                                   # (a log away from its CD's tracks)
+        if not toc_fits_audio(log["toc"], [i for _p, i in part]):
+            return None
+        crosses = crosses or len(dirs) > 1
+        for j, (p, _i) in enumerate(part, 1):
+            out[p] = (k, j)
+    return out if crosses else None
+
+
+# --- match_albums.py:3849
+def fitting_logs(infos, logs):
+    """The logs whose TOC fits one disc of the files (or that have no TOC to check), and the
+    foreign ones: a TOC that fits no disc. A disc whose files fit their own tracks of the
+    TOC (the others missing from the folder) fits too."""
+    discs = {}
+    for _p, i in infos:
+        discs.setdefault(i.get("disc_eff", 1), []).append(i)
+    kept, foreign = [], []
+    for log in logs:
+        if not log["toc"] or any(toc_fits_disc(log["toc"], tracks) for tracks in discs.values()):
+            kept.append(log)
+        else:
+            foreign.append(log)
+    return kept, foreign
 
 
 # --- match_albums.py:4043
@@ -594,6 +3691,103 @@ def cue_tocs(album_dir, infos):
     return {i + 1: toc for i, toc in enumerate(out)}
 
 
+# --- match_albums.py:4318
+def cue_fits(cue, infos):
+    """Is this cue sheet of these files? True when every file it names is a file of the
+    folder (the rip's own cue, an image's), or its tracks' lengths (from its INDEX lines, and
+    the length of a file of the folder it names) fit one disc of the files, or it names some
+    of their files but gives no length to compare; False when it gives lengths and they fit no
+    disc (another edition's cue, a downloaded one); None when there is nothing to compare
+    (no audio read, or nothing of it known): unverifiable. A track's length is taken each
+    way a rip is split: the gap before the next track (INDEX 00) appended to it, left out,
+    or prepended to the next track (the track then starts at its own INDEX 00 too). A hidden
+    track before track 1 ripped to a file numbered 0 (htoa_file; the cue lists no track 0)
+    is left out of the comparison, and fits when it is as long as track 1's pregap (its
+    INDEX 01 less its INDEX 00)."""
+    try:
+        text = _read_log(cue)
+    except OSError:
+        return None
+    secs_by_name = {Path(p).name.casefold(): i.get("secs") for p, i in infos if p is not None}
+    files, current, pending_gap = [], None, None
+    for line in text.splitlines():
+        m = re.match(r'\s*FILE\s+"?(.+?)"?\s+(WAVE|FLAC|MP3|AIFF|BINARY)?\s*$', line, re.I)
+        if m:
+            current = {"name": m.group(1), "starts": [], "gaps": []}
+            files.append(current)
+            continue
+        m = re.match(r"\s*INDEX\s+(00|01)\s+(\d+):(\d+):(\d+)", line)
+        if m and current is not None:
+            at = int(m.group(2)) * 4500 + int(m.group(3)) * 75 + int(m.group(4))
+            if m.group(1) == "00":
+                pending_gap = (current, at)
+            else:
+                current["starts"].append(at)
+                current["gaps"].append(pending_gap[1] if pending_gap and pending_gap[0] is current else None)
+                pending_gap = None
+    if not files or not any(f["starts"] for f in files):
+        return None
+    if all(Path(f["name"]).name.casefold() in secs_by_name for f in files):
+        return True                 # it names the folder's own files (an image and its cue)
+    # [(lengths in seconds it may have)] per track, [] when unknown
+    lengths, named = [], False
+    for f in files:
+        file_secs = secs_by_name.get(Path(f["name"]).name.casefold())
+        named = named or file_secs is not None
+        for k, start in enumerate(f["starts"]):
+            own = f["gaps"][k]
+            if k + 1 < len(f["starts"]):
+                nxt = f["starts"][k + 1]
+                gap = f["gaps"][k + 1]
+                opts = {(nxt - start) / 75}
+                if gap is not None:
+                    opts.add((gap - start) / 75)
+                    if own is not None:
+                        opts.add((gap - own) / 75)            # gaps prepended
+                lengths.append(opts)
+            elif file_secs:
+                lengths.append({file_secs - start / 75} | ({file_secs - own / 75} if own is not None else set()))
+            else:
+                lengths.append(set())
+    # track 1's pregap in the cue (seconds), for a hidden track ripped to a file of its own
+    first = next((f for f in files if f["starts"]), None)
+    pregap = (first["starts"][0] - (first["gaps"][0] or 0)) / 75 if first else 0
+    if not any(lengths):
+        return True if named else None
+    discs = {}
+    for _p, i in infos:
+        if i.get("secs"):
+            discs.setdefault(i.get("disc_eff", 1), []).append(i)
+    if not discs:
+        return None
+
+    def near(secs, options):
+        return not options or any(abs(secs - o) <= 0.5 for o in options)
+    for tracks in discs.values():
+        hidden = htoa_file(tracks)
+        if hidden is not None and len(tracks) == len(lengths) + 1:
+            if pregap <= 0 or abs(hidden["secs"] - pregap) > 0.5:
+                continue
+            tracks = [i for i in tracks if i is not hidden]
+        if len(tracks) == len(lengths):
+            if all(near(i["secs"], opt) for i, opt in zip(tracks, lengths)):
+                return True
+        elif len(tracks) < len(lengths):
+            nums = [i.get("num") or 0 for i in tracks]
+            if (len(set(nums)) == len(nums) and all(1 <= n <= len(lengths) for n in nums)
+                    and all(near(i["secs"], lengths[n - 1]) for i, n in zip(tracks, nums))):
+                return True
+    return False
+
+
+# --- match_albums.py:4406
+def foreign_cues(album_dir, infos):
+    """The names of the cue sheets in the folder that fit no disc of the files (cue_fits
+    False): another edition's or a downloaded cue, whose CATALOG is no print of this copy."""
+    return sorted({cue.name for cue in Path(album_dir).rglob("*.cue")
+                   if not cue.name.startswith(".") and cue_fits(cue, infos) is False})
+
+
 # --- match_albums.py:5290
 _MB_DISCOGS_RE = re.compile(r"discogs\.com/(?:[a-zA-Z-]+/)?release/(\d+)", re.I)
 
@@ -623,6 +3817,22 @@ def _genre_names(genres):
         if name and name.casefold() not in {x.casefold() for x in out}:
             out.append(name)
     return out
+
+
+# --- match_albums.py:5559
+def _folder_title_of(album_folder, title, artist="") -> str:
+    """QRY-5: the album title the folder's name gives ("1999 - Hits 1999 [FLAC]" -> "Hits 1999"),
+    "" when it is the title already, names a disc or is too short to search."""
+    name = re.sub(r"[\(\[\{]\s*(?:19|20)\d\d\s*[\)\]\}]", " ", str(album_folder or ""))   # ("[1979] The Wall")
+    parts = [x.strip() for x in re.split(r"\s+[-\u2013]\s+", name) if x.strip()]
+    parts = [x for x in parts if not re.fullmatch(r"(?:19|20)\d\d", x)]                  # ("Artist - 1979 - Album")
+    if len(parts) >= 2 and artist and mc.artist_sim(parts[0], artist) >= 0.85:
+        parts = parts[1:]                                                                # ("Pink Floyd - The Wall")
+    ft = mc.search_title(" - ".join(parts)).strip()
+    ft = re.sub(r"(?i)[\s,\-]*\b(?:cd|disc|disk)\s*\d{1,2}\s*$", "", ft).strip()           # ("The Wall CD1")
+    if len(re.sub(r"\W", "", ft)) < 3 or re.fullmatch(r"(?i)(?:cd|disc|disk|dvd|side)\s*\w{0,3}|\d+", ft):
+        return ""
+    return "" if mc.title_sim(ft, title or "") >= 0.85 else ft
 
 
 # --- match_albums.py:5846
@@ -1236,3 +4446,687 @@ def packaging_evidence(album_dir):
                 elif re.search(r"(?<![a-z])(?:inlay|tray)(?![a-z])", p.stem.casefold()):
                     jewel_parts = True
     return out or ({"jewel"} if jewel_parts else set())
+
+
+# --- engine.py:65
+DISC_DIR = re.compile(r"^(?:cd|disc|disk|dvd|side)\s*[-_.]?\s*(?:\d+|one|two|three|four|five|six|seven|eight|"
+                      r"nine|ten|[a-h])\b|^\d{1,2}$", re.I)
+
+
+# --- engine.py:67
+_NUMBER_ONLY = re.compile(r"^\d{1,2}$")
+
+
+# --- engine.py:70
+_DISC_WORD = r"(?:\d+|one|two|three|four|five|six|seven|eight|nine|ten)"
+
+
+# --- engine.py:73
+# "(Disc 1)", "[CD 2 of 3]", "(Disc One)", "(Disc 2: Live)" anywhere in the title, and an
+# unbracketed "- Disc 2" / "CD1" at its end
+_DISC_SUFFIX = re.compile(r"\s*[\(\[\{]\s*(?:disc|disk|cd|dvd)\s*" + _DISC_WORD +
+                          r"(?:\s*(?:of|/)\s*\d+)?(?:\s*[:\-\u2013]\s*[^\)\]\}]*)?\s*[\)\]\}]"
+                          r"|\s*(?:[-:,\u2013]\s*)?\b(?:disc|disk|cd|dvd)\s*" + _DISC_WORD +
+                          r"(?:\s*(?:of|/)\s*\d+)?\s*$", re.I)
+
+
+# --- engine.py:80
+# DSC-15b: an unbracketed marker followed by the disc's own subtitle ("The Minimalists CD1:
+# Steve Reich, Kyle Gann, Louis Andriessen"), taken off only where a title of its own is left
+# before it (not "Mix CD 1: Pete Tong" beside "Mix CD 1: Sasha", nor "The CD 2: x")
+_DISC_SUBTITLE = re.compile(r"(?<=\S)\s+(?:[-,\u2013]\s*)?\b(?:disc|disk|cd|dvd)\s*" + _DISC_WORD +
+                            r"(?:\s*(?:of|/)\s*\d+)?\s*(?::|\s[-\u2013])\s*\S.*$", re.I)
+
+
+# --- engine.py:84
+def _off_disc_subtitle(title: str) -> str:
+    head = _DISC_SUBTITLE.sub("", title).strip()
+    words = [w for w in re.findall(r"\w+", head) if w not in ("the", "a", "an")]
+    return head if head != title.strip() and len("".join(words)) >= 4 else title
+
+
+# --- engine.py:90
+def _first(meta, k):
+    return ((meta.get(k) or [""])[0] or "").strip()
+
+
+# --- engine.py:96
+# DSC-15: a disc marker in brackets followed by that disc's own span of years ("My Lives (Disc 3)
+# 1989-1999" beside "My Lives [Disc 1]"): the years are the disc's subtitle, not the album's
+_DISC_YEARS = re.compile(r"\s*[\(\[\{]\s*(?:disc|disk|cd)\s*" + _DISC_WORD + r"\s*[\)\]\}]\s*[-:\u2013]?\s*"
+                         r"(?:19|20)\d\d(?:\s*[-\u2013/]\s*(?:(?:19|20)\d\d|\d\d))?\s*$", re.I)
+
+
+# --- engine.py:100
+def _album_title(meta, years=True) -> str:
+    """The album title a file is grouped by: without its disc marker (DSC-15: "(Disc 1)", "[Disk
+    4]", "- CD2", and with years=True "(Disc 3) 1989-1999" with the disc's own years)."""
+    album = _first(meta, "album").casefold()
+    if years:
+        album_y = _DISC_YEARS.sub("", album)
+    else:
+        album_y = album
+    return re.sub(r"\s+", " ", _DISC_SUFFIX.sub("", _off_disc_subtitle(album_y))).strip() or album
+
+
+# --- engine.py:111
+_DISC_MARK_NUMBER = re.compile(r"\b(?:disc|disk|cd)\s*(\d+)", re.I)
+
+
+# --- engine.py:114
+def _years_apart(fs, metas) -> dict:
+    """DSC-15: {file: its title with the disc's years kept} for files whose titles are one only
+    without those years, when that would join two discs of one number ("Hits (CD 2) 1999" and
+    "Hits (CD 2) 2001": two albums); {} when the disc numbers all differ (one album's discs)."""
+    bases = {f: _album_title(metas[f], years=False) for f in fs}
+    if len(set(bases.values())) < 2:
+        return {}
+    marks = {}
+    for f, b in bases.items():
+        m = _DISC_MARK_NUMBER.search(_first(metas[f], "album"))
+        marks.setdefault(b, set()).add(m[1].lstrip("0") if m else "")
+    seen = set()
+    for nums in marks.values():
+        if nums & seen or "" in nums:
+            return bases
+        seen |= nums
+    return {}
+
+
+# --- engine.py:133
+def _one_compilation(files, metas, title, folder) -> bool:
+    """Tracks sharing an album title, by several artists, with no album artist: one
+    compilation (a freedb/EAC rip of a Various Artists CD) when they say so, when their
+    folder is named after the album, or when their track numbers are a set of one album's."""
+    if any(_first(metas[f], "compilation").lower() in ("1", "true", "yes") for f in files):
+        return True
+    fold = lambda s: re.sub(r"[\W_]+", " ", s.casefold()).strip()  # noqa: E731
+    t = fold(title)
+    named = re.compile(r"(?:^| )" + re.escape(t) + r"(?: |$)") if t else None
+    if named and any(named.search(fold(d.name)) for d in {folder, *{f.parent for f in files}}):
+        return True                            # "1999 - Hits 1999"; not "Demos" for "Demo"
+    nums, totals = [], set()
+    for f in files:
+        n, _, tot = _first(metas[f], "tracknumber").partition("/")
+        if not n.strip().isdigit():
+            return False
+        nums.append((_first(metas[f], "discnumber").partition("/")[0].strip(), int(n)))
+        totals.add(tot.strip() or _first(metas[f], "totaltracks") or _first(metas[f], "tracktotal"))
+    return len(set(nums)) == len(nums) and len(totals) == 1 and "" not in totals
+
+
+# --- engine.py:154
+def album_keys(files, folder, metas=None) -> dict:
+    """{file: which album it belongs to} for the audio files of one folder (with its disc
+    folders): exclusions.album_key, with the disc left out of the title ("Album (Disc 1)"
+    and "Album (Disc Two)" are one album). Within one title, tracks without an album artist
+    join the album artist the others have; with no album artist at all, tracks by different
+    artists are one compilation only when they look like one (_one_compilation) - otherwise
+    "Greatest Hits" by Queen and by ABBA stay two albums."""
+    metas = {f: (metas or {}).get(f) or read_meta(f) for f in files}
+    out, by_title = {}, {}
+    for f in files:
+        k = album_key(metas[f])
+        if k[0] != "tags":
+            out[f] = k
+        else:
+            by_title.setdefault(_album_title(metas[f]), []).append(f)
+    for title0, fs0 in list(by_title.items()):
+        apart = _years_apart(fs0, metas)                 # DSC-15
+        if apart:
+            del by_title[title0]
+            for f in fs0:
+                by_title.setdefault(apart[f], []).append(f)
+    for title, fs in by_title.items():
+        aa = {f: _first(metas[f], "albumartist").casefold() for f in fs}
+        ar = {f: _first(metas[f], "artist").casefold() for f in fs}
+        aas = {v for v in aa.values() if v}
+        if aas:
+            for f in fs:
+                who = aa[f] or (next(iter(aas)) if len(aas) == 1 else ar[f])
+                out[f] = ("tags", who, title)
+            continue
+        artists = set(ar.values())
+        if len(artists) > 1 and not _one_compilation(fs, metas, title, Path(folder)):
+            for f in fs:
+                out[f] = ("tags", ar[f], title)
+        else:
+            who = next(iter(artists)) if len(artists) == 1 else ""
+            for f in fs:
+                out[f] = ("tags", who, title)
+    return out
+
+
+# --- engine.py:195
+def is_disc_dir(d: Path) -> bool:
+    """A disc folder ("CD1", "Disc 2", "Disc One", "Side A"). A folder named only by a
+    number counts when its siblings are numbered 1, 2, ... too: "Adele/19" and "Adele/21"
+    are albums, "Box/1" and "Box/2" are discs."""
+    if not DISC_DIR.match(d.name) or mc.parse_version(d.name):
+        return False                      # ("DVD 2.0", "DVD 5.1": a version's folder, not "DVD 2")
+    if not _NUMBER_ONLY.match(d.name):
+        return True
+    try:
+        nums = sorted(int(x.name) for x in d.parent.iterdir() if x.is_dir() and _NUMBER_ONLY.match(x.name))
+    except OSError:
+        return False
+    return len(nums) >= 2 and nums[0] == 1 and nums == list(range(1, len(nums) + 1))
+
+
+# --- engine.py:333
+# DSC-3: a disc folder holding two discs of a set ("CD02-03 1973 Out-Takes") and its
+# parts ("Part 1", "Part 2"): the range's discs in order
+# (written tight, "CD02-03" / "CD2-3": never "CD1 - 12 Inch Mixes" - no spaces around its
+# dash, no "12 inch", at most ten discs: box_part_disc)
+_DISC_RANGE = re.compile(r"^(?:cd|disc|disk)\s*[-_.]?\s*(?P<a>\d{1,2})[-–](?P<b>\d{1,2})(?!\d)"
+                         r"(?!\s*(?:inch|in\b|\"|''|'))", re.I)
+
+
+# --- engine.py:335
+_PART_DIR = re.compile(r"^(?:part|pt\.?)\s*[-_.]?\s*(?P<n>\d{1,2})$", re.I)
+
+
+# --- engine.py:338
+def box_part_disc(d: Path):
+    """DSC-3: the set's disc number a part folder of a disc-range folder holds ("CD02-03 .../
+    Part 2" -> 3), else None: the range counts up (b > a) and the part lies within it."""
+    d = Path(d)
+    m, r = _PART_DIR.match(d.name), _DISC_RANGE.match(d.parent.name)
+    if not m or not r:
+        return None
+    a, b, n = int(r["a"]), int(r["b"]), int(m["n"])
+    if not (1 <= a < b <= a + 9 and 1 <= n <= b - a + 1):
+        return None
+    return a + n - 1
+
+
+# --- engine.py:396
+# DSC-5: the CD count a box set's folder names ("Complete Box 13CD+DVD", "(2011, 7CD+DVD, Sony,
+# ...)", "[16 CD]", "4xSACD"): a number written right before "CD" - never a catalogue number's
+# digits ("88697763332-4"), never the disc word of a disc folder ("CD4-5")
+_BOX_CD_COUNT = re.compile(r"(?<![\w.\-])(\d{1,3})\s*[x×]?\s*(?:shm-?|blu-?spec\s*|hq|uhq|sa)?cds?(?![a-z0-9])",
+                           re.I)
+
+
+# --- engine.py:400
+def box_cd_count(name) -> int:
+    """DSC-5: the number of CDs a folder's name says it holds ("13CD+DVD" -> 13), when it names
+    one count only and at least two CDs; else 0."""
+    counts = {int(m[1]) for m in _BOX_CD_COUNT.finditer(str(name or ""))}
+    return counts.pop() if len(counts) == 1 and min(counts) >= 2 else 0
+
+
+# --- engine.py:407
+def _disc_tag(meta) -> tuple:
+    """(disc number, disc total) a file's tags give, as text without leading zeros ("" for none):
+    "4/7" and "04" with a total tag of "7" are both ("4", "7")."""
+    num, _s, total = _first(meta, "discnumber").partition("/")
+    total = total.strip() or _first(meta, "totaldiscs") or _first(meta, "disctotal")
+    return num.strip().lstrip("0"), total.strip().lstrip("0")
+
+
+# --- engine.py:415
+def numbered_box(box: Path, found: dict, metas: dict) -> bool:
+    """DSC-5 (BOX-1): a box set's folder whose discs sit in folders of its own named as albums
+    ("01. (1980) - Kenso (2012) - KIZC 168"; "CD3. 1992. Amused to Death (88697763332-3)"),
+    some holding two discs in disc folders ("CD4-5. 2005. Ca Ira (2CD, ...)/CD1" and "/CD2"), is
+    one album - the box - when every sign of it agrees: the folder's name gives its CD count N
+    (box_cd_count) and it has no tracks of its own; each of its audio folders is a sub-folder
+    of it, or a disc folder of one (a sub-folder holding disc folders has no tracks beside
+    them); each such folder's files are tagged as one album with one disc number, by one album
+    artist all through; the disc numbers are 1 .. N, each once, rising in the folders' order;
+    and no file's disc total says fewer than N discs (a "1 of 1" standalone album). An artist's
+    folder or a "Compilations" folder of albums each tagged disc 1, a box whose discs' tags
+    leave a gap or count otherwise, two artists' albums - stay apart as before."""
+    got = _box_discs(box, found, metas)
+    return bool(got) and got[1] == list(range(1, got[0] + 1))
+
+
+# --- engine.py:431
+def cd_split_box(box: Path, found: dict) -> bool:
+    """DSC-18: a folder whose name gives its CD count M ("Seven Classic Albums [4CD]") holding
+    its albums in folders of its own (more than M, none deeper, no tracks of its own) and M rip
+    logs whose tables of contents the files, in the folders' order, fit run by run
+    (match_albums.cd_split): one album - the M-CD release - never each folder an album of its own
+    matched to the original record it was."""
+    n = box_cd_count(box.name)
+    if n < 2 or box in found:
+        return False
+    dirs = [d for d in found if box in d.parents]
+    if len(dirs) <= n or any(d.parent != box for d in dirs):
+        return False
+    try:
+        tocs = {log["toc"] for log in rip_logs(box) if log["toc"]}
+        if len(tocs) != n:
+            return False
+        files = [f for d in dirs for f in found[d]]
+        return bool(cd_split(box, [(Path(f), read_file(Path(f))) for f in files]))
+    except Exception:                                  # (a file that cannot be read: no set)
+        return False
+
+
+# --- engine.py:455
+# DSC-13: the words a box set's folder names itself by ("Box Set", "BoxSet", "Box", "The Complete
+# Albums Collection", "Complete Studio Recordings"); a CD count (box_cd_count) says it too
+_BOX_WORDS = re.compile(r"\bbox[\s_-]*set\b(?!s)|\bboxset\b(?!s)|\bbox\b(?=\s*(?:$|[-\u2013(\[{,]|\d))", re.I)
+
+
+# --- engine.py:457
+# ("Complete ... Collection" only as the folder's own title, never "My Complete X Collection")
+_COMPLETE_TITLE = re.compile(r"^(?:the\s+)?complete\b(?:\s+\w+){0,3}?\s+collection\b|"
+                             r"^(?:the\s+)?complete\s+(?:albums|studio\s+(?:albums|recordings))\b", re.I)
+
+
+# --- engine.py:461
+def says_box(name) -> bool:
+    """DSC-13: a folder's name says it is a box: "Box Set", "BoxSet", "Box" ending a part of the
+    name ("THRAK BOX - Live ...", "The Classical Chillout Box - 2003" - never "Out of the Box
+    Sessions", "Box Sets"), or its own title is "The Complete ... Collection", "Complete Albums",
+    "Complete Studio Recordings"."""
+    name = str(name or "")
+    if _BOX_WORDS.search(name):
+        return True
+    bare = re.sub(r"^\s*(?:19|20)\d\d\s*[-.\u2013]\s*", "", name)
+    return any(_COMPLETE_TITLE.match(part.strip()) for part in bare.split(" - "))
+
+
+# --- engine.py:471
+_COMPILATION_WORD = re.compile(r"\bcompilations?\b|^\s*(?:va|v\.a\.|various(?:\s+artists)?)\s*[-–]", re.I)
+
+
+# --- engine.py:472
+_VARIOUS = ("various artists", "various", "va", "")
+
+
+# --- engine.py:477
+# DSC-13: what a set's name says beside its title - box words, a CD count, years ("The Set Box Set
+# 3CD 2011" -> "The Set")
+_BOX_COUNT_YEARS = re.compile(r"\bbox[\s_-]*sets?\b|\bboxset\b|\bbox\b|" + _BOX_CD_COUNT.pattern +
+                              r"|(?<!\d)(?:19|20)\d\d(?!\d)", re.I)
+
+
+# --- engine.py:486
+def said_set_dirs(box: Path, found: dict, metas: dict) -> list:
+    """DSC-13: a folder whose name says it is a set - a CD count ("14 CD", even one fewer than its
+    disc folders: the box's own bonus disc) or box words ("Box Set", "BoxSet", "Complete Albums
+    Collection") - is one album, its discs, whatever album each disc is tagged as, when every sign
+    agrees: it has no tracks of its own; each of its audio folders is a folder of it (none deeper)
+    whose name begins with a disc word or a number ("CD01 Cold Spring Harbor", "01. Title", "Disc
+    3 - Title"), numbered 1 to N, each once, N two or more (the CD count N or N - 1); each holds one
+    album by its tags (or, folders side by side, one album of their own discs numbered 1 to k of k);
+    all by one album artist, or each naming the artist the folder is named after
+    ("John Mayer Trio" in "John Mayer - John Mayer (BoxSet, 5CD)") - Various Artists only where the
+    name says box or compilation; no disc tag against its folder's number; and no disc is tagged
+    "1 of 1" with a release ID or barcode (a standalone release's own). An artist's folder of
+    numbered albums ("Billy Joel - Discography/01. Cold Spring Harbor") stays apart unless its disc
+    folders carry a disc word or its name a CD count; a series' volumes in a folder that does not
+    say it is a set stay as DSC-7 has them."""
+    name = box.name
+    count = box_cd_count(name)
+    words = says_box(name)
+    if not (count or words) or box in found:
+        return []                                    # (the name first: most folders say no set)
+    dirs = [d for d in found if box in d.parents]
+    if len(dirs) < 2 or any(d.parent != box or mc.version_layout(d.name) for d in dirs):
+        return []                                    # (audio deeper down: no one level of discs)
+    numbers = {}
+    for d in dirs:
+        m = _LEAD_NUMBER.match(d.name)
+        if not m:
+            return []
+        numbers[d] = int(m[1])
+    n = len(dirs)
+    disc_words = all(is_disc_dir(d) for d in dirs)
+    if sorted(numbers.values()) != list(range(1, n + 1)) or (count and n not in (count, count + 1)):
+        return []
+    if count and n == count + 1 and not disc_words:
+        # (a box and a stray album numbered on - "CD1" .. "CD3" and "04 - Single" in "(3CD)": the
+        # disc-worded folders, as many as the count, numbered 1 to N, are the box; the stray one
+        # stays the album it is)
+        worded = [d for d in dirs if is_disc_dir(d)]
+        if len(worded) == count and sorted(numbers[d] for d in worded) == list(range(1, count + 1)):
+            return said_set_dirs(box, {d: fs for d, fs in found.items() if d not in dirs or d in worded}, metas)
+        return []
+    files = [f for d in dirs for f in found[d]]
+    keys = album_keys(files, box, metas)
+    if any(k[0] != "tags" for k in keys.values()):
+        return []                                    # (an untagged disc)
+    # (an album of two discs or more within the set, in folders side by side - "cd7 - Live (I)" and
+    # "cd8 - Live (II)" both tagged as "CD 7&8 - Live (I & II)", discs 1/2 and 2/2: its own numbering)
+    runs = {}
+    for d in sorted(dirs, key=lambda x: numbers[x]):
+        runs.setdefault(next(iter({keys[f] for f in found[d]})), []).append(d)
+    inner = {}
+    for run in runs.values():
+        if len(run) > 1 and [numbers[d] for d in run] == list(range(numbers[run[0]], numbers[run[0]] + len(run))):
+            for i, d in enumerate(run, 1):
+                inner[d] = (str(i), str(len(run)))
+    for d in dirs:
+        if len({keys[f] for f in found[d]}) != 1:
+            return []                                # (a folder of two albums)
+        for f in found[d]:
+            meta = metas.get(f) or {}
+            num, total = _disc_tag(meta)
+            if num not in ("", "1", str(numbers[d])) and (num, total) != inner.get(d):
+                return []                            # (a disc tag against the folder's number)
+            if num == "1" and total == "1" and (
+                    _first(meta, "musicbrainz_albumid") or _first(meta, "barcode")):
+                return []                            # (a standalone release's own disc 1 of 1)
+    artists = {k[1] for k in keys.values()}
+    if artists & set(_VARIOUS):
+        if not (artists <= set(_VARIOUS) and (words or _COMPILATION_WORD.search(name))):
+            return []
+    elif len(artists) > 1:
+        who = _title_fold(_folder_artist(name))
+        if not who or not all(re.search(rf"(?<!\w){re.escape(who)}(?!\w)", _title_fold(a)) for a in artists):
+            return []                                # (two artists' albums)
+    if len(artists) == 1 and not artists & set(_VARIOUS) and _artist_folder(box, next(iter(artists))) \
+            and not disc_words:
+        return []                                    # (an artist's folder of numbered albums, a count or not)
+    if not disc_words and not words:
+        # (folders "01 - Alpha", "02 - Beta" each tagged as an album of its own, none naming the
+        # set, in a folder that gives only a count: albums numbered in a folder, never one box's
+        # discs - "Box Set" in the name says otherwise)
+        titles = {k[2] for k in keys.values()}
+        own = _bare_name(name.split(" - ", 1)[1] if " - " in name else name)
+        own = _title_fold(_BOX_COUNT_YEARS.sub(" ", own))
+        named = own and any(own in _title_fold(t) or own in _title_fold(d.name) for t in titles for d in dirs)
+        if len(titles) == n and not named:
+            return []
+    return sorted(dirs)
+
+
+# --- engine.py:576
+def noted_set_dirs(box: Path, found: dict, metas: dict) -> list:
+    """DSC-20: a folder whose name says it is a set (says_box's words or a CD count) and whose own
+    notes list its parts is one album - the set - whatever each part is tagged as, when every sign
+    agrees: it has no tracks of its own and is no artist's folder by DSC-10's words; a notes file
+    at its root names every audio folder below it, each once (match_albums.noted_set_discs: the
+    folders at its root, or one level deeper beneath a folder of no audio, "Bonus/"; none a version
+    folder); and every file's artist or album artist names the artist the folder is named after
+    ("Warsaw" credited with album artist "Joy Division"; "Various Artists" as album artist beside
+    the artist "Joy Division") - or, for fewer than half the parts, a credit the part's own folder
+    names ("01 - The Warsaw demo session", by "Warsaw" alone). The set's audio folders, sorted;
+    [] otherwise."""
+    if box in found or not (says_box(box.name) or box_cd_count(box.name)):
+        return []                                    # (the name first: most folders say no set)
+    who = _folder_artist(box.name)
+    if not who or _artist_folder(box, who) or _title_fold(who) in _VARIOUS or _COMPILATION_WORD.search(box.name):
+        return []                                    # (no artist named; an artist's folder; Various Artists)
+    dirs = [d for d in found if box in d.parents]
+    if not noted_set_discs(box, dirs):
+        return []                                    # (no notes naming every part; bare "CD1", "Disc 2")
+    for d in dirs:
+        for f in found[d]:
+            meta = metas.get(f) or {}
+            if _disc_tag(meta) == ("1", "1") and any(_first(meta, k) for k in ("musicbrainz_albumid", "barcode",
+                                                                                  "discogs_release_id")):
+                return []                            # (a standalone release's own disc 1 of 1, as DSC-13)
+    def names(name, text):
+        name = _title_fold(name)
+        return bool(name) and re.search(rf"(?<!\w){re.escape(name)}(?!\w)", _title_fold(text)) is not None
+    credited = 0
+    for d in dirs:
+        metas_d = [metas.get(f) or {} for f in found[d]]
+        if all(any(names(who, v) for k in ("artist", "albumartist") for v in m.get(k) or ()) for m in metas_d):
+            continue
+        # (a part credited to another name that its own folder - as the notes list it - names: Joy
+        # Division's "01 - The Warsaw demo session (1977-07-18)", its files by "Warsaw", the band's
+        # first name, no album artist. Fewer than half the parts; any other credit keeps it apart)
+        own = {v for m in metas_d for k in ("artist", "albumartist") for v in m.get(k) or () if v.strip()}
+        if not own or not all(any(names(v, d.name) for k in ("artist", "albumartist") for v in m.get(k) or ())
+                              for m in metas_d) or not all(names(v, d.name) or names(who, v) for v in own):
+            return []                                # (a part by another artist, or untagged)
+        credited += 1
+    if credited * 2 >= len(dirs):
+        return []
+    return sorted(dirs)
+
+
+# --- engine.py:622
+def noted_set(box: Path, found: dict, metas: dict) -> list:
+    """DSC-20: the parts of a set its own notes list (noted_set_dirs) that no earlier rule takes as
+    its shape - DSC-5's numbered box, DSC-13's said set, DSC-9's volumes, DSC-18's CD split, a
+    titled box: those are what they were. The one test the grouping, the planning and
+    match_albums.read_album share; [] otherwise."""
+    got = noted_set_dirs(box, found, metas)
+    if not got or titled_box(box, found, metas) or volume_set(box, found, metas) or \
+            said_set_dirs(box, found, metas) or numbered_box(box, found, metas) or cd_split_box(box, found):
+        return []
+    return got
+
+
+# --- engine.py:634
+def noted_set_order(box, files) -> dict:
+    """DSC-20: {part folder: disc number} when FILES (all the audio of BOX) are a set its own notes
+    list (noted_set), in the notes' order; {} otherwise. The cheap tests first: the name, the notes."""
+    box = Path(box)
+    if not (says_box(box.name) or box_cd_count(box.name)):
+        return {}
+    found = {}
+    for f in files:
+        found.setdefault(Path(f).parent, []).append(Path(f))
+    order = noted_set_discs(box, list(found))
+    if not order:
+        return {}
+    metas = {f: read_meta(f) for fs in found.values() for f in fs}
+    return order if noted_set(box, found, metas) else {}
+
+
+# --- engine.py:650
+def _folder_artist(name) -> str:
+    """DSC-13: the artist a box's folder is named after - the part before " - ", a year in front
+    aside ("2013 - John Mayer - John Mayer (BoxSet, ...)" -> "John Mayer"); "" for none."""
+    name = re.sub(r"^\s*(?:19|20)\d\d\s*[-.–]\s*", "", str(name or ""))
+    head, sep, _rest = name.partition(" - ")
+    return head.strip() if sep else ""
+
+
+# --- engine.py:660
+# DSC-6: the words a twofer's folder joins its albums' titles with ("The Stranger & An Innocent
+# Man", "Album One / Album Two", "One + Two", "One and Two")
+_TITLE_JOIN = re.compile(r"\s+(?:&|\+|/|and|und|et|y)\s+|\s*/\s*", re.I)
+
+
+# --- engine.py:662
+# a year or bracketed part around the title in a folder's name: "1992 - ", " (2CD)", " [Columbia]"
+_NAME_EXTRAS = re.compile(r"^\s*(?:19|20)\d\d\s*[-.–]\s*|\s*[\(\[\{][^\)\]\}]*[\)\]\}]")
+
+
+# --- engine.py:665
+def _title_fold(text) -> str:
+    return re.sub(r"[\W_]+", " ", str(text or "").casefold()).strip()
+
+
+# --- engine.py:836
+# DSC-10: what an artist's folder may say besides the artist's name ("Band - Discography [FLAC]")
+_ARTIST_FOLDER_WORDS = {"discography", "albums", "album", "collection", "studio", "complete", "works",
+                        "the", "flac", "mp3", "lossless", "cd", "cds", "music", "and", "other", "others",
+                        "live", "singles", "eps", "ep", "compilations", "box", "sets", "rips",
+                        # (and in other languages, and a discography's other names)
+                        "discografia", "discografie", "diskografie", "diskografia", "discographie",
+                        "diskografi", "discographies", "remasters", "remastered", "anthology", "full",
+                        "collections"}
+
+
+# --- engine.py:845
+def _artist_folder(folder: Path, artist: str) -> bool:
+    """DSC-10: FOLDER is named as ARTIST's folder ("Billy Joel", "Billy Joel - Discography
+    [FLAC]"): what it holds are the artist's albums, never one set's discs."""
+    def fold(t):                                        # ("The Beatles" and "Beatles", "Motörhead" and "Motorhead")
+        t = _title_fold(unicodedata.normalize("NFKD", str(t or "")).encode("ascii", "ignore").decode())
+        return t[4:] if t.startswith("the ") else t
+    name = fold(re.sub(r"[\(\[\{][^\)\]\}]*[\)\]\}]", " ", folder.name))
+    who = fold(artist)
+    if not who or not name.startswith(who):
+        return False
+    rest = [w for w in name[len(who):].split() if not re.fullmatch(r"(?:19|20)\d\d", w)]
+    return all(w in _ARTIST_FOLDER_WORDS for w in rest)
+
+
+# --- engine.py:1171
+def _bare_name(name) -> str:
+    """A folder name or title without its year in front and its brackets ("1992 - Title (2CD)
+    [Label]" -> "Title")."""
+    name = str(name or "")
+    while True:
+        cut = _NAME_EXTRAS.sub("", name, count=1)
+        if cut == name:
+            return name
+        name = cut
+
+
+# --- engine.py:1182
+def titled_box(box: Path, found: dict, metas: dict) -> bool:
+    """DSC-6: a folder holding two or more albums' folders that it is named after, joined ("1992 -
+    The Stranger & An Innocent Man" holding "1977 - The Stranger" and "1983 - An Innocent Man"),
+    is one album - the set they were issued in (a twofer, a "2 albums on 2 CDs" box) - when every
+    sign agrees: the folder has no tracks of its own; each of its audio folders is a sub-folder
+    of it; each holds one album by its tags, all by one album artist, each a different title;
+    and its name, its year and brackets aside, is exactly those titles joined by "&", "+", "/" or
+    "and" (each once, in any order). Its discs are numbered as the release found lists them (the
+    folders' order is no disc order: the discs of a twofer may be packed the other way round).
+    An artist's folder ("Billy Joel") or a folder named otherwise stays apart, as before."""
+    if box in found or not _TITLE_JOIN.search(_bare_name(box.name)):
+        return False                                    # (the name first: no titles joined, no twofer)
+    dirs = [d for d in found if box in d.parents]
+    if len(dirs) < 2 or any(d.parent != box for d in dirs):
+        return False
+    files = [f for d in dirs for f in found[d]]
+    keys = album_keys(files, box, metas)
+    if any(k[0] != "tags" or not k[1] for k in keys.values()) or len({k[1] for k in keys.values()}) != 1:
+        return False                                    # (untagged, or two artists' albums)
+    titles = []
+    for d in dirs:
+        own = {keys[f] for f in found[d]}
+        if len(own) != 1:
+            return False                                # (a folder of two albums)
+        # (an edition in brackets aside: "Streetlife Serenade [1986 Reissue]", as a tagger named it)
+        titles.append(_title_fold(_bare_name(next(iter(own))[2])))
+    if len(set(titles)) != len(titles) or not all(titles):
+        return False
+    parts = [_title_fold(p) for p in _TITLE_JOIN.split(_bare_name(box.name)) if _title_fold(p)]
+    return sorted(parts) == sorted(titles)
+
+
+# --- engine.py:1217
+_names_volumes = names_volumes
+
+
+# --- engine.py:1221
+# DSC-9: a catalogue number that names none ("none", Discogs's for a release without one)
+_NO_CODE = {"", "none", "n/a", "na", "nocat", "-", "0", "unknown"}
+
+
+# --- engine.py:1224
+def volume_set(box: Path, found: dict, metas: dict) -> bool:
+    """DSC-9: a folder holding a set's volumes in folders of their own ("Volume 1", "Volume 2"),
+    each tagged as an album of its own ("Greatest Hits MFSL I", "... II"), is one album - the
+    set - when every sign agrees: its name says it holds k volumes ("Volume I & II", "Vol. 1-2",
+    "2 Hybrid SACD", "2CD": every count or range in it saying k); it has no tracks of its own;
+    each of its audio folders is a sub-folder of it named as a volume, numbered 1 to k, each
+    once; each holds one album by its tags with one disc tag, all by one album artist; the
+    volumes are not shown to be separate releases (a series pack "Vol. 1-2" of two releases:
+    their barcodes or catalogue numbers differ, or their years do, with no code shared); and
+    their disc tags, where they are one numbering of a set (every volume tagged, one total),
+    number them as the volumes (that total k or none) - or say disc 1 on every volume, each
+    numbered from track 1. Disc tags that are no one numbering (half tagged, totals differing:
+    "1/2" beside "3/4") say nothing; the volume number is the disc (match_albums.read_album).
+    A series' volumes in a folder named otherwise stay apart."""
+    if box in found or not named_volume_count(box.name):
+        return False                                    # (the name first: cheap, and most folders fail it)
+    dirs = [d for d in found if box in d.parents]
+    k = len(dirs)
+    if k < 2 or any(d.parent != box for d in dirs):
+        return False
+    if sorted(volume_number(d) for d in dirs) != list(range(1, k + 1)) or not _names_volumes(box.name, k):
+        return False
+    files = [f for d in dirs for f in found[d]]
+    keys = album_keys(files, box, metas)
+    if any(k_[0] != "tags" or not k_[1] for k_ in keys.values()) or len({k_[1] for k_ in keys.values()}) != 1:
+        return False                                    # (untagged, or two artists' albums)
+    discs, totals, years, barcodes, catnos, restart, stale = {}, set(), [], [], [], {}, {}
+    for d in dirs:
+        if len({keys[f] for f in found[d]}) != 1:
+            return False                                # (a folder of two albums)
+        ms = [metas.get(f) or {} for f in found[d]]
+        nums = {_disc_tag(m)[0] for m in ms}
+        if len(nums) != 1:
+            return False                                # (a folder of two discs, or partly tagged)
+        discs[d] = next(iter(nums))
+        totals |= {_disc_tag(m)[1] for m in ms}
+        years.append({_first(m, "date")[:4] for m in ms} - {""})
+        barcodes.append({mc.norm_code(_first(m, "barcode")) for m in ms} - {""})
+        catnos.append({mc.norm_code(_first(m, "catalognumber")) for m in ms} - _NO_CODE)
+        stale[d] = all(_first(m, "tagmender") for m in ms)     # (an earlier job's tags: its disc numbers too)
+        restart[d] = "1" in {_first(m, "tracknumber").partition("/")[0].strip().lstrip("0") or "0" for m in ms}
+
+    def apart(codes):                                   # (every volume carries one, and no two share)
+        return all(codes) and not set.intersection(*codes)
+    # (barcodes first, when every volume has one; else catalogue numbers - "none" is no number)
+    codes = barcodes if all(barcodes) else catnos      # (a barcode on some volumes only tells nothing apart)
+    if apart(codes):
+        return False                                    # (each volume its own release)
+    shared = all(codes) and set.intersection(*codes)
+    if not shared and all(len(y) == 1 for y in years) and len({next(iter(y)) for y in years}) > 1:
+        return False                                    # (released years apart: a series' volumes)
+    # (a total counting other than the set - "1 of 3" on a volume of two - is another release's,
+    # unless an earlier job of TagMender's wrote it: "3 of 4" from a release listing each disc twice)
+    for d in dirs:
+        ts = {_disc_tag(metas.get(f) or {})[1] for f in found[d]} - {"", "1", str(k)}
+        if ts and not stale[d]:
+            return False
+    if all(discs.values()) and len(totals) == 1:        # (one numbering of a set: it must be this one)
+        if len(set(discs.values())) == 1:
+            return discs[dirs[0]] == "1" and all(restart.values())
+        total = next(iter(totals))
+        return total in ("", str(k)) and all(v == str(volume_number(d)) for d, v in discs.items())
+    return True
+
+
+# --- engine.py:1291
+# DSC-5: the number a box's folder begins with, the order its discs are in: "01. (1980) - ...",
+# "CD3. 1992. ...", "CD02-03 1973 ..." (2), "CD-1 (KZ 2)", "Part 1"
+_LEAD_NUMBER = re.compile(r"^(?:(?:cd|disc|disk|part|pt\.?)\s*[-_.]?\s*)?(\d{1,3})(?!\d)", re.I)
+
+
+# --- engine.py:1294
+def _lead_key(name):
+    """DSC-5: a folder's place among its siblings - by the number its name begins with (any word
+    of a disc or part before it: "01. Alpha" and "CD02-03 Beta" are 1 and 2), else by its name."""
+    m = _LEAD_NUMBER.match(name)
+    return (0, int(m[1]), []) if m else (1, 0, _natural_key(name))
+
+
+# --- engine.py:1301
+def _box_discs(box: Path, found: dict, metas: dict):
+    """DSC-5: (N, the disc numbers of box's audio folders in their order, whether every file
+    gives a disc total) for numbered_box and box_still_arriving, when every other sign of a box
+    agrees; else None."""
+    n = box_cd_count(box.name)
+    if n < 2 or box in found:
+        return None
+    dirs = [d for d in found if box in d.parents]
+    if not dirs:
+        return None
+    for d in dirs:
+        depth = len(d.relative_to(box).parts)
+        if depth > 2 or (depth == 2 and (not (is_disc_dir(d) or box_part_disc(d) is not None) or d.parent in found)):
+            return None                                   # (DSC-3's "Part 1" of a range folder is a disc folder too)
+    dirs.sort(key=lambda d: [_lead_key(x) for x in d.relative_to(box).parts])
+    files = [f for d in dirs for f in found[d]]
+    keys = album_keys(files, box, metas)
+    if any(k[0] != "tags" or not k[1] for k in keys.values()) or len({k[1] for k in keys.values()}) != 1:
+        return None                                       # (untagged, or two artists' albums)
+    numbers = []
+    for d in dirs:
+        if len({keys[f] for f in found[d]}) != 1:
+            return None                                   # (a folder of two albums)
+        tags = {_disc_tag(metas.get(f) or {}) for f in found[d]}
+        nums = {t[0] for t in tags}
+        if len(nums) != 1 or not next(iter(nums)).isdigit():
+            return None                                   # (no disc number, or two of them)
+        if any(t[1].isdigit() and int(t[1]) < n for t in tags):
+            return None                                   # (its own tags count fewer discs)
+        numbers.append(int(next(iter(nums))))
+    return n, numbers, all(t[1].isdigit() for f in files for t in [_disc_tag(metas.get(f) or {})])

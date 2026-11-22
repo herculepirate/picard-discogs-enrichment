@@ -55,6 +55,9 @@ DEFAULTS: dict[str, Any] = {
     # ("Max Corbacho", "Bruno Sanfilippo") instead of Picard's joined credit,
     # on every album, with or without a Discogs match. See README.
     'split_collaborations': True,
+    # Read the album's folder (folder and file names, rip logs, cue sheets, notes) for what
+    # your copy says of its pressing, and search and rank Discogs by it. See README.
+    'folder_evidence': True,
     'log_level': 'basic',
     'log_max_kb': '2048',
     'prefer_original_date': False,

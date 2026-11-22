@@ -40,6 +40,55 @@ class UpToDate(unittest.TestCase):
         self.assertEqual(run.returncode, 0, run.stderr)
 
 
+def _undefined_names(path: Path) -> list:
+    """Names a module loads that nothing defines (a closure the vendoring tool cut short)."""
+    import ast
+    import builtins
+    tree = ast.parse(path.read_text())
+    top = set()
+    for n in tree.body:
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            top.add(n.name)
+        elif isinstance(n, ast.Assign):
+            for t in n.targets:
+                top |= {x.id for x in ast.walk(t) if isinstance(x, ast.Name)}
+        elif isinstance(n, (ast.AnnAssign, ast.AugAssign)) and isinstance(n.target, ast.Name):
+            top.add(n.target.id)
+        for x in ast.walk(n):
+            if isinstance(x, (ast.Import, ast.ImportFrom)) and (n is x or isinstance(n, (ast.Try, ast.If))):
+                top |= {(a.asname or a.name).split(".")[0] for a in x.names}
+    bad = set()
+    for n in tree.body:
+        bound = set()
+        for x in ast.walk(n):
+            if isinstance(x, ast.Name) and not isinstance(x.ctx, ast.Load):
+                bound.add(x.id)
+            elif isinstance(x, ast.arg):
+                bound.add(x.arg)
+            elif isinstance(x, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                bound.add(x.name)
+            elif isinstance(x, (ast.Import, ast.ImportFrom)):
+                bound |= {(a.asname or a.name).split(".")[0] for a in x.names}
+            elif isinstance(x, ast.ExceptHandler) and x.name:
+                bound.add(x.name)
+        for x in ast.walk(n):
+            if isinstance(x, ast.Name) and isinstance(x.ctx, ast.Load) and x.id not in top | bound \
+                    and not hasattr(builtins, x.id):
+                bad.add(x.id)
+    return sorted(bad)
+
+
+class Generated(unittest.TestCase):
+    def test_no_undefined_names(self):
+        for name in ("tm_readers.py", "tm_match_core.py"):
+            self.assertEqual(_undefined_names(ROOT / name), [], name)
+
+    def test_tagmender_state_never_read(self):
+        # the plugin reads no TagMender job history (TagMender's state folder is not used)
+        self.assertFalse(tr.STATE_DIR.exists())
+        self.assertIn("nonexistent", str(tr.STATE_DIR))
+
+
 class RipLogs(unittest.TestCase):
     def test_eac_log_toc_header_year(self):
         with tempfile.TemporaryDirectory() as d:

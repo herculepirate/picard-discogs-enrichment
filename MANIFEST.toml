@@ -2,7 +2,7 @@ uuid = "dd789f69-332f-498a-af94-d8e3273cc435"
 name = "Discogs Enrichment"
 description = "Tag from Discogs alongside or instead of MusicBrainz, with a release picker, box-set disc mapping and cover art."
 api = ["3.0"]
-version = "0.3.8"
+version = "0.4.0"
 authors = ["herculepirate"]
 maintainers = ["herculepirate"]
 license = "GPL-2.0-or-later"
@@ -24,6 +24,12 @@ year, country and medium — and says which facts agreed. Search by any field
 Discogs supports, or paste a release ID or URL. A search that returns
 nothing widens itself by dropping the most over-specific terms and tells you
 which ones it dropped.
+
+**Reads your copy.** The album's folder says which pressing you own:
+catalogue numbers in its name, rip logs and cue sheets whose disc ID fits your
+files, a pressing year, a vinyl or SACD rip. Discogs is searched by these
+first and its releases ranked against them, and a Discogs release MusicBrainz
+links to is not applied when your copy's barcode is not on it.
 
 **Four tag sources.** Discogs only, MusicBrainz only, Discogs preferred, or
 MusicBrainz preferred. Each is exact about what it overwrites and what it

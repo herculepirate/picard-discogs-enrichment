@@ -1668,6 +1668,9 @@ def explain_release_match(candidate: dict[str, Any],
         'missed': missed,
         'available': available,
         'comparable': len(matched) + len(missed),
+        # where each fact compared was read, when it was your copy rather than MusicBrainz
+        # ("barcode": "the folder name"): discogs_evidence.match_facts
+        'sources': dict(mb.get('_from') or {}),
     }
 
 
@@ -1707,11 +1710,16 @@ def describe_match(detail: dict[str, Any]) -> tuple[str, str]:
     else:
         label = 'No match'
 
+    sources = detail.get('sources') or {}
+
+    def _named(items):
+        return [f'{i} (from {sources[i]})' if sources.get(i) else i for i in items]
+
     parts = []
     if matched:
-        parts.append('agrees on ' + _human_list(matched))
+        parts.append('agrees on ' + _human_list(_named(matched)))
     if missed:
-        parts.append('differs on ' + _human_list(missed))
+        parts.append('differs on ' + _human_list(_named(missed)))
     return label, (label + ': ' + '; '.join(parts) if parts else label)
 
 

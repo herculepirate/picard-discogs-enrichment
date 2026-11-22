@@ -27,6 +27,12 @@ that finds nothing widens itself by dropping the most over-specific terms
 and tells you which ones it dropped, instead of reporting "no matches" and
 leaving you to guess.
 
+**Reads your copy, not just MusicBrainz.** The album's folder says which
+pressing you own: a catalogue number in its name (`[Relativity, 88561-1115-2,
+U.S.A.]`), a rip log or cue sheet whose disc ID fits your files, a pressing
+year, a vinyl or SACD rip. Discogs is searched by these first and its
+releases ranked against them. See [Your copy's evidence](#your-copys-evidence).
+
 **Four tag sources**, each exact about what it overwrites. See
 [Tag sources](#tag-sources).
 
@@ -226,6 +232,49 @@ correctly.
 
 ---
 
+## Your copy's evidence
+
+MusicBrainz's release is the one Picard *matched*, which for a much-reissued
+album may be another pressing than yours. So the plugin also reads the
+album's own folder, using TagMender's readers (see [Development](#development)):
+
+| Read from | What it gives |
+| --- | --- |
+| Folder and file names | Catalogue numbers in brackets (`(Under One Flag, CD FLAG 54, France)`), a remaster or reissue year (`[2004 RM]`), vinyl and SACD rips |
+| Rip logs (EAC, XLD) and cue sheets | The disc's table of contents and so its MusicBrainz disc ID, only when it fits your files to the sector; the year it was ripped; catalogue numbers in the paths the ripper wrote to |
+| `CDTOC` tags, and lossless files that are whole CD sectors | The disc ID, rebuilt from the files' own lengths |
+| Notes (`.txt`, `.nfo`) | Catalogue numbers and barcodes the ripper typed |
+| Your files' tags | A barcode and catalogue number, unless another tagger wrote them (the files carry release IDs): those came *from* a release and prove nothing |
+
+What it does with them:
+
+- **Searches Discogs by your copy first**: its barcode, then its catalogue
+  number, then MusicBrainz's.
+- **Ranks candidates against your copy**: your copy's barcode, catalogue
+  number, pressing year and medium replace MusicBrainz's. Hovering the Match
+  column says where each fact came from: *"Strong: agrees on catalogue number
+  (from the folder name)"*.
+- **Checks MusicBrainz's link.** When MusicBrainz links the release to a
+  Discogs release that does not carry your copy's barcode, that release is not
+  applied; Discogs is searched by your copy instead.
+- **Checks the disc ID** against the disc IDs MusicBrainz attaches to the
+  release Picard matched (no extra requests), and says so in the log.
+- **Pre-fills Search Discogs…** with your copy's barcode, catalogue number
+  and pressing year.
+
+A disc ID counts only when its TOC has three tracks or more: a one- or
+two-track disc ID, or a single-file image read as one track, is just "a CD
+this long". The folder is never read when the album's files are spread over a
+folder holding other albums (an artist's or library folder), and nothing in
+it is changed. Switch it off under **Options → Plugins → Discogs Enrichment →
+"Read the album folder for which pressing you own"**.
+
+Coming next: TagMender's own pressing scorer deciding when a Discogs release
+is proven, and barcodes, catalogue numbers and matrix codes read from your
+scans (OCR).
+
+---
+
 ## Troubleshooting
 
 **"Failed to update the plugin … has uncommitted changes".** Files in the
@@ -266,8 +315,15 @@ git push                  # when you are happy with it
 Only committed work is installed. `./install.sh` (without `--local`) switches
 back to the GitHub source; settings are kept either way.
 
-Pure logic lives in `discogs_mapping.py` with no Qt or Picard imports, so it
-can be tested directly. `discogs_runtime.py` holds the late-bound `api`
+Pure logic lives in `discogs_mapping.py` and `discogs_evidence.py` with no Qt
+or Picard imports, so it can be tested directly (`python3 tests/test_*.py`).
+
+`tm_match_core.py` and `tm_readers.py` are **generated** from a
+[TagMender](https://github.com/herculepirate/tagmender) checkout by
+`tools/vendor_tagmender.py`: its pressing scorer verbatim, and the folder
+reader (`read_album`) with every reader it reaches. Never edit them; change
+TagMender and run the tool again. `tests/test_vendored.py` fails when they are
+behind TagMender. `discogs_runtime.py` holds the late-bound `api`
 object: `enable(api)` binds it once and the rest of the plugin imports `log`
 and `settings` from there, rather than threading the api through every call.
 
@@ -276,6 +332,10 @@ MANIFEST.toml            plugin metadata (uuid, name, api version)
 __init__.py              enable()/disable(), actions, options page
 discogs_runtime.py       late-bound api: settings + logging
 discogs_mapping.py       pure logic — field mapping, merge modes, scoring
+discogs_evidence.py      pure logic — your copy's evidence from the album folder
+tm_match_core.py         generated from TagMender: pressing scorer, code rules
+tm_readers.py            generated from TagMender: folder, rip log, cue readers
+tools/vendor_tagmender.py  regenerates the two tm_* files
 discogs_client.py        Discogs API over Picard's web service
 discogs_*_dialog.py      release picker, search, disc mapping, preview
 discogs_coverart.py      cover art provider
