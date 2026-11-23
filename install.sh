@@ -11,7 +11,8 @@
 #   ./install.sh                  # install from GitHub (normal use)
 #   ./install.sh --local          # install from this folder's git repo (development:
 #                                 #   commit here, then ./install.sh --update)
-#   ./install.sh --update         # update to the latest commit of the install source
+#   ./install.sh --update         # update: to the newest version tag (installed on a tag), else
+#                                 #   the latest commit of the install source
 #   ./install.sh --repair         # back up hand edits in the installed copy, discard them, update
 #   ./install.sh --status         # show the installed copy's state
 #   ./install.sh --uninstall
@@ -150,6 +151,13 @@ case "$MODE" in
             SOURCE="$(git -C "$SRC_DIR" remote get-url origin 2>/dev/null || echo "$DEFAULT_URL")"
             case "$SOURCE" in git@github.com:*) SOURCE="https://github.com/${SOURCE#git@github.com:}" ;; esac
         fi
+        # the version's tag (v0.8.0): Picard shows "v0.8.0 @commit" and its Update moves to
+        # the newest tag; no tag for this version yet: the branch, as before
+        REF=()
+        VERSION="$(manifest_value version)"
+        if [ -n "$VERSION" ] && git ls-remote --exit-code --tags "$SOURCE" "refs/tags/v$VERSION" >/dev/null 2>&1; then
+            REF=(--ref "v$VERSION")
+        fi
         if [ -d "$DEST" ] && ! is_git; then
             info "Found a plain copy from an older install.sh; replacing it with a Picard-managed install."
             rm -rf -- "$DEST"
@@ -162,9 +170,9 @@ case "$MODE" in
             fi
             info "Switching the install source from $current to $SOURCE (settings are kept)."
             backup_edits
-            "${CLI[@]}" plugins install --reinstall "$SOURCE"
+            "${CLI[@]}" plugins install --reinstall "${REF[@]}" "$SOURCE"
         else
-            "${CLI[@]}" plugins install "$SOURCE"
+            "${CLI[@]}" plugins install "${REF[@]}" "$SOURCE"
         fi
         warn_running
         info "Then: Options > Plugins, enable \"$NAME\", and paste your Discogs token in its settings."
