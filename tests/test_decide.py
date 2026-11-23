@@ -116,6 +116,66 @@ class Decide(unittest.TestCase):
         r = self._decide(album, http)
         self.assertEqual(r['status'], 'review')
 
+    def test_shared_number_most_likely_pressing(self):
+        # both carry the folder's number; the other's last track is 6 s longer than yours
+        album = self._copy('Nightfall (1987) [Active, ACTLP 1]', log=False)
+        off = list(LENGTHS[:2]) + [LENGTHS[2] + 450]
+        http = FakeHttp([release(1, 'ACTLP 1'), release(2, 'ACTLP 1', year=2005, lengths=off)])
+        r = self._decide(album, http)
+        self.assertEqual(r['status'], 'likely', r['why'])
+        self.assertEqual(str(r['best']['cand']['id']), '1')
+        self.assertEqual([str(x['cand']['id']) for x in r['others']], ['2'])
+        self.assertEqual(self._decide(album, http, likely=False)['status'], 'review')
+
+    def test_pressings_nothing_tells_apart_ask_you(self):
+        album = self._copy('Nightfall (1987) [Active, ACTLP 1]', log=False)
+        http = FakeHttp([release(1, 'ACTLP 1'), release(2, 'ACTLP 1', year=2005)])
+        self.assertEqual(self._decide(album, http)['status'], 'review')
+
+    def test_printed_mark_only_one_pressing_lists(self):
+        # Warsaw: one barcode on three Portuguese runs; the scan prints "(C) 1994 Movieplay"
+        album = self._copy('Nightfall (1987) [Active, ACTLP 1]', log=False)
+        a, b = release(1, 'ACTLP 1', year=1994), release(2, 'ACTLP 1', year=1999)
+        a['notes'] = '\u24c1 SPA \u2117 1994 Intermusic S.A. \u00a9 1994 Movieplay S.A.'
+        b['notes'] = '(L) SPA \u2117 1994 Intermusic S.A. \u00a9 1994 Intermusic S.A.'
+        b['identifiers'] = [{'type': 'Rights Society', 'value': 'MCPS'}]
+        http = FakeHttp([a, b])
+        scan = 'ISSUED UNDER LICENSE TO INTERMUSIC S.A.\n|994 INTERMUSIC S.A. \u00a9 1994 MOVIEPLAY S.A.\nSPA'
+        r = self._decide(album, http, ocr_text=scan, likely=False)
+        self.assertEqual(r['status'], 'auto', r['why'])
+        self.assertEqual(str(r['best']['cand']['id']), '1')
+        self.assertIn('1994 Movieplay', r['why'][0])
+        # the scans print nothing that tells them apart: you are asked
+        self.assertEqual(self._decide(album, http, ocr_text='SPA 1994 INTERMUSIC', likely=False)['status'], 'review')
+
+    def test_printed_marks(self):
+        det = {'notes': '\u2117 1994 Intermusic S.A. \u00a9 1999 IMC Music Ltd.  Made in Portugal. GEMA',
+               'identifiers': [{'type': 'Rights Society', 'value': 'SPA'},
+                               {'type': 'Matrix / Runout', 'value': 'CDSNV MPG 74034 (94281205)'},
+                               {'type': 'Barcode', 'value': '8712177021284'}]}
+        self.assertEqual(dd.printed_marks(det), {('rights', 'SPA'), ('rights', 'GEMA'),
+                                                 ('matrix', 'CDSNVMPG7403494281205'),
+                                                 ('copyright', '1994 INTERMUSIC'), ('copyright', '1999 IMC')})
+
+    def test_printed_marks_another_pressing_also_shows_ask(self):
+        x = {'cand': {'id': 1}}
+        y = {'cand': {'id': 2}}
+        details = {'1': {'identifiers': [{'type': 'Rights Society', 'value': 'SPA'}]},
+                   '2': {'identifiers': [{'type': 'Rights Society', 'value': 'MCPS'}]}}
+        self.assertIs(dd.printed_tiebreak([x, y], details, 'SPA')[0], x)
+        self.assertIsNone(dd.printed_tiebreak([x, y], details, 'SPA MCPS')[0])     # both printed
+        self.assertIsNone(dd.printed_tiebreak([x, y], details, 'nothing')[0])
+
+    def test_likely_needs_a_lead(self):
+        tied = [{'cand': {'id': n}, 'confidence': 95.0, 'tracks_ok': True, 'clues': {'disc TOC': 'x'}}
+                for n in (1, 2)]
+        self.assertIsNone(dd.most_likely(tied, tied)[0])
+        tied[0]['confidence'] = 97.0
+        self.assertEqual(dd.most_likely(tied, tied)[0]['cand']['id'], 1)
+        self.assertIsNone(dd.most_likely(tied, tied, held_unofficial={'1'})[0])
+        tied[0]['clues_against'] = ['made in Germany']
+        self.assertIsNone(dd.most_likely(tied, tied)[0])
+
     def test_nothing_of_the_copy_is_no_proof(self):
         album = self._copy('Nightfall (1987)', log=False)
         http = FakeHttp([release(1, 'ACTLP 1')])

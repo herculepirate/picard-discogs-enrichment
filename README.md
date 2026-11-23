@@ -275,6 +275,11 @@ What it does with them, when your copy says anything of its pressing:
    | **Proven** | TagMender is sure *and* your copy proves the pick: your disc ID, your barcode or your catalogue number, with no other pressing proven as strongly (a disc ID beats a barcode, a barcode a catalogue number; a number two pressings share proves neither) |
    | **Linked** | MusicBrainz links that Discogs release to the release Picard matched, and nothing of your copy is against it |
    | **Same as MusicBrainz** | It carries the matched MusicBrainz release's barcode (or its catalogue number and year), and nothing of your copy is against it |
+   | **Printed on your scans** | Several pressings carry what your copy proves (one barcode on a 1994 and a 1999 run), and only one of them lists a mark your scans print: a copyright line (*"© 1994 Movieplay S.A."*), a rights society (SPA, MCPS, GEMA …) or a matrix code. If a mark another pressing lists is printed too, you are asked |
+   | **Most likely** | Several pressings carry what your copy proves and nothing printed tells them apart, but TagMender scores one clearly highest (at least 90%, a point or more ahead): its year, country, label and track lengths fit best. The others are named in the log. Turn off with **"When several pressings share my proof, take the most likely"** |
+
+   An unofficial release (a bootleg) is taken only when no official release
+   carries what proves it (TagMender's rule: bootlegs copy official barcodes).
 
 5. **Otherwise you choose.** The release picker opens with TagMender's
    candidates, best first; its Match column shows TagMender's confidence and
@@ -333,8 +338,10 @@ Up to 15 scans an album are read, the likeliest to carry a code first
 (the back, tray, disc and obi before the booklet). Each is read once — a full
 set takes a minute or two the first time — and kept in a cache
 (`~/.var/app/org.musicbrainz.Picard/cache/discogs-enrichment/ocr.sqlite` for
-the Flatpak). A barcode decoded off a scan is your copy's own, as a tag would
-be; the codes printed on the scans are searched too, and the page text is
+the Flatpak). A page tesseract reads poorly as a whole (a busy back cover:
+a barcode, a grey panel, columns of credits) is read again in tiles, smoothed
+and enlarged, for its small print — the copyright line at its foot. A barcode
+decoded off a scan is your copy's own, as a tag would be; the codes printed on the scans are searched too, and the page text is
 scored against every candidate. Nothing is sent anywhere.
 
 While OCR is unavailable, **every look-up says so** in the log and Picard's

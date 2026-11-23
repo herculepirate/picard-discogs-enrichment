@@ -69,6 +69,46 @@ def _joined(readings) -> str:
     return "\n".join(r for r in readings if isinstance(r, str) and r.strip())
 
 
+# The small print: a page whose text tesseract read poorly (fewer than SMALL_PRINT_WORDS words)
+# is read again in overlapping tiles, its print's halftone dots smoothed out and enlarged. A
+# busy back cover (a barcode, a grey panel, columns of credits) defeats tesseract's own page
+# layout; a tile of it does not - the copyright line "(P) 1994 Intermusic S.A." at the foot of
+# a scan tells a 1994 pressing from a 1999 one.
+SMALL_PRINT_KIND = "small-print-1"
+SMALL_PRINT_WORDS = 40
+SMALL_PRINT_GRID = (4, 3)            # rows, columns
+SMALL_PRINT_OVERLAP = 0.04           # of the page's size, so no line is cut in every tile
+SMALL_PRINT_MAX_SIDE = 4000          # enlarged up to 2x, never past this
+SMALL_PRINT_BUDGET_S = 120.0
+
+
+def _words(text) -> int:
+    import re
+    return len(re.findall(r"[^\W\d_]{3,}", text or ""))
+
+
+def small_print(path: str) -> str:
+    """One scan's text read tile by tile (see SMALL_PRINT_KIND)."""
+    from PIL import Image, ImageFilter, ImageOps
+    import tm_ocr as to
+    with Image.open(path) as im:
+        g = ImageOps.grayscale(ImageOps.exif_transpose(im))
+    g = g.filter(ImageFilter.MedianFilter(3))
+    scale = min(2.0, SMALL_PRINT_MAX_SIDE / max(g.size))
+    if scale > 1.05:
+        g = g.resize((round(g.width * scale), round(g.height * scale)), Image.LANCZOS)
+    rows, cols = SMALL_PRINT_GRID
+    w, h = g.size
+    ox, oy = round(w * SMALL_PRINT_OVERLAP), round(h * SMALL_PRINT_OVERLAP)
+    out = []
+    for r in range(rows):
+        for c in range(cols):
+            box = (max(0, w * c // cols - ox), max(0, h * r // rows - oy),
+                   min(w, w * (c + 1) // cols + ox), min(h, h * (r + 1) // rows + oy))
+            out.append(to._tess(g.crop(box), 6, to.ocr_langs()) or "")
+    return "\n".join(t.strip() for t in out if t.strip())
+
+
 def read_album(album_dir: str, max_images: int, cache: str | None, have_barcode: bool) -> dict:
     """TagMender's scan reading for one album (match_albums' _process, the OCR part): every
     scan's barcodes and page text, spines, the digit band when no barcode is known, disc rings,
@@ -87,7 +127,11 @@ def read_album(album_dir: str, max_images: int, cache: str | None, have_barcode:
         found = set(to.decoded_barcodes(db, images, log)) if images and _have("pyzbar") else set()
         page = spines = digits = rings = ""
         if images:
-            page = _joined(to.each_scan(db, to.page_kind("text"), images, lambda p: to.ocr_text([p]), log))
+            pages = to.each_scan(db, to.page_kind("text"), images, lambda p: to.ocr_text([p]), log)
+            poor = [p for p, t in zip(images, pages) if _words(t) < SMALL_PRINT_WORDS]
+            small = to.each_scan(db, SMALL_PRINT_KIND, poor, small_print, log,
+                                 budget_s=SMALL_PRINT_BUDGET_S) if poor else []
+            page = _joined(list(pages) + list(small))
             spines = _joined(to.each_scan(db, to.page_kind("spines"), images,
                                           lambda p: to.ocr_spines([p]), log))
             if not (found or have_barcode) and _have("numpy"):

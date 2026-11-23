@@ -902,7 +902,8 @@ def process_album(api, album, metadata, release) -> None:
         http = job['http'] = PicardHttp(client, webservice)
         job['verdict'] = decide(album_d, http, _dm, mb_release_id=getattr(album, 'id', '') or '',
                                 mb_discids=mb_discids, linked=all_linked, mb_facts=mb_facts,
-                                ocr_text=merged.get('text') or '', scan_probe=merged.get('probe'))
+                                ocr_text=merged.get('text') or '', scan_probe=merged.get('probe'),
+                                likely=bool(settings['pick_likely']))
         return job
 
     def _apply(release_id, why):
@@ -950,6 +951,10 @@ def process_album(api, album, metadata, release) -> None:
                             f'is against it')
             elif status == 'musicbrainz':
                 _apply(rid, f'Discogs release {rid}: {verdict["why"][0]}')
+            elif status == 'likely':
+                rest = ', '.join(str(x['cand'].get('id')) for x in verdict.get('others') or ())
+                _apply(rid, f'Discogs release {rid}: {verdict["why"][0]}; also possible: {rest} '
+                            f'(Search Discogs… to choose another)')
             elif status == 'review':
                 _review(verdict, http)
             else:
@@ -1298,6 +1303,13 @@ class DiscogsOptionsPage(OptionsPage):
             'barcode of the MusicBrainz release Picard matched - and nothing of your copy is\n'
             'against it. Otherwise this opens the release picker, one album at a time; without it\n'
             'the album gets no Discogs data until you use Search Discogs\u2026')
+        self.pick_likely_checkbox = QtWidgets.QCheckBox(
+            'When several pressings share my proof, take the most likely', self)
+        self.pick_likely_checkbox.setToolTip(
+            'Several pressings may carry the barcode or catalogue number your copy shows (a 1994\n'
+            'and a 1999 run of one CD). With this on, the one TagMender scores clearly highest\n'
+            '(year, country, label, track lengths, the text of your scans) is applied, and the\n'
+            'others are named in the log; off, you are asked.')
         self.ocr_scans_checkbox = QtWidgets.QCheckBox(
             'Read my scans and PDF booklets (OCR)', self)
         self.ocr_scans_checkbox.setToolTip(
@@ -1311,7 +1323,8 @@ class DiscogsOptionsPage(OptionsPage):
         for box in (self.reverse_match_checkbox, self.skip_preview_checkbox,
                     self.auto_disc_map_checkbox, self.use_cache_checkbox,
                     self.split_collab_checkbox, self.folder_evidence_checkbox,
-                    self.picker_when_unsure_checkbox, self.ocr_scans_checkbox):
+                    self.picker_when_unsure_checkbox, self.pick_likely_checkbox,
+                    self.ocr_scans_checkbox):
             layout.addWidget(box)
 
         # --- web sources -------------------------------------------------
@@ -1520,6 +1533,7 @@ class DiscogsOptionsPage(OptionsPage):
         self.folder_evidence_checkbox.setChecked(True)
         self.picker_when_unsure_checkbox.setChecked(True)
         self.ocr_scans_checkbox.setChecked(True)
+        self.pick_likely_checkbox.setChecked(True)
         self.web_sources_checkbox.setChecked(False)
         self.web_source_list_edit.setText('')
         self.web_lyrics_checkbox.setChecked(False)
@@ -1562,6 +1576,7 @@ class DiscogsOptionsPage(OptionsPage):
         self.folder_evidence_checkbox.setChecked(bool(s['folder_evidence']))
         self.picker_when_unsure_checkbox.setChecked(bool(s['picker_when_unsure']))
         self.ocr_scans_checkbox.setChecked(bool(s['ocr_scans']))
+        self.pick_likely_checkbox.setChecked(bool(s['pick_likely']))
         self.web_sources_checkbox.setChecked(bool(s['web_sources']))
         self.web_source_list_edit.setText(str(s['web_source_list'] or ''))
         self.web_lyrics_checkbox.setChecked(bool(s['web_lyrics']))
@@ -1604,6 +1619,7 @@ class DiscogsOptionsPage(OptionsPage):
         s['folder_evidence'] = self.folder_evidence_checkbox.isChecked()
         s['picker_when_unsure'] = self.picker_when_unsure_checkbox.isChecked()
         s['ocr_scans'] = self.ocr_scans_checkbox.isChecked()
+        s['pick_likely'] = self.pick_likely_checkbox.isChecked()
         s['web_sources'] = self.web_sources_checkbox.isChecked()
         s['web_source_list'] = self.web_source_list_edit.text().strip()
         s['web_lyrics'] = self.web_lyrics_checkbox.isChecked()

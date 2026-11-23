@@ -188,7 +188,7 @@ def main(argv=None) -> int:
             c = (r.get('best') or {}).get('cand') or {}
             pick = f' -> {c.get("id")} {c.get("year")} {c.get("country")}' if c else ''
             print(f'[{status:7}] {line}{pick}')
-            if status == 'auto':
+            if status in ('auto', 'likely'):
                 print(f'          {dd.explain(r["best"])[:200]}')
             elif r.get('why'):
                 print(f'          why: {"; ".join(r["why"][:2])[:200]}')
@@ -207,7 +207,7 @@ def main(argv=None) -> int:
           f'pressing, {counts["no evidence"]} without, {counts["error"]} unreadable')
     print('evidence: ' + ', '.join(f'{k} {v}' for k, v in sorted(kinds.items())))
     if http:
-        print('verdicts: ' + ', '.join(f'{k} {counts[k]}' for k in ('auto', 'review', 'nomatch') if counts[k])
+        print('verdicts: ' + ', '.join(f'{k} {counts[k]}' for k in ('auto', 'likely', 'review', 'nomatch') if counts[k])
               + f'; requests sent: {dict(http.sent)}')
     return 1 if counts['error'] else 0
 

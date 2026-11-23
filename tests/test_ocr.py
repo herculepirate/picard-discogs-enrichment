@@ -245,6 +245,33 @@ class Helper(unittest.TestCase):
             self.assertEqual(again['read_now'], 0)             # (the cache: read once)
             self.assertEqual(again['ocr_barcodes'], [BARCODE])
 
+    def test_small_print_read_in_tiles(self):
+        # a busy back cover: a grey halftone panel, a barcode, a large title, and the copyright
+        # line at its foot in 15 px type
+        import random
+        from PIL import Image, ImageDraw, ImageFont
+        sys.path.insert(0, str(ROOT))
+        import discogs_ocr_helper as h
+        font = '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf'
+        if not Path(font).exists():
+            self.skipTest('DejaVu Sans not installed')
+        im = Image.new('RGB', (1400, 1000), (200, 200, 200))
+        draw = ImageDraw.Draw(im)
+        rnd = random.Random(1)
+        for y in range(0, 1000, 4):
+            for x in range(0, 1400, 4):
+                draw.point((x + rnd.randint(0, 1), y), fill=(120, 120, 120))
+        draw.rectangle([900, 300, 1300, 800], fill='white')
+        for i in range(0, 380, 9):
+            draw.rectangle([920 + i, 350, 923 + i, 750], fill='black')
+        draw.text((80, 60), 'WARSAW', font=ImageFont.truetype(font, 90), fill='black')
+        draw.text((150, 950), '\u2117 1994 INTERMUSIC S.A. \u00a9 1994 MOVIEPLAY S.A.',
+                  font=ImageFont.truetype(font, 15), fill='black')
+        with tempfile.TemporaryDirectory() as d:
+            im.save(Path(d) / 'Back.jpg', quality=85)
+            self.assertIn('1994 MOVIEPLAY', h.small_print(str(Path(d) / 'Back.jpg')).upper())
+        self.assertEqual(h._words('WARSAW 1994 S.A. MPG 74034'), 2)
+
     def test_ean13_drawing(self):
         self.assertEqual(len(_ean13_bits(BARCODE)), 95)
 

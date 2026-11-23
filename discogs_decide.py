@@ -22,6 +22,7 @@ Runs on a worker thread. Pure Python: no Qt, no Picard.
 """
 from __future__ import annotations
 
+import re
 from typing import Any
 
 try:
@@ -35,6 +36,10 @@ except ImportError:  # run outside Picard (tests)
 MAX_DISCID_RELEASES = 3
 # Discogs releases MusicBrainz links to that are fetched beside the search's own
 MAX_LINKED = 4
+# "likely": how far (confidence points) the most likely of the pressings your copy proves
+# equally must lead the next, and how sure TagMender must be of it
+LIKELY_MIN_LEAD = 1.0
+LIKELY_MIN_CONFIDENCE = 90.0
 
 
 def _cfg(overrides: dict | None = None) -> dict:
@@ -122,9 +127,109 @@ def agrees_with_musicbrainz(s: dict, mb: dict) -> str:
     return ''
 
 
+# ---- what is printed on your scans that only one pressing lists ------------------------------
+# rights societies a sleeve or disc names (Discogs' "Rights Society" identifier, or its notes)
+RIGHTS_SOCIETIES = ('SPA', 'MCPS', 'GEMA', 'SACEM', 'SDRM', 'BIEM', 'SGAE', 'JASRAC', 'STEMRA', 'SIAE',
+                    'BUMA', 'NCB', 'AKM', 'AUME', 'APRA', 'AMCOS', 'ASCAP', 'BMI', 'SABAM', 'SUISA',
+                    'ZAIKS', 'STIM', 'TEOSTO', 'KODA', 'TONO', 'ARTISJUS', 'OSA', 'ECAD', 'SOCAN', 'CMRRA')
+# "(P) 1994 Intermusic", "© 1999 IMC Music": a copyright line's year and its owner's first word
+_COPYRIGHT = re.compile(r"(?:\u2117|\u00a9|\u24c1|\u24c5|\u24b8|\((?:p|c|l)\)|copyright|phonographic)"
+                        r"\s*(?:by\s+)?((?:19|20)\d\d)[\s,]+([A-Za-z][A-Za-z&'-]{2,})", re.I)
+_MATRIX_TYPES = ('matrix / runout', 'mould sid code', 'mastering sid code')
+
+
+def _ocr_upper(text: str) -> str:
+    """Your scans' text for matching printed marks: upper case, "|994" read as "1994"."""
+    return re.sub(r"[|Il!](?=\d{3}\b)", "1", text or "").upper()
+
+
+def printed_marks(det: dict | None) -> set:
+    """What a Discogs release says is printed on it and a scan can show: its rights societies,
+    its copyright lines (year and owner) and its matrix and SID codes."""
+    det = det or {}
+    marks = set()
+    notes = str(det.get('notes') or '')
+    for i in det.get('identifiers') or ():
+        kind, value = str(i.get('type') or '').casefold(), str(i.get('value') or '')
+        if kind == 'rights society':
+            marks |= {('rights', w) for w in re.findall(r'[A-Za-z]{2,}', value.upper()) if w in RIGHTS_SOCIETIES}
+        elif kind in _MATRIX_TYPES:
+            code = re.sub(r'[^A-Z0-9]', '', value.upper())
+            if len(code) >= 6:
+                marks.add(('matrix', code))
+    marks |= {('rights', w) for w in re.findall(r'\b[A-Z]{2,7}\b', notes) if w in RIGHTS_SOCIETIES}
+    marks |= {('copyright', f'{y} {o.upper()}') for y, o in _COPYRIGHT.findall(notes)}
+    return marks
+
+
+def mark_printed(mark, upper: str, compact: str) -> bool:
+    kind, value = mark
+    if kind == 'rights':
+        return re.search(rf'(?<![A-Z]){value}(?![A-Z])', upper) is not None
+    if kind == 'matrix':
+        return value in compact
+    year, owner = value.split(' ', 1)
+    return re.search(rf'{year}\W{{0,3}}{re.escape(owner)}', upper) is not None
+
+
+def printed_tiebreak(tied: list, details: dict, ocr_text: str) -> tuple[dict | None, list]:
+    """Of pressings your copy proves equally, the one whose printed marks (printed_marks) on
+    your scans include every other's - and at least one no other has. A mark all of them list
+    tells none apart. Returns (that candidate or None, its marks found on your scans)."""
+    if len(tied) < 2 or not (ocr_text or '').strip():
+        return None, []
+    upper = _ocr_upper(ocr_text)
+    compact = re.sub(r'[^A-Z0-9]', '', upper)
+    marks = {id(x): printed_marks(details.get(str(x['cand'].get('id')))) for x in tied}
+    common = set.intersection(*marks.values())
+    hits = {k: {m for m in v - common if mark_printed(m, upper, compact)} for k, v in marks.items()}
+    best = max(tied, key=lambda x: len(hits[id(x)]))
+    mine = hits[id(best)]
+    if not mine or any(x is not best and not hits[id(x)] < mine for x in tied):
+        return None, []
+    return best, sorted(mine - set().union(*(hits[id(x)] for x in tied if x is not best)))
+
+
+def _mark_text(mark) -> str:
+    kind, value = mark
+    return {'rights': f'rights society {value}', 'matrix': f'matrix {value}',
+            'copyright': f'copyright "{value.title()}"'}[kind]
+
+
+def most_likely(scored, proven, held_unofficial=()) -> tuple[dict | None, list]:
+    """When several pressings carry what your copy proves as strongly (the same barcode on a
+    1994 and a 1999 pressing), the one TagMender scores highest - year, country, label, track
+    lengths, the text of your scans - if it leads the next by LIKELY_MIN_LEAD, TagMender is
+    LIKELY_MIN_CONFIDENCE sure of it, every track fits and nothing of your copy is against it.
+    Returns (that candidate or None, the others proven as strongly). HELD_UNOFFICIAL: ids of
+    bootlegs TagMender's R9 still holds (an official release carries the same barcode)."""
+    if not proven:
+        return None, []
+    top_rank = max(proof_rank(x) for x in proven)
+    tied = sorted((x for x in proven if proof_rank(x) == top_rank), key=lambda x: -(x.get('confidence') or 0))
+    top, others = tied[0], tied[1:]
+    lead = (top.get('confidence') or 0) - ((others[0].get('confidence') or 0) if others else 0)
+    if (lead < LIKELY_MIN_LEAD or (top.get('confidence') or 0) < LIKELY_MIN_CONFIDENCE
+            or not top.get('tracks_ok') or top.get('clues_against') or top.get('conflict')
+            or str(top['cand'].get('id')) in held_unofficial):
+        return None, others
+    return top, others
+
+
+def _details(http, rid) -> dict | None:
+    """A Discogs release's own page, as discogs_search fetched it (Picard's bridge keeps them)."""
+    kept = getattr(http, 'releases', None)
+    if isinstance(kept, dict) and str(rid) in kept:
+        return kept[str(rid)]
+    try:
+        return http.get_json(f'https://api.discogs.com/releases/{rid}', 'discogs')
+    except Exception:
+        return None
+
+
 def decide(album: dict, http, dm, *, mb_release_id: str = '', mb_discids=(), linked=(),
            mb_facts: dict | None = None, cfg: dict | None = None, ocr_text: str = '',
-           scan_probe: dict | None = None) -> dict[str, Any]:
+           scan_probe: dict | None = None, likely: bool = True) -> dict[str, Any]:
     """Which Discogs release ALBUM (read_album's dict) is.
 
     OCR_TEXT and SCAN_PROBE come from discogs_ocr.merge_scans: the text of your scans and
@@ -142,6 +247,8 @@ def decide(album: dict, http, dm, *, mb_release_id: str = '', mb_discids=(), lin
                   and no other candidate is proven by your copy
     "musicbrainz" a candidate carrying the matched MusicBrainz release's barcode (or catalogue
                   number and year), when your copy proves nothing else and is not against it
+    "likely"      (LIKELY) several pressings carry what your copy proves as strongly, and
+                  TagMender scores one clearly highest (most_likely); "others" lists the rest
     "review"      you choose (the picker); "nomatch" nothing found
     """
     cfg = _cfg(cfg)
@@ -162,6 +269,9 @@ def decide(album: dict, http, dm, *, mb_release_id: str = '', mb_discids=(), lin
     mc.settle_title_numbers(album, cands)
     scored = mc.code_twins(album, [mc.score_candidate(album, c, cfg, ocr_text) for c in cands], cfg, ocr_text)
     res = mc.classify(scored, cfg)
+    # TagMender's R9 against Discogs' whole list: a bootleg your copy proves is yours when no
+    # official release carries that proof (classify alone never takes one)
+    res = mc.unofficial_settled(res, [None, {'scored': scored}], album, cfg, ocr_text)
     status, best = res.get('status'), res.get('best')
     out = {'status': status, 'best': best, 'scored': scored, 'why': list(res.get('why') or ()),
            'discid_on': discid_on, 'classified': status, 'runner_up': res.get('runner_up'),
@@ -203,6 +313,28 @@ def decide(album: dict, http, dm, *, mb_release_id: str = '', mb_discids=(), lin
         out.update(status='musicbrainz', best=x)
         out['why'].insert(0, f'it carries the {what} of the MusicBrainz release Picard matched, '
                              f'and nothing of your copy is against it')
+        return out
+    held = {str(best['cand'].get('id'))} if best and mc.R9_HELD in out['why'] else set()
+    if proven:
+        top_rank = max(proof_rank(x) for x in proven)
+        tied = [x for x in proven if proof_rank(x) == top_rank]
+        details = {str(x['cand'].get('id')): _details(http, x['cand'].get('id')) for x in tied}
+        pick, marks = printed_tiebreak(tied, details, ocr_text)
+        if pick is not None and str(pick['cand'].get('id')) not in held and pick.get('tracks_ok') \
+                and not pick.get('clues_against') and not pick.get('conflict'):
+            what = ', '.join(_mark_text(m) for m in marks)
+            out.update(status='auto', best=pick, others=[x for x in tied if x is not pick])
+            out['why'] = [w for w in out['why'] if not w.startswith('more than one pressing carries')]
+            out['why'].insert(0, f'{len(tied)} pressings carry what your copy proves; only this one '
+                                 f'lists what your scans print: {what}')
+            pick['notes'] = list(pick.get('notes') or []) + [f'printed on your scans, only this pressing: {what}']
+            return out
+    top, others = most_likely(scored, proven, held) if likely else (None, [])
+    if top is not None and others:
+        out.update(status='likely', best=top, others=others)
+        out['why'].insert(0, f'{len(others) + 1} pressings carry what your copy proves; this one is the '
+                             f'most likely ({top["confidence"]:.1f}% against '
+                             f'{others[0]["confidence"]:.1f}% for {others[0]["cand"].get("id")})')
         return out
     if status == 'nomatch' or not scored:
         out['status'] = 'nomatch'
