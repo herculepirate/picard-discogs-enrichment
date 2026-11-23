@@ -32,6 +32,24 @@ except ImportError:  # run outside Picard (tests)
     import tm_match_core as mc
     import tm_readers as tr
 
+# ---- Discogs' compound countries ("UK & Europe", "Germany, Austria, & Switzerland") -----------
+# TagMender's country_code knows one country at a time, so a pressing filed under two got no
+# country clue either way: "Made in the EU" on your scans neither for nor against "UK & Europe".
+# One of Europe: Europe (XE, which TagMender treats as every European country); else the first.
+_COUNTRY_CODE = mc.country_code
+
+
+def country_code(name):
+    code = _COUNTRY_CODE(name)
+    raw = str(name or '')
+    if code or not re.search(r'&|,|/|\band\b', raw):
+        return code
+    codes = [c for c in (_COUNTRY_CODE(p) for p in re.split(r'\s*(?:&|,|/|\band\b)\s*', raw) if p.strip()) if c]
+    return 'XE' if 'XE' in codes else (codes[0] if codes else '')
+
+
+mc.country_code = country_code
+
 # MusicBrainz releases (carrying your exact disc ID) whose Discogs links are read
 MAX_DISCID_RELEASES = 3
 # Discogs releases MusicBrainz links to that are fetched beside the search's own
@@ -69,9 +87,18 @@ def _disc_ids(album: dict, http, mb_release_id: str, mb_discids: set, linked: li
     album['toc_releases'] = tr.toc_releases(http, album)
     exact = sorted(album.get('exact_toc_releases') or ())
     links = set()
+    album['discid_mb'] = {}
     for rid in exact[:MAX_DISCID_RELEASES]:
-        rel = http.get_json(f'https://musicbrainz.org/ws/2/release/{rid}?inc=url-rels&fmt=json', 'mb')
-        links |= {x for x in tr.mb_linked_discogs_ids(rel or {}) if str(x).isdigit()}
+        rel = http.get_json(f'https://musicbrainz.org/ws/2/release/{rid}?inc=url-rels+labels+media&fmt=json', 'mb')
+        own = {str(x) for x in tr.mb_linked_discogs_ids(rel or {}) if str(x).isdigit()}
+        links |= own
+        rel = rel or {}
+        album['discid_mb'][rid] = {
+            'discogs': own, 'barcode': str(rel.get('barcode') or ''),
+            'catnos': [str(li.get('catalog-number') or '') for li in rel.get('label-info') or ()
+                       if isinstance(li, dict) and li.get('catalog-number')],
+            'formats': [str(m.get('format') or '') for m in rel.get('media') or () if isinstance(m, dict)],
+        }
     if links:
         album['toc_discogs'] = set(album.get('toc_discogs') or ()) | {str(x) for x in links}
         album['toc_discogs_fuzzy'] = {k: v for k, v in (album.get('toc_discogs_fuzzy') or {}).items()
@@ -227,6 +254,116 @@ def _details(http, rid) -> dict | None:
         return None
 
 
+def _one_digit_off(a: str, b: str) -> bool:
+    return len(a) == len(b) and sum(x != y for x, y in zip(a, b)) == 1
+
+
+def drop_misread_numbers(album: dict) -> list:
+    """A "catalogue number" of 12-13 digits that is no valid barcode and one digit off your
+    copy's decoded barcode is that barcode misread or mistyped (Joy Division - Total: MusicBrainz
+    has 5053498647958 for 5052498647958): it is no number of yours that no pressing carries.
+    Removed from album["catnos"]; returns those removed."""
+    barcodes = {re.sub(r'\D', '', str(b)).lstrip('0') for b in album.get('barcodes') or ()}
+    gone = []
+    for c in list(album.get('catnos') or ()):
+        d = re.sub(r'\D', '', str(c))
+        if 12 <= len(d) <= 13 and re.fullmatch(r'[\d\s-]+', str(c).strip()) and not mc.valid_barcode(d) \
+                and any(_one_digit_off(d.lstrip('0'), b) for b in barcodes):
+            gone.append(c)
+    if gone:
+        album['catnos'] = type(album['catnos'])(c for c in album['catnos'] if c not in gone) \
+            if isinstance(album['catnos'], (set, list, tuple)) else album['catnos']
+    return gone
+
+
+def pick_discid_release(album: dict, others: list, mb_facts: dict | None, likely: bool):
+    """Your disc ID is on several MusicBrainz releases, none the one Picard matched (one CD in
+    two editions - The Ocean - Solaris, PEL 349 and PEL 350CD). The one of them that is your
+    copy: (1) its barcode is your copy's, or its catalogue number is printed on your scans;
+    else, LIKELY on, (2) its catalogue number is the matched release's and it is a CD - when
+    exactly one of them is. Returns (mbid, why) or (None, "")."""
+    info = album.get('discid_mb') or {}
+    rel = {m: info.get(m) or {} for m in others}
+    own_bc = {re.sub(r'\D', '', str(b)).lstrip('0') for b in album.get('barcodes') or ()} - {''}
+    by_copy = [m for m, r in rel.items()
+               if (r.get('barcode') and re.sub(r'\D', '', r['barcode']).lstrip('0') in own_bc)
+               or any(mc.catno_printed(album, c) for c in r.get('catnos') or ())]
+    if len(by_copy) == 1:
+        return by_copy[0], 'its barcode or catalogue number is on your copy'
+    if by_copy or not likely:
+        return None, ''
+    matched = [x for x in str((mb_facts or {}).get('catalognumber') or '').split(';') if x.strip()]
+    if not matched:
+        return None, ''
+    by_mb = [m for m, r in rel.items()
+             if mc.catnos_agree(matched, r.get('catnos') or ())
+             and r.get('formats') and all('CD' in f for f in r['formats'])]
+    if len(by_mb) == 1:
+        return by_mb[0], f'it is the CD with catalogue number {"; ".join(matched)} of the release Picard matched'
+    return None, ''
+
+
+def proof_first(scored: list, cfg: dict, held=()) -> dict | None:
+    """The one candidate your copy proves by disc ID or barcode, when no other is proven as
+    strongly - whatever TagMender's confidence ranked first (Dustin O'Halloran - Piano Solos:
+    five pressings at 82%, one with your exact disc ID). It must fit every track, carry the
+    album's artist and title, and have nothing of your copy against it."""
+    proven = [x for x in scored if proven_by_copy(x) and x.get('tracks_ok')]
+    if not proven:
+        return None
+    top = max(proof_rank(x) for x in proven)
+    tied = [x for x in proven if proof_rank(x) == top]
+    if top < 2 or len(tied) != 1:
+        return None
+    x = tied[0]
+    if (x.get('clues_against') or x.get('conflict') or mc._ruled_out_by_copy(x)
+            or str(x['cand'].get('id')) in held
+            or (x.get('artist_sim') or 0) < cfg['auto_min_artist']
+            or (x.get('title_sim') or 0) < cfg['auto_min_title']):
+        return None
+    return x
+
+
+def only_unopposed(tied: list) -> dict | None:
+    """Of pressings your copy proves equally, the only one nothing of your copy is against AND
+    whose country your scans print (Joy Division - Total: one barcode on six CDs; "Made in the
+    EU" on the scans; only "UK & Europe" is left). None otherwise."""
+    free = [x for x in tied if not x.get('clues_against') and not x.get('conflict') and x.get('tracks_ok')]
+    if len(tied) > 1 and len(free) == 1 and 'country' in (free[0].get('clues') or {}):
+        return free[0]
+    return None
+
+
+_BACK_SCAN = re.compile(r'back|rear|tray|inlay|traseira|r\u00fcckseite|arri\u00e8re', re.I)
+
+
+def codeless_pick(scored: list, album: dict, cfg: dict) -> dict | None:
+    """Your copy prints no code at all - its back cover scanned and read whole, no barcode on
+    it, none in your tags or notes - and of the pressings that fit, exactly one lists neither a
+    barcode nor a catalogue number; every other lists one your scans do not show (Dustin
+    O'Halloran - The Beauty Inside: the codeless 2013 US CD, not the Japanese PDIP-6537 nor
+    the 2014 US reissue). None otherwise."""
+    if not (album.get('scans_complete') and 'scan_barcodes' in album and not album.get('scan_barcodes')
+            and not album.get('barcodes') and any(_BACK_SCAN.search(n) for n in album.get('scan_names') or ())):
+        return None
+    def fits(x):
+        return (x.get('tracks_ok') and not x.get('clues_against') and not x.get('conflict')
+                and not mc._ruled_out_by_copy(x) and (x.get('artist_sim') or 0) >= cfg['auto_min_artist']
+                and (x.get('title_sim') or 0) >= cfg['auto_min_title'])
+    def codes(x):
+        c = x.get('cand') or {}
+        return [b for b in c.get('barcodes') or () if str(b).strip()] + \
+               [n for n in c.get('catnos') or () if str(n).strip() and mc.norm_code(n) not in ('none', '')]
+    fitting = [x for x in scored if fits(x)]
+    bare = [x for x in fitting if not codes(x)]
+    if len(bare) != 1:
+        return None
+    for x in fitting:
+        if x is not bare[0] and any(mc.catno_printed(album, n) for n in (x.get('cand') or {}).get('catnos') or ()):
+            return None                       # a code of another IS printed: not codeless after all
+    return bare[0]
+
+
 def decide(album: dict, http, dm, *, mb_release_id: str = '', mb_discids=(), linked=(),
            mb_facts: dict | None = None, cfg: dict | None = None, ocr_text: str = '',
            scan_probe: dict | None = None, likely: bool = True) -> dict[str, Any]:
@@ -257,6 +394,7 @@ def decide(album: dict, http, dm, *, mb_release_id: str = '', mb_discids=(), lin
     linked = [str(x) for x in linked or () if str(x).isdigit()]
     discid_on = _disc_ids(album, http, mb_release_id, set(mb_discids or ()), linked)
 
+    misread = drop_misread_numbers(album)
     cands = tr.discogs_search(http, album, cfg, dm)
     if scan_probe:
         ids = {str(c.get('id')) for c in cands}
@@ -278,6 +416,9 @@ def decide(album: dict, http, dm, *, mb_release_id: str = '', mb_discids=(), lin
     out = {'status': status, 'best': best, 'scored': scored, 'why': list(res.get('why') or ()),
            'discid_on': discid_on, 'classified': status, 'runner_up': res.get('runner_up'),
            'margin': res.get('margin')}
+    if misread:
+        out['why'].append(f'{", ".join(map(str, misread))}: your barcode misread or mistyped, not read as a '
+                          f'catalogue number')
 
     if discid_on.startswith('other:'):
         # your disc ID is on another MusicBrainz release than the one Picard matched: the
@@ -290,6 +431,13 @@ def decide(album: dict, http, dm, *, mb_release_id: str = '', mb_discids=(), lin
             out['why'].insert(0, f'your disc ID is on MusicBrainz release {others[0]}, not the one '
                                  f'Picard matched: your files belong there')
             return out
+        pick, how = pick_discid_release(album, others, mb_facts, likely) if len(others) > 1 \
+            and len(album.get('tocs') or {}) == 1 else (None, '')
+        if pick:
+            out.update(status='move', move_to=pick)
+            out['why'].insert(0, f'your disc ID is on MusicBrainz releases {", ".join(others)}; '
+                                 f'{pick} is yours: {how}')
+            return out
         out['status'] = 'review'
         out['why'].insert(0, f'your disc ID is on MusicBrainz release {discid_on[6:]}, '
                              f'not the one Picard matched')
@@ -300,6 +448,14 @@ def decide(album: dict, http, dm, *, mb_release_id: str = '', mb_discids=(), lin
     if status == 'auto' and best is not None and rank and best.get('tracks_ok') \
             and all(x is best or proof_rank(x) < rank for x in proven):
         return out              # proven by your copy, and no other pressing as strongly
+    held = {str(best['cand'].get('id'))} if best and mc.R9_HELD in out['why'] else set()
+    first = proof_first(scored, cfg, held)
+    if first is not None:
+        out.update(status='auto', best=first)
+        out['why'].insert(0, f'only this pressing is proven by your copy '
+                             f'({"disc ID" if proof_rank(first) == 3 else "barcode"}), and nothing of '
+                             f'your copy is against it (TagMender\'s confidence {first.get("confidence", 0):.0f}%)')
+        return out
 
     def clean(x):
         return (x is not None and not x.get('clues_against') and not x.get('conflict')
@@ -324,7 +480,6 @@ def decide(album: dict, http, dm, *, mb_release_id: str = '', mb_discids=(), lin
         out['why'].insert(0, f'it carries the {what} of the MusicBrainz release Picard matched, '
                              f'and nothing of your copy is against it')
         return out
-    held = {str(best['cand'].get('id'))} if best and mc.R9_HELD in out['why'] else set()
     if proven:
         top_rank = max(proof_rank(x) for x in proven)
         tied = [x for x in proven if proof_rank(x) == top_rank]
@@ -339,6 +494,12 @@ def decide(album: dict, http, dm, *, mb_release_id: str = '', mb_discids=(), lin
                                  f'lists what your scans print: {what}')
             pick['notes'] = list(pick.get('notes') or []) + [f'printed on your scans, only this pressing: {what}']
             return out
+        lone = only_unopposed(tied) if likely else None
+        if lone is not None and str(lone['cand'].get('id')) not in held:
+            out.update(status='likely', best=lone, others=[x for x in tied if x is not lone])
+            out['why'].insert(0, f'{len(tied)} pressings carry what your copy proves; only this one has '
+                                 f'nothing of your copy against it, and {lone["clues"]["country"]}')
+            return out
     top, others = most_likely(scored, proven, held) if likely else (None, [])
     if top is not None and others:
         out.update(status='likely', best=top, others=others)
@@ -346,8 +507,18 @@ def decide(album: dict, http, dm, *, mb_release_id: str = '', mb_discids=(), lin
                              f'most likely ({top["confidence"]:.1f}% against '
                              f'{others[0]["confidence"]:.1f}% for {others[0]["cand"].get("id")})')
         return out
+    lone = codeless_pick(scored, album, cfg) if likely and not proven else None
+    if lone is not None:
+        out.update(status='likely', best=lone, others=[x for x in scored if x is not lone and x.get('tracks_ok')])
+        out['why'].insert(0, 'your copy prints no barcode or catalogue number (its back cover read '
+                             'whole), and only this pressing lists none')
+        return out
     if status == 'nomatch' or not scored:
         out['status'] = 'nomatch'
+    elif not proven and all(mc._ruled_out_by_copy(x) for x in scored):
+        out.update(status='nomatch', ruled_out=True)
+        out['why'].insert(0, 'Discogs lists no release your copy can be (each is a format or '
+                             'pressing your copy rules out)')
     else:
         out['status'] = 'review'
     return out

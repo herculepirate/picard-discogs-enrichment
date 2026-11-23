@@ -96,7 +96,7 @@ from .discogs_webenrich import apply_to_late_file as _web_late_file
 from .discogs_albumartist import apply_to_late_file as _aa_late_file
 from .discogs_albumartist import settle as settle_album_artist
 from .discogs_copy import refresh as refresh_copy, refresh_late as _copy_late, write_lrc
-from .discogs_ocr_bridge import OcrBridge, partial_message, unavailable_message
+from .discogs_ocr_bridge import OcrBridge, embedded_dir, partial_message, unavailable_message
 from . import discogs_mapping as _dm
 from .tm_readers import mb_linked_discogs_ids
 from .discogs_picker_dialog import DiscogsPickerDialog
@@ -926,6 +926,7 @@ def process_album(api, album, metadata, release) -> None:
     matched_artist = metadata.get('albumartist') or metadata.get('artist') or ''
     matched_title = metadata.get('album') or ''
     want_ocr = bool(settings.get('ocr_scans', True))
+    embedded = _embedded_art(album) if want_ocr else []
     max_images = int(settings.get('ocr_max_images') or 15)
 
     def _job():
@@ -939,11 +940,12 @@ def process_album(api, album, metadata, release) -> None:
         named_by = with_matched_names(album_d, matched_artist, matched_title)
         job = {'loc': loc, 'named_by': named_by, 'ocr': None, 'scans': None, 'merged': {}, 'verdict': None, 'http': None}
         scans = None
+        extra = _save_embedded_art(loc['album_dir'], embedded)
         if want_ocr:
             job['ocr'] = probe = OCR.probe()
             if probe.get('ok'):
                 scans = OCR.read(loc['album_dir'], max_images=max_images,
-                                 have_barcode=bool(album_d.get('barcodes')))
+                                 have_barcode=bool(album_d.get('barcodes')), extra=extra)
                 if not scans.get('ok'):
                     job['ocr'] = scans          # (it failed on this album: warned as unavailable)
         job['scans'] = scans
@@ -952,10 +954,31 @@ def process_album(api, album, metadata, release) -> None:
         if not has_copy_evidence(ev):
             return job
         http = job['http'] = PicardHttp(client, webservice)
-        job['verdict'] = decide(album_d, http, _dm, mb_release_id=getattr(album, 'id', '') or '',
-                                mb_discids=mb_discids, linked=all_linked, mb_facts=mb_facts,
-                                ocr_text=merged.get('text') or '', scan_probe=merged.get('probe'),
-                                likely=bool(settings['pick_likely']))
+
+        def _decide(a, m):
+            return decide(a, http, _dm, mb_release_id=getattr(album, 'id', '') or '',
+                          mb_discids=mb_discids, linked=all_linked, mb_facts=mb_facts,
+                          ocr_text=m.get('text') or '', scan_probe=m.get('probe'),
+                          likely=bool(settings['pick_likely']))
+
+        verdict = job['verdict'] = _decide(album_d, merged)
+        # undecided: the scans (and cover art) read again, harder, and decided again (Discogs'
+        # answers are cached, so deciding again costs few requests)
+        if verdict.get('status') in ('review', 'nomatch') and not verdict.get('ruled_out') \
+                and scans and scans.get('ok') and (scans.get('images') or extra):
+            deep = OCR.read(loc['album_dir'], max_images=max_images,
+                            have_barcode=bool(album_d.get('barcodes')), deep=True, extra=extra)
+            job['deep'] = deep
+            if deep.get('ok'):
+                again = read_copy(loc)
+                with_matched_names(again, matched_artist, matched_title)
+                merged2 = merge_scans(again, loc['album_dir'], deep)
+                http.budget += DEEP_EXTRA_REQUESTS
+                verdict2 = _decide(again, merged2)
+                job['deep_status'] = verdict2.get('status')
+                if verdict2.get('status') not in ('review', 'nomatch'):
+                    job.update(verdict=verdict2, merged=merged2, scans=deep,
+                               ev=copy_evidence(again))
         return job
 
     def _apply(release_id, why):
@@ -977,6 +1000,14 @@ def process_album(api, album, metadata, release) -> None:
                 _start()
                 return
             ev, verdict, http = result.get('ev'), result.get('verdict'), result.get('http')
+            if result.get('deep') is not None:
+                d = result['deep']
+                plugin_log.event(op, 'undecided after the first reading: scans read again, harder ('
+                                     + (f'{d.get("images", 0)} image(s), {d.get("embedded", 0)} embedded, '
+                                        f'{d.get("seconds", "?")} s; barcodes: '
+                                        f'{", ".join(d.get("deep_barcodes") or ()) or "none"}'
+                                        if d.get('ok') else f'failed: {d.get("error", "?")}')
+                                     + f') \u2014 decided again: {result.get("deep_status") or "-"}')
             _warn_ocr(op, result.get('ocr'), album)
             if result.get('named_by'):
                 plugin_log.detail(op, "your files carry no artist tag: Discogs is searched by the "
@@ -1012,6 +1043,9 @@ def process_album(api, album, metadata, release) -> None:
                 return
             elif status in ('review', 'move'):
                 _review(verdict, http)
+            elif verdict.get('ruled_out'):
+                plugin_log.decision(op, f'{verdict["why"][0]}: no Discogs data for this album '
+                                        f'(Search Discogs\u2026 to choose one anyway)')
             else:
                 plugin_log.decision(op, 'TagMender found no Discogs release; trying the plain search')
                 _start()
@@ -1042,6 +1076,52 @@ def process_album(api, album, metadata, release) -> None:
     Worker.shared().submit(_job, _done)
 
 
+
+
+# a deep reading may search the new codes it read: this many more Discogs requests
+DEEP_EXTRA_REQUESTS = 10
+# embedded cover art: at most this many images per album, each at least this many bytes
+EMBEDDED_MAX = 6
+EMBEDDED_MIN_BYTES = 20_000
+
+
+def _embedded_art(album) -> list:
+    """The cover art embedded in the album's files (front, back, disc ...), each image once - on
+    Picard's thread, where the files' tags are."""
+    import hashlib
+    out, seen = [], set()
+    for f in album.iterfiles():
+        for img in getattr(getattr(f, 'orig_metadata', None), 'images', None) or ():
+            try:
+                data = img.data
+            except Exception:
+                continue
+            if not data or len(data) < EMBEDDED_MIN_BYTES:
+                continue
+            key = hashlib.md5(data).hexdigest()
+            if key not in seen:
+                seen.add(key)
+                out.append((key, data, str(getattr(img, 'mimetype', '') or '')))
+            if len(out) >= EMBEDDED_MAX:
+                return out
+    return out
+
+
+def _save_embedded_art(album_dir: str, images) -> list:
+    """Embedded cover art saved where the OCR helper reads it (on the worker); [] for none."""
+    if not images:
+        return []
+    import hashlib
+    folder = embedded_dir(hashlib.md5(str(album_dir).encode()).hexdigest())
+    try:
+        folder.mkdir(parents=True, exist_ok=True)
+        for key, data, mime in images:
+            path = folder / f'{key}{".png" if "png" in mime else ".jpg"}'
+            if not path.exists():
+                path.write_bytes(data)
+    except OSError:
+        return []
+    return [str(folder)]
 
 
 # album folders already moved to the MusicBrainz release their disc ID is on (never twice)

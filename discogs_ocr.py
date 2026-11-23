@@ -40,6 +40,7 @@ def merge_scans(album: dict, album_dir: str, scans: dict | None) -> dict:
             out['barcodes_from_scans'] = sorted(found)
         album['scan_barcodes'] = set(found)
         album['scans_complete'] = bool(scans.get('complete'))
+        album['scan_names'] = [str(n) for n in scans.get('image_names') or ()]
         docs_txt = _txt(scans.get('docs_text'))
     else:
         try:

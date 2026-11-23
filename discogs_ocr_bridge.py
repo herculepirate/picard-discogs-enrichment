@@ -90,12 +90,23 @@ class OcrBridge:
                 self._probe, self._probed = p, time.monotonic()
             return dict(self._probe)
 
-    def read(self, album_dir: str, *, max_images: int = 15, have_barcode: bool = False) -> dict:
+    def read(self, album_dir: str, *, max_images: int = 15, have_barcode: bool = False,
+             deep: bool = False, extra=()) -> dict:
         args = ['--album', str(album_dir), '--max-images', str(int(max_images)),
                 '--cache', str(cache_file())]
         if have_barcode:
             args.append('--have-barcode')
+        if deep:
+            args.append('--deep')
+        for d in extra or ():
+            args += ['--extra', str(d)]
         return _run(args, ALBUM_TIMEOUT_S, self._runner)
+
+
+def embedded_dir(key: str) -> Path:
+    """Where an album's embedded cover art is saved for the helper (your home, which the helper
+    and a Flatpak Picard both see)."""
+    return cache_file().parent / 'embedded' / key
 
 
 def unavailable_message(probe: dict) -> str:

@@ -135,6 +135,8 @@ def main(argv=None) -> int:
     ap.add_argument('root', help='a music folder')
     ap.add_argument('--ocr', action='store_true', help="read the scans (the OCR helper)")
     ap.add_argument('--decide', action='store_true', help='ask Discogs what the plugin would decide')
+    ap.add_argument('--deep', action='store_true',
+                    help='undecided: read the scans again, harder, and decide again (as the plugin does)')
     ap.add_argument('--limit', type=int, default=0, help='albums at most (0: all)')
     ap.add_argument('--only-evidence', action='store_true',
                     help='decide only albums whose copy says something of its pressing')
@@ -182,7 +184,18 @@ def main(argv=None) -> int:
         line = f'{loc["artist_folder"]} / {loc["album_folder"]}'
         status = ''
         if http and (has or not args.only_evidence):
-            r = dd.decide(album, http, dm, ocr_text=merged.get('text') or '', scan_probe=merged.get('probe'))
+            r = dd.decide(album, http, dm, ocr_text=merged.get('text') or '', scan_probe=merged.get('probe'),
+                          likely=True)
+            if args.deep and ocr and r['status'] in ('review', 'nomatch') and not r.get('ruled_out') \
+                    and scans and scans.get('ok') and scans.get('images'):
+                deep = ocr.read(loc['album_dir'], have_barcode=bool(album.get('barcodes')), deep=True)
+                print(f'          deep reading: {deep.get("seconds")} s, barcodes '
+                      f'{deep.get("deep_barcodes") or "none"}; first verdict {r["status"]}')
+                if deep.get('ok'):
+                    again = de.read_copy(loc)
+                    merged2 = do.merge_scans(again, loc['album_dir'], deep)
+                    r = dd.decide(again, http, dm, ocr_text=merged2.get('text') or '',
+                                  scan_probe=merged2.get('probe'), likely=True)
             status = r['status']
             counts[status] += 1
             c = (r.get('best') or {}).get('cand') or {}

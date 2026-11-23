@@ -26,7 +26,7 @@ from .discogs_runtime import log
 
 # Discogs requests one automatic look-up may make (searches and release details); Picard
 # sends them one a second, which is Discogs' limit of 60 a minute.
-AUTO_BUDGET = 15
+AUTO_BUDGET = 25
 # How long one request is waited for before it counts as failed.
 TIMEOUT_S = 90
 

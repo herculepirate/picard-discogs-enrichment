@@ -271,3 +271,120 @@ class PickerRows(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class NoInterventionRules(unittest.TestCase):
+    """0.9.0: the rules that decide without asking you, each with the case it must not decide."""
+
+    CFG = dd._cfg()
+
+    def _s(self, rid, conf=90.0, clues=None, code='', against=None, **kw):
+        return dict({'cand': {'id': rid}, 'confidence': conf, 'clues': clues or {}, 'code': code,
+                     'clues_against': against or [], 'tracks_ok': True,
+                     'artist_sim': 1.0, 'title_sim': 1.0}, **kw)
+
+    def test_compound_discogs_countries(self):
+        self.assertEqual(dd.mc.country_code('UK & Europe'), 'XE')
+        self.assertEqual(dd.mc.country_code('Germany, Austria, & Switzerland'), 'DE')
+        self.assertEqual(dd.mc.country_code('UK'), 'GB')
+        self.assertEqual(dd.mc.country_code(''), '')
+
+    def test_barcode_misread_is_no_catalogue_number(self):
+        album = {'barcodes': {'5052498647958'}, 'catnos': {'5053498647958', 'R2 647958'}}
+        self.assertEqual(dd.drop_misread_numbers(album), ['5053498647958'])
+        self.assertEqual(album['catnos'], {'R2 647958'})
+        # a valid barcode, or one two digits off, is left as it is
+        album = {'barcodes': {'5052498647958'}, 'catnos': {'5053498647959', '5052498647958'}}
+        self.assertEqual(dd.drop_misread_numbers(album), [])
+
+    def test_disc_id_on_two_releases_the_cd_of_the_matched_number(self):
+        album = {'discid_mb': {
+            'a': {'catnos': ['PEL 349'], 'formats': ['CD'], 'barcode': ''},
+            'b': {'catnos': ['PEL 350CD'], 'formats': ['CD'], 'barcode': ''}}}
+        mbid, _ = dd.pick_discid_release(album, ['a', 'b'], {'catalognumber': 'PEL 350'}, likely=True)
+        self.assertEqual(mbid, 'b')
+        # "most likely" off: you are asked
+        self.assertIsNone(dd.pick_discid_release(album, ['a', 'b'], {'catalognumber': 'PEL 350'}, likely=False)[0])
+        # both agree with the matched number: you are asked
+        album['discid_mb']['a']['catnos'] = ['PEL 350']
+        self.assertIsNone(dd.pick_discid_release(album, ['a', 'b'], {'catalognumber': 'PEL 350'}, likely=True)[0])
+
+    def test_disc_id_on_two_releases_your_barcode_decides(self):
+        album = {'barcodes': {'0123456789012'}, 'discid_mb': {
+            'a': {'catnos': [], 'formats': ['CD'], 'barcode': '0123456789012'},
+            'b': {'catnos': [], 'formats': ['CD'], 'barcode': '0999999999999'}}}
+        self.assertEqual(dd.pick_discid_release(album, ['a', 'b'], {}, likely=False)[0], 'a')
+
+    def test_proof_first_takes_the_one_disc_id_pressing(self):
+        disc = self._s(2, 82, clues={'disc TOC': 'disc ID matches'})
+        rest = [self._s(i, 82) for i in (1, 3, 4)]
+        self.assertIs(dd.proof_first(rest + [disc], self.CFG), disc)
+
+    def test_proof_first_not_when_another_is_proven_as_strongly(self):
+        a = self._s(1, 82, clues={'disc TOC': 'x'})
+        b = self._s(2, 82, clues={'disc TOC': 'x'})
+        self.assertIsNone(dd.proof_first([a, b], self.CFG))
+
+    def test_proof_first_not_with_anything_against_or_another_title(self):
+        a = self._s(1, 82, clues={'disc TOC': 'x'}, against=['scans say made in DE'])
+        self.assertIsNone(dd.proof_first([a], self.CFG))
+        b = self._s(1, 82, clues={'disc TOC': 'x'}, title_sim=0.5)
+        self.assertIsNone(dd.proof_first([b], self.CFG))
+        c = self._s(1, 82, clues={'disc TOC': 'x'})
+        self.assertIsNone(dd.proof_first([c], self.CFG, held={'1'}))
+
+    def test_proof_first_never_on_a_catalogue_number_alone(self):
+        a = self._s(1, 82, code='catalogue number')
+        self.assertIsNone(dd.proof_first([a], self.CFG))
+
+    def test_only_unopposed_with_its_country_printed(self):
+        eu = self._s(1, 99, clues={'country': 'made in the EU on the scans (a European pressing)'})
+        others = [self._s(i, 99, against=['scans say made in XE, this pressing is from Taiwan']) for i in (2, 3)]
+        self.assertIs(dd.only_unopposed([eu] + others), eu)
+        # nothing printed for it: not enough
+        bare = self._s(1, 99)
+        self.assertIsNone(dd.only_unopposed([bare] + others))
+        # two unopposed: not decided
+        self.assertIsNone(dd.only_unopposed([eu, self._s(4, 99)] + others))
+
+
+class DeepReading(unittest.TestCase):
+    def test_only_words_tesseract_is_sure_of(self):
+        import discogs_ocr_helper as h
+        head = 'level\tpage_num\tblock_num\tpar_num\tline_num\tword_num\tleft\ttop\twidth\theight\tconf\ttext'
+        rows = [head,
+                '5\t1\t1\t1\t1\t1\t0\t0\t9\t9\t96.1\tPEL',
+                '5\t1\t1\t1\t1\t2\t0\t0\t9\t9\t91.0\t350CD',
+                '5\t1\t1\t1\t1\t3\t0\t0\t9\t9\t12.0\tqzx',
+                '5\t1\t1\t1\t2\t1\t0\t0\t9\t9\t30.0\tAS',
+                '5\t1\t1\t1\t2\t2\t0\t0\t9\t9\t22.0\t274']
+        self.assertEqual(h._sure_words('\n'.join(rows)), 'PEL 350CD')
+
+
+class CodelessCopy(unittest.TestCase):
+    CFG = dd._cfg()
+
+    def _s(self, rid, barcodes=(), catnos=(), **kw):
+        return dict({'cand': {'id': rid, 'barcodes': list(barcodes), 'catnos': list(catnos)},
+                     'confidence': 100.0, 'clues': {}, 'code': '', 'clues_against': [],
+                     'tracks_ok': True, 'artist_sim': 1.0, 'title_sim': 1.0}, **kw)
+
+    def _album(self, **kw):
+        return dict({'scans_complete': True, 'scan_barcodes': set(), 'barcodes': set(),
+                     'scan_names': ['Back.png', 'Front.png'], 'printed_text': 'NEW DAY\nHOME'}, **kw)
+
+    def test_the_one_pressing_that_lists_no_code(self):
+        bare = self._s(5220713)
+        scored = [bare, self._s(8876415, catnos=['pdip6537']), self._s(36205219, catnos=['rbdc12302'])]
+        self.assertIs(dd.codeless_pick(scored, self._album(), self.CFG), bare)
+
+    def test_not_without_a_back_cover_read_whole(self):
+        scored = [self._s(1), self._s(2, catnos=['abc123'])]
+        self.assertIsNone(dd.codeless_pick(scored, self._album(scan_names=['Front.png']), self.CFG))
+        self.assertIsNone(dd.codeless_pick(scored, self._album(scans_complete=False), self.CFG))
+        self.assertIsNone(dd.codeless_pick(scored, self._album(barcodes={'0123'}), self.CFG))
+
+    def test_not_when_two_list_no_code_or_another_code_is_printed(self):
+        self.assertIsNone(dd.codeless_pick([self._s(1), self._s(2)], self._album(), self.CFG))
+        scored = [self._s(1), self._s(2, catnos=['PDIP-6537'])]
+        self.assertIsNone(dd.codeless_pick(scored, self._album(printed_text='PDIP-6537'), self.CFG))

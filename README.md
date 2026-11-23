@@ -273,9 +273,12 @@ What it does with them, when your copy says anything of its pressing:
    | | |
    | --- | --- |
    | **Proven** | TagMender is sure *and* your copy proves the pick: your disc ID, your barcode or your catalogue number, with no other pressing proven as strongly (a disc ID beats a barcode, a barcode a catalogue number; a number two pressings share proves neither) |
+   | **Only one proven** | Your disc ID or barcode is on exactly one candidate, it fits every track, its artist and title are the album's, and nothing of your copy is against it — even when TagMender's overall confidence is under 90% (five pressings of one album at 82%, one of them with your exact disc ID) |
    | **Linked** | MusicBrainz links that Discogs release to the release Picard matched, and nothing of your copy is against it |
    | **Same as MusicBrainz** | It carries the matched MusicBrainz release's barcode (or its catalogue number and year), and nothing of your copy is against it |
    | **Printed on your scans** | Several pressings carry what your copy proves (one barcode on a 1994 and a 1999 run), and only one of them lists a mark your scans print: a copyright line (*"© 1994 Movieplay S.A."*), a rights society (SPA, MCPS, GEMA …) or a matrix code. If a mark another pressing lists is printed too, you are asked |
+   | **Only one unopposed** | Several pressings carry your barcode, and only one has nothing of your copy against it *and* its country printed on your scans (*"Made in the EU"* on a *UK & Europe* pressing, the Taiwan, Brazil and Mexico runs of the same barcode ruled out). Under **"…take the most likely"** |
+   | **No code printed** | Your back cover was scanned and read whole, no barcode is on it or in your tags, and of the pressings that fit only one lists neither a barcode nor a catalogue number (a codeless promo-style CD, not the Japanese or reissue pressings that print theirs). Under **"…take the most likely"** |
    | **Most likely** | Several pressings carry what your copy proves and nothing printed tells them apart, but TagMender scores one clearly highest (at least 90%, a point or more ahead): its year, country, label and track lengths fit best. The others are named in the log. Turn off with **"When several pressings share my proof, take the most likely"** |
 
    An unofficial release (a bootleg) is taken only when no official release
@@ -286,9 +289,27 @@ What it does with them, when your copy says anything of its pressing:
    took the vinyl, you ripped the CD), your files are moved to that release —
    as Picard's own disc lookup would put them — and the album left empty is
    removed; the right release then loads and is looked up afresh, so its
-   media, barcode and Grouping are your copy's too. On several releases, or
-   for a copy of more than one disc, you are asked. Turn off with **"Move my
+   media, barcode and Grouping are your copy's too. On several releases the one
+   whose barcode is yours, or whose catalogue number is printed on your scans,
+   is taken; failing that (under **"…take the most likely"**) the one CD among
+   them with the matched release's catalogue number (PEL 350 → *PEL 350CD*, not
+   *PEL 349*). Otherwise, or for a copy of more than one disc, you are asked. Turn off with **"Move my
    files to the MusicBrainz release my disc ID is on"**.
+
+   **Read again, harder.** When the first reading leaves the pressing
+   undecided, the scans — and the cover art embedded in your files — are read
+   again: every page in all four turns, its small print in tiles, barcodes
+   enlarged and thresholded, the barcode's digits even when your tags carry
+   one. Then it is decided again.
+
+   **Nothing your copy can be.** When every Discogs entry is one your copy
+   rules out (only an MP3 download, for a CD rip), the album gets no Discogs
+   data and no picker opens.
+
+   A 12–13 digit "catalogue number" one digit off your decoded barcode, and no
+   valid barcode itself, is a misread or mistyped barcode: it is not held
+   against every pressing. Discogs' compound countries (*UK & Europe*) count as
+   Europe.
 
 5. **Otherwise you choose.** The release picker opens with TagMender's
    candidates, best first; its Match column shows TagMender's confidence and
@@ -349,7 +370,10 @@ set takes a minute or two the first time — and kept in a cache
 (`~/.var/app/org.musicbrainz.Picard/cache/discogs-enrichment/ocr.sqlite` for
 the Flatpak). A page tesseract reads poorly as a whole (a busy back cover:
 a barcode, a grey panel, columns of credits) is read again in tiles, smoothed
-and enlarged, for its small print — the copyright line at its foot. A barcode
+and enlarged, for its small print — the copyright line at its foot. Cover
+art embedded in your audio files is read as a scan. When that first reading
+leaves the pressing undecided, everything is read again, harder (see above),
+and cached too. A barcode
 decoded off a scan is your copy's own, as a tag would be; the codes printed on the scans are searched too, and the page text is
 scored against every candidate. Nothing is sent anywhere.
 
