@@ -45,10 +45,13 @@ MODULES = {
     "ma": "match_albums.py",
     "engine": "engine.py",
     "web": "web_tag.py",
+    "comp": "compilations.py",
+    "cls": "classical.py",
 }
 # other spellings of the same modules in TagMender's imports
 ALIASES = {"exclusions": "ex", "match_albums": "ma", "engine": "engine", "tagio": "tagio",
-           "companions": "companions", "ocr_order": "ocr_order", "web_tag": "web"}
+           "companions": "companions", "ocr_order": "ocr_order", "web_tag": "web",
+           "compilations": "comp", "classical": "cls"}
 
 # what the plugin calls (through discogs_evidence.py); everything they reach comes along
 ROOTS = {
@@ -78,6 +81,31 @@ WEB_ROOTS = {
         "wikidata_artist_ids", "artist_ids",
     ],
 }
+
+# what TagMender's album_artist.py (copied whole as tm_album_artist.py) takes from its neighbours
+AA_DEP_ROOTS = {"comp": ["is_various"], "cls": ["genre_kind"]}
+# album_artist.py's own imports of them, and what they become
+AA_IMPORTS = (
+    ("import compilations\n",
+     "try:\n    from . import tm_album_artist_deps as compilations\n"
+     "except ImportError:  # run outside Picard (tests)\n    import tm_album_artist_deps as compilations\n"),
+    ("    import classical as _cls\n", "    _cls = compilations  # (vendored: genre_kind is in tm_album_artist_deps)\n"),
+)
+
+
+def _album_artist(root: Path, hdr: str) -> str:
+    """TagMender's album_artist.py as it is, its two imports pointed at tm_album_artist_deps."""
+    text = (root / "album_artist.py").read_text()
+    for old, new in AA_IMPORTS:
+        if old not in text:
+            raise SystemExit(f"vendor_tagmender: album_artist.py no longer has {old.strip()!r}")
+        text = text.replace(old, new)
+    future = "from __future__ import annotations\n"
+    if future not in text:
+        raise SystemExit("vendor_tagmender: album_artist.py no longer imports annotations from __future__")
+    # (one docstring may come before a __future__ import: the header's; TagMender's own follows)
+    return hdr + "# flake8: noqa\n" + future + text.replace(future, "", 1)
+
 
 # what discogs_ocr_helper.py calls, on your system's Python (not Picard's)
 OCR_ROOTS = {
@@ -216,12 +244,14 @@ def build(root: Path) -> dict[str, str]:
     core = (root / "match_core.py").read_text()
     head, version = _git_head(root), _version(root)
     sources = ", ".join(f"{f} @ {hashlib.sha1((root / f).read_bytes()).hexdigest()[:10]}"
-                        for f in ["match_core.py", *MODULES.values()])
+                        for f in ["match_core.py", *MODULES.values(), "album_artist.py"])
     hdr = HEADER.format(version=version, head=head, sources=sources)
     return {"tm_match_core.py": hdr + core,
             "tm_readers.py": _closure(mods, ROOTS, hdr),
             "tm_ocr.py": _closure(mods, OCR_ROOTS, hdr),
             "tm_web.py": _closure(mods, WEB_ROOTS, hdr),
+            "tm_album_artist.py": _album_artist(root, hdr),
+            "tm_album_artist_deps.py": _closure(mods, AA_DEP_ROOTS, hdr),
             "tm_ocr_order.json": (root / "assets" / "ocr_order.json").read_text()}
 
 

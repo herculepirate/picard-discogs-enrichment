@@ -93,6 +93,8 @@ from .discogs_ocr import merge_scans, scans_summary
 from .discogs_webenrich import (CoverArtProviderWeb, WebTagClusterAction, drop_web_fills,
                                 enrich_album)
 from .discogs_webenrich import apply_to_late_file as _web_late_file
+from .discogs_albumartist import apply_to_late_file as _aa_late_file
+from .discogs_albumartist import settle as settle_album_artist
 from .discogs_ocr_bridge import OcrBridge, partial_message, unavailable_message
 from . import discogs_mapping as _dm
 from .tm_readers import mb_linked_discogs_ids
@@ -442,6 +444,18 @@ def _forget_applied(album) -> None:
 
 
 def apply_to_late_file(api, track, file) -> None:
+    """A file attached after the album's look-ups finished: the Discogs data, then the album
+    artist chosen (TagMender's lead-artist rule)."""
+    try:
+        _apply_discogs_to_late_file(api, track, file)
+    finally:
+        try:
+            _aa_late_file(track, file)
+        except Exception:
+            log.debug('Discogs Enrichment: album artist for a late file failed', exc_info=True)
+
+
+def _apply_discogs_to_late_file(api, track, file) -> None:
     """Give a newly attached file the Discogs data its album already has.
 
     Registered as a file-post-addition-to-track processor. Without it, a file
@@ -663,6 +677,13 @@ def process_album(api, album, metadata, release) -> None:
         enrich_album(album, metadata, release, op, _album_metadata_targets, _refresh_album_ui)
     except Exception:
         log.error('Discogs Enrichment: web sources failed to start', exc_info=True)
+    # the album artist as TagMender files it (lead artist, a band named after a member)
+    try:
+        settle_album_artist(album, metadata, release, op, _album_metadata_targets, _refresh_album_ui,
+                            DiscogsClient(album.tagger.webservice, settings['token'])
+                            if settings['token'] else None)
+    except Exception:
+        log.error('Discogs Enrichment: album artist failed to start', exc_info=True)
 
     if (settings['merge_mode'] or MODE_COMBINE) == MODE_MB_ONLY:
         plugin_log.decision(op, 'tag source is MusicBrainz only \u2014 no Discogs lookup')
@@ -763,6 +784,12 @@ def process_album(api, album, metadata, release) -> None:
             # by apply_to_late_file(), which needs the same field set.
             _remember_applied(album, fields, track_fields, disc_count)
             _refresh_album_ui(album)
+            # Discogs may have written its own credit: the album artist is chosen again from it
+            try:
+                settle_album_artist(album, metadata, release, op, _album_metadata_targets,
+                                    _refresh_album_ui, client)
+            except Exception:
+                log.error('Discogs Enrichment: album artist failed to start', exc_info=True)
             log.info('Discogs Enrichment: applied fields %r to album %r (%d target(s))',
                      list(fields.keys()), album, len(targets))
 
@@ -1327,6 +1354,29 @@ class DiscogsOptionsPage(OptionsPage):
                     self.ocr_scans_checkbox):
             layout.addWidget(box)
 
+        # --- album artist ------------------------------------------------
+        layout.addWidget(_section_label(self, 'Album artist (as TagMender files it)'))
+        self.aa_lead_checkbox = QtWidgets.QCheckBox('Lead artist only', self)
+        self.aa_lead_checkbox.setToolTip(
+            'Thomas Str\u00f8nen & Time Is a Blind Guide: the album artist is Thomas Str\u00f8nen (and\n'
+            'the album is filed in his folder); the Artist tags keep the whole credit. A collaboration\n'
+            'of equals (Calexico and Iron & Wine), various artists and classical albums are kept.')
+        self.aa_bands_checkbox = QtWidgets.QCheckBox('Bands named after a member', self)
+        self.aa_bands_checkbox.setToolTip(
+            'Steve Morse Band, Pat Metheny Group, The Jimi Hendrix Experience: filed under that\n'
+            'member, when MusicBrainz (else Discogs) lists them as a member. Deep Purple stays\n'
+            'Deep Purple; The Marshall Tucker Band (no member of that name) stays as it is.')
+        self.aa_file_under_edit = QtWidgets.QPlainTextEdit(self)
+        self.aa_file_under_edit.setPlaceholderText('Your own album artists, one per line:\n'
+                                                   'Dregs = Dixie Dregs\nBen Folds Five = Ben Folds Five')
+        self.aa_file_under_edit.setToolTip(
+            'Credit = Album artist, over the rules above. Credit = Credit keeps one as credited.')
+        self.aa_file_under_edit.setFixedHeight(70)
+        self.aa_lead_checkbox.toggled.connect(self.aa_bands_checkbox.setEnabled)
+        self.aa_lead_checkbox.toggled.connect(self.aa_file_under_edit.setEnabled)
+        for w in (self.aa_lead_checkbox, self.aa_bands_checkbox, self.aa_file_under_edit):
+            layout.addWidget(w)
+
         # --- web sources -------------------------------------------------
         layout.addWidget(_section_label(self, 'Web sources (where MusicBrainz and Discogs fall short)'))
         self.web_sources_checkbox = QtWidgets.QCheckBox(
@@ -1535,6 +1585,9 @@ class DiscogsOptionsPage(OptionsPage):
         self.ocr_scans_checkbox.setChecked(True)
         self.pick_likely_checkbox.setChecked(True)
         self.web_sources_checkbox.setChecked(False)
+        self.aa_lead_checkbox.setChecked(True)
+        self.aa_bands_checkbox.setChecked(True)
+        self.aa_file_under_edit.setPlainText('')
         self.web_source_list_edit.setText('')
         self.web_lyrics_checkbox.setChecked(False)
         self.web_synced_checkbox.setChecked(False)
@@ -1578,6 +1631,11 @@ class DiscogsOptionsPage(OptionsPage):
         self.ocr_scans_checkbox.setChecked(bool(s['ocr_scans']))
         self.pick_likely_checkbox.setChecked(bool(s['pick_likely']))
         self.web_sources_checkbox.setChecked(bool(s['web_sources']))
+        self.aa_lead_checkbox.setChecked(bool(s['aa_lead']))
+        self.aa_bands_checkbox.setChecked(bool(s['aa_bands']))
+        self.aa_file_under_edit.setPlainText(str(s['aa_file_under'] or ''))
+        self.aa_bands_checkbox.setEnabled(self.aa_lead_checkbox.isChecked())
+        self.aa_file_under_edit.setEnabled(self.aa_lead_checkbox.isChecked())
         self.web_source_list_edit.setText(str(s['web_source_list'] or ''))
         self.web_lyrics_checkbox.setChecked(bool(s['web_lyrics']))
         self.web_synced_checkbox.setChecked(bool(s['web_synced_lyrics']))
@@ -1621,6 +1679,9 @@ class DiscogsOptionsPage(OptionsPage):
         s['ocr_scans'] = self.ocr_scans_checkbox.isChecked()
         s['pick_likely'] = self.pick_likely_checkbox.isChecked()
         s['web_sources'] = self.web_sources_checkbox.isChecked()
+        s['aa_lead'] = self.aa_lead_checkbox.isChecked()
+        s['aa_bands'] = self.aa_bands_checkbox.isChecked()
+        s['aa_file_under'] = self.aa_file_under_edit.toPlainText()
         s['web_source_list'] = self.web_source_list_edit.text().strip()
         s['web_lyrics'] = self.web_lyrics_checkbox.isChecked()
         s['web_synced_lyrics'] = self.web_synced_checkbox.isChecked()

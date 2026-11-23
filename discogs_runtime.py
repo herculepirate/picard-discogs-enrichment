@@ -66,6 +66,11 @@ DEFAULTS: dict[str, Any] = {
     # your scans and PDF booklets read (OCR, on your system's Python: discogs_ocr_helper)
     'ocr_scans': True,
     'ocr_max_images': 15,
+    # the album artist as TagMender files it (discogs_albumartist): the lead artist alone, a band
+    # named after a member under that member, your own "Credit = Album artist" lines
+    'aa_lead': True,
+    'aa_bands': True,
+    'aa_file_under': '',
     # web sources (discogs_web): off by default. Fill empty genres/credits and add cover art from
     # the first source that proves the album; lyrics from LRCLIB where a track has none.
     'web_sources': False,

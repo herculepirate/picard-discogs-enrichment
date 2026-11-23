@@ -350,6 +350,25 @@ PDF booklets (OCR)"**.
 
 ---
 
+## Album artist
+
+The album artist is filed as TagMender files it (its `album_artist.py`,
+copied as `tm_album_artist.py`); the **Artist** tags always keep the credit
+as it is. Under **Options → Plugins → Discogs Enrichment → Album artist**:
+
+| Option | What it does |
+| --- | --- |
+| **Lead artist only** (on) | A joint credit's first artist is the album artist: *Thomas Strønen & Time Is a Blind Guide* → *Thomas Strønen*. A collaboration of equals (*Calexico and Iron & Wine*), various artists and classical albums are kept whole |
+| **Bands named after a member** (on) | *The Jimi Hendrix Experience*, *Pat Metheny Group*, *Steve Morse Band*, *Tom Petty and the Heartbreakers* → that member — only when MusicBrainz (else Discogs) lists that person as a member. *Deep Purple* and *The Marshall Tucker Band* stay |
+| **Your own album artists** | `Credit = Album artist` lines over both rules (`Dregs = Dixie Dregs`); `Ben Folds Five = Ben Folds Five` keeps one as credited |
+
+The album artist's sort name and MusicBrainz ID follow the member's; one not
+known is removed rather than left naming the band. The band's members are
+asked of MusicBrainz once a session; when MusicBrainz cannot be reached the
+album artist is left as it is. It is chosen when MusicBrainz matches the
+album and again after Discogs writes its own credit, so your file-naming
+script (`%albumartist%`) files the album under the member.
+
 ## Web sources
 
 Off by default: **Options → Plugins → Discogs Enrichment → Web sources**.
@@ -443,7 +462,7 @@ Pure logic lives in `discogs_mapping.py`, `discogs_evidence.py` and
 `discogs_decide.py` with no Qt
 or Picard imports, so it can be tested directly (`python3 tests/test_*.py`).
 
-`tm_match_core.py`, `tm_readers.py`, `tm_ocr.py`, `tm_web.py` and `tm_ocr_order.json` are
+`tm_match_core.py`, `tm_readers.py`, `tm_ocr.py`, `tm_web.py`, `tm_album_artist.py`, `tm_album_artist_deps.py` and `tm_ocr_order.json` are
 **generated** from a
 [TagMender](https://github.com/herculepirate/tagmender) checkout by
 `tools/vendor_tagmender.py`: its pressing scorer verbatim, and the folder
@@ -472,8 +491,10 @@ discogs_ocr_helper.py    reads the scans on your system's Python; prints JSON
 discogs_ocr_bridge.py    starts the helper (flatpak-spawn --host in a Flatpak)
 discogs_ocr.py           pure logic — what the scans read, added as TagMender adds it
 tm_web.py                generated from TagMender: web sources (web_tag)
+tm_album_artist*.py      generated from TagMender: album_artist.py, as it is
 discogs_web.py           pure logic — web sources, VGMdb, LRCLIB, the proof
 discogs_webenrich.py     web sources in Picard: fills, lyrics, cover art, cluster action
+discogs_albumartist.py   the album artist as TagMender files it (tm_album_artist.py)
 tools/vendor_tagmender.py  regenerates the tm_* files
 tools/library_check.py   what the plugin reads and decides, over a music folder
 discogs_client.py        Discogs API over Picard's web service

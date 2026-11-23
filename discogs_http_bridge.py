@@ -44,6 +44,7 @@ class PicardHttp:
         self.used = 0
         self.spent = False
         self.releases: dict[str, dict] = {}
+        self.last_status = 0
 
     def _wait(self, start: Callable[[Callable], None]) -> tuple[Any, Any]:
         """Run START(done) on the main thread; block until done(document, reply, error)."""
@@ -54,6 +55,11 @@ class PicardHttp:
 
         def done(document, reply, error):
             box['document'], box['error'] = document, error
+            try:
+                from PyQt6.QtNetwork import QNetworkRequest
+                box['status'] = int(reply.attribute(QNetworkRequest.Attribute.HttpStatusCodeAttribute) or 0)
+            except Exception:
+                box['status'] = 0
             finished.set()
 
         def begin():
@@ -66,8 +72,21 @@ class PicardHttp:
         to_main(begin)
         if not finished.wait(TIMEOUT_S):
             log.warning('Discogs Enrichment: no answer within %d s; carrying on without it', TIMEOUT_S)
+            self.last_status = 0
             return None, 'timeout'
+        self.last_status = box.get('status', 0)
         return box.get('document'), box.get('error')
+
+    def get_json_or_raise(self, url: str) -> dict | None:
+        """A MusicBrainz (or other non-Discogs) answer: the document, None for "no such thing"
+        (404), and OSError when the site could not be asked - which TagMender's album-artist
+        code reads as "unknown" (the credit is kept) rather than "no members"."""
+        document, error = self._wait(lambda done: self._send(url, 'json', done))
+        if not error and isinstance(document, dict):
+            return document
+        if getattr(self, 'last_status', 0) == 404:
+            return None
+        raise OSError(f'not answered: {error!r}')
 
     def get_json(self, url: str, host: str) -> dict | None:
         if host == 'discogs' and self.client is None:

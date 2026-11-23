@@ -2,7 +2,7 @@ uuid = "dd789f69-332f-498a-af94-d8e3273cc435"
 name = "Discogs Enrichment"
 description = "Tag from Discogs alongside or instead of MusicBrainz, with a release picker, box-set disc mapping and cover art."
 api = ["3.0"]
-version = "0.5.1"
+version = "0.6.0"
 authors = ["herculepirate"]
 maintainers = ["herculepirate"]
 license = "GPL-2.0-or-later"
@@ -16,13 +16,9 @@ MusicBrainz covers thinly — specific pressings, small labels, reissues and
 box sets.
 
 **Choosing a release.** Searching Discogs opens a sortable table, not
-the top hit: artist, title, year, country, medium, disc and
-track counts, edition markers (Reissue, Remastered, Deluxe), label,
-catalogue number and community have/want counts. A Match column scores each
-candidate against what Picard already knows — barcode, catalogue number,
-year, country and medium — and says which facts agreed. Search by any field
-Discogs supports, or paste a release ID or URL; a search that finds nothing
-widens itself and says how.
+the top hit: year, country, medium, edition, label, catalogue number and
+have/want counts, with a Match column saying which facts agreed. Search by
+any field, or paste a release ID or URL.
 
 **Reads your copy.** The album's folder says which pressing you own:
 catalogue numbers in its name, rip logs and cue sheets whose disc ID fits your
@@ -36,6 +32,10 @@ it. Otherwise the release picker asks you, one album at a time.
 **The web, off by default.** Empty genres and credits, cover art, lyrics and
 albums no database has, from Deezer, iTunes, Bandcamp, Wikipedia, VGMdb and
 LRCLIB, each only when every track's length fits your files.
+
+**Album artist as TagMender files it.** The lead artist alone, and a band
+named after a member under that member (Pat Metheny Group: Pat Metheny);
+the Artist tags keep the credit.
 
 **Four tag sources.** Discogs only, MusicBrainz only, Discogs preferred, or
 MusicBrainz preferred. Each is exact about what it overwrites and what it
