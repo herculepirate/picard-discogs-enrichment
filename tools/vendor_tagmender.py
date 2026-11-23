@@ -47,11 +47,16 @@ MODULES = {
     "web": "web_tag.py",
     "comp": "compilations.py",
     "cls": "classical.py",
+    "naming": "naming.py",
+    "vinylrip": "vinylrip.py",
+    "marks": "marks.py",
+    "plan": "plan.py",
 }
 # other spellings of the same modules in TagMender's imports
 ALIASES = {"exclusions": "ex", "match_albums": "ma", "engine": "engine", "tagio": "tagio",
            "companions": "companions", "ocr_order": "ocr_order", "web_tag": "web",
-           "compilations": "comp", "classical": "cls"}
+           "compilations": "comp", "classical": "cls", "naming": "naming", "vinylrip": "vinylrip",
+           "marks": "marks", "plan": "plan"}
 
 # what the plugin calls (through discogs_evidence.py); everything they reach comes along
 ROOTS = {
@@ -83,7 +88,17 @@ WEB_ROOTS = {
 }
 
 # what TagMender's album_artist.py (copied whole as tm_album_artist.py) takes from its neighbours
-AA_DEP_ROOTS = {"comp": ["is_various"], "cls": ["genre_kind"]}
+AA_DEP_ROOTS = {"comp": ["is_various", "is_single_compilation", "discogs_hints", "FREE_FORM", "EXTRA_FLAGS",
+                         "HIDDEN_VA", "HIDDEN_COMPILATION"],
+                "cls": ["genre_kind"]}
+# the edition in the album title (naming.edition, ED-1..7) and ED-6's generic version mark
+EDITION_ROOTS = {"naming": ["edition", "edition_name", "edition_parts", "EDITIONS"],
+                 "plan": ["_GENERIC_VERSION_MARK"]}
+# a vinyl rip's own comment line (VIN-4)
+VINYLRIP_ROOTS = {"vinylrip": ["describe", "comment_line", "merged_values", "resolution_of", "resolution_name",
+                               "own_line", "PREFIX"]}
+# Grouping marks: Vinyl Rip, Tape Rip, HD Audio (MED-6, MED-8)
+MARKS_ROOTS = {"marks": ["of_album", "is_hd", "HD", "VINYL", "TAPE"]}
 # album_artist.py's own imports of them, and what they become
 AA_IMPORTS = (
     ("import compilations\n",
@@ -135,6 +150,23 @@ OVERRIDES = {
     ("ex", "STATE_DIR"): 'STATE_DIR = Path("/nonexistent/tagmender-state-not-read-by-the-plugin")',
     # TagMender's shipped scan order, copied beside the generated module
     ("ocr_order", "SHIPPED"): 'SHIPPED = Path(__file__).resolve().parent / "tm_ocr_order.json"',
+    # a vinyl rip's notes and scans: the folder's notes as tm_readers reads them; the scans' text
+    # comes from the OCR helper (discogs_ocr), passed to describe() - never read here
+    ("vinylrip", "notes_of"): (
+        'def notes_of(folder) -> str:\n'
+        '    """The rip notes beside the music (tm_readers.notes_text: .txt, .nfo, .info, .md)."""\n'
+        '    try:\n'
+        '        try:\n'
+        '            from . import tm_readers as _tr\n'
+        '        except ImportError:  # run outside Picard (tests)\n'
+        '            import tm_readers as _tr\n'
+        '        return _tr.notes_text(Path(str(folder)))\n'
+        '    except Exception:\n'
+        '        return ""'),
+    ("vinylrip", "scan_text"): (
+        'def scan_text(paths) -> str:\n'
+        '    """The scans\' text comes from the OCR helper (passed to describe as scans=)."""\n'
+        '    return ""'),
 }
 
 STDLIB = {
@@ -252,6 +284,9 @@ def build(root: Path) -> dict[str, str]:
             "tm_web.py": _closure(mods, WEB_ROOTS, hdr),
             "tm_album_artist.py": _album_artist(root, hdr),
             "tm_album_artist_deps.py": _closure(mods, AA_DEP_ROOTS, hdr),
+            "tm_editions.py": _closure(mods, EDITION_ROOTS, hdr),
+            "tm_vinylrip.py": _closure(mods, VINYLRIP_ROOTS, hdr),
+            "tm_marks.py": _closure(mods, MARKS_ROOTS, hdr),
             "tm_ocr_order.json": (root / "assets" / "ocr_order.json").read_text()}
 
 
@@ -286,7 +321,8 @@ def _closure(mods: dict, roots: dict, hdr: str) -> str:
                             used_stubs.add(target)
                         elif _canon(target) is None and target not in STDLIB and target != "match_core":
                             problems.append(f"{MODULES[alias]}:{name} uses {target} (not vendored, no stub)")
-                elif isinstance(x, ast.Attribute) and isinstance(x.value, ast.Name):
+                elif isinstance(x, ast.Attribute) and isinstance(x.value, ast.Name) \
+                        and x.value.id not in local:          # (a variable, "marks = {}": not the module)
                     target = mod.imports.get(x.value.id)
                     other = _canon(target) if target else None
                     if other:
@@ -337,7 +373,7 @@ def _closure(mods: dict, roots: dict, hdr: str) -> str:
             s, e = mod.segment(node)
             text = "\n".join(mod.lines[s:e])
             # "ma.rip_logs(" -> "rip_logs(": one namespace now
-            for la in local_aliases:
+            for la in local_aliases - _locals(node):    # (never a variable of that name: "marks = []")
                 text = re.sub(rf"(?<![\w.]){re.escape(la)}\.(?=[A-Za-z_])", "", text)
             # a function's own "from engine import a, b": those are names of this module now
             text = re.sub(r"(?m)^(\s*)from (?:" + "|".join(map(re.escape, ALIASES)) + r") import [^\n]+$",

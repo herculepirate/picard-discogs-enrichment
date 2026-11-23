@@ -95,6 +95,7 @@ from .discogs_webenrich import (CoverArtProviderWeb, WebTagClusterAction, drop_w
 from .discogs_webenrich import apply_to_late_file as _web_late_file
 from .discogs_albumartist import apply_to_late_file as _aa_late_file
 from .discogs_albumartist import settle as settle_album_artist
+from .discogs_copy import refresh as refresh_copy, refresh_late as _copy_late, write_lrc
 from .discogs_ocr_bridge import OcrBridge, partial_message, unavailable_message
 from . import discogs_mapping as _dm
 from .tm_readers import mb_linked_discogs_ids
@@ -453,6 +454,20 @@ def apply_to_late_file(api, track, file) -> None:
             _aa_late_file(track, file)
         except Exception:
             log.debug('Discogs Enrichment: album artist for a late file failed', exc_info=True)
+        try:
+            _copy_late(track, _album_metadata_targets, _refresh_album_ui)
+        except Exception:
+            log.debug('Discogs Enrichment: copy marks for a late file failed', exc_info=True)
+
+
+def save_lrc(api, file) -> None:
+    """After a save: the track's time-synced lyrics as an .lrc beside it (when switched on)."""
+    try:
+        written = write_lrc(file)
+        if written:
+            log.info('Discogs Enrichment: lyrics saved to %s', written)
+    except Exception:
+        log.warning('Discogs Enrichment: the .lrc file could not be written', exc_info=True)
 
 
 def _apply_discogs_to_late_file(api, track, file) -> None:
@@ -684,6 +699,11 @@ def process_album(api, album, metadata, release) -> None:
                             if settings['token'] else None)
     except Exception:
         log.error('Discogs Enrichment: album artist failed to start', exc_info=True)
+    # what your copy is: edition, Grouping, vinyl rip comment, compilations, genres (TagMender's)
+    try:
+        refresh_copy(album, metadata, op, _album_metadata_targets, _refresh_album_ui)
+    except Exception:
+        log.error('Discogs Enrichment: copy marks failed to start', exc_info=True)
 
     if (settings['merge_mode'] or MODE_COMBINE) == MODE_MB_ONLY:
         plugin_log.decision(op, 'tag source is MusicBrainz only \u2014 no Discogs lookup')
@@ -790,6 +810,11 @@ def process_album(api, album, metadata, release) -> None:
                                     _refresh_album_ui, client)
             except Exception:
                 log.error('Discogs Enrichment: album artist failed to start', exc_info=True)
+            # Discogs' media and date may change the edition
+            try:
+                refresh_copy(album, metadata, op, _album_metadata_targets, _refresh_album_ui)
+            except Exception:
+                log.error('Discogs Enrichment: copy marks failed to start', exc_info=True)
             log.info('Discogs Enrichment: applied fields %r to album %r (%d target(s))',
                      list(fields.keys()), album, len(targets))
 
@@ -1354,6 +1379,66 @@ class DiscogsOptionsPage(OptionsPage):
                     self.ocr_scans_checkbox):
             layout.addWidget(box)
 
+        # --- your copy and editions ---------------------------------------
+        layout.addWidget(_section_label(self, 'Your copy and editions (as TagMender writes them)'))
+        row = QtWidgets.QHBoxLayout()
+        row.addWidget(QtWidgets.QLabel('Edition in the Album tag:', self))
+        self.ed_album_combo = QtWidgets.QComboBox(self)
+        for key, label in (('off', 'Off'),
+                           ('edition', 'Edition ([Remaster], [Vinyl Rip], [SACD], [HD])'),
+                           ('edition_year', 'Edition and year ([2004 Remaster], [1977 Vinyl Rip])')):
+            self.ed_album_combo.addItem(label, key)
+        self.ed_album_combo.setToolTip(
+            'SACD, DVD-Audio, Blu-ray and vinyl or tape rips always; a CD or download only as a\n'
+            'newer remaster or reissue (its date later than the first release), or by the name it\n'
+            'calls itself ("Deluxe Edition"); HD for audio finer than a CD. The original CD or\n'
+            'download has none, and a bootleg is no remaster. A "(Remastered)" the title carries\n'
+            'gives way to the edition.')
+        row.addWidget(self.ed_album_combo, 1)
+        layout.addLayout(row)
+        self.ed_version_tags_checkbox = QtWidgets.QCheckBox(
+            'With it, ALBUMVERSION and RELEASECOMMENT tags (for LMS and other media servers)', self)
+        self.mark_grouping_checkbox = QtWidgets.QCheckBox(
+            'Mark HD audio, vinyl and tape rips in Grouping', self)
+        self.mark_grouping_checkbox.setToolTip(
+            'Grouping says HD Audio (above 16 bits or 44.1 kHz, DSD too), Vinyl Rip or Tape Rip.\n'
+            'Only when Grouping is empty; it never replaces yours.')
+        self.vinyl_comment_checkbox = QtWidgets.QCheckBox("Write a vinyl rip's details in the comment", self)
+        self.vinyl_comment_checkbox.setToolTip(
+            'One line beside what the comment says: the ripper, the resolution, the year ripped and\n'
+            'the turntable, as far as the folder and its notes tell ("Vinyl rip: PBTHAL \u00b7 24-bit/96 kHz\n'
+            '\u00b7 ripped 2012").')
+        self.comments_remove_checkbox = QtWidgets.QCheckBox(
+            "Remove the files' comments (a ripper's or shop's note)", self)
+        self.comp_single_checkbox = QtWidgets.QCheckBox('Also flag single-artist compilations', self)
+        self.comp_single_checkbox.setToolTip('Best-ofs (release type Compilation): many players then list '
+                                             'them under Various Artists.')
+        self.comp_flags_checkbox = QtWidgets.QCheckBox(
+            'Compilations: also write ITUNESCOMPILATION and COMP (FLAC, Ogg, Opus, APE, WavPack)', self)
+        self.comp_grouping_checkbox = QtWidgets.QCheckBox('Compilations: set Grouping to Compilation', self)
+        for w in (self.ed_version_tags_checkbox, self.mark_grouping_checkbox, self.vinyl_comment_checkbox,
+                  self.comments_remove_checkbox, self.comp_single_checkbox, self.comp_flags_checkbox,
+                  self.comp_grouping_checkbox):
+            layout.addWidget(w)
+        row = QtWidgets.QHBoxLayout()
+        row.addWidget(QtWidgets.QLabel('Genres: at most', self))
+        self.genre_max_spin = QtWidgets.QSpinBox(self)
+        self.genre_max_spin.setRange(0, 20)
+        self.genre_max_spin.setSpecialValueText('no limit')
+        self.genre_max_spin.setToolTip('Per album; any more are left out (0: no limit).')
+        row.addWidget(self.genre_max_spin)
+        row.addStretch(1)
+        layout.addLayout(row)
+        self.genre_map_edit = QtWidgets.QPlainTextEdit(self)
+        self.genre_map_edit.setPlaceholderText('Your own genre names, one per line:\n'
+                                               'funeral doom metal = Doom Metal')
+        self.genre_map_edit.setFixedHeight(60)
+        layout.addWidget(self.genre_map_edit)
+        self.lyrics_lrc_checkbox = QtWidgets.QCheckBox(
+            'Save time-synced lyrics as an .lrc file beside each track', self)
+        self.lyrics_lrc_checkbox.setToolTip('When the track is saved; never over an .lrc that is there.')
+        layout.addWidget(self.lyrics_lrc_checkbox)
+
         # --- album artist ------------------------------------------------
         layout.addWidget(_section_label(self, 'Album artist (as TagMender files it)'))
         self.aa_lead_checkbox = QtWidgets.QCheckBox('Lead artist only', self)
@@ -1587,6 +1672,17 @@ class DiscogsOptionsPage(OptionsPage):
         self.web_sources_checkbox.setChecked(False)
         self.aa_lead_checkbox.setChecked(True)
         self.aa_bands_checkbox.setChecked(True)
+        self.ed_album_combo.setCurrentIndex(0)
+        self.ed_version_tags_checkbox.setChecked(True)
+        self.mark_grouping_checkbox.setChecked(True)
+        self.vinyl_comment_checkbox.setChecked(True)
+        self.comments_remove_checkbox.setChecked(False)
+        self.comp_single_checkbox.setChecked(False)
+        self.comp_flags_checkbox.setChecked(False)
+        self.comp_grouping_checkbox.setChecked(False)
+        self.genre_max_spin.setValue(5)
+        self.genre_map_edit.setPlainText('')
+        self.lyrics_lrc_checkbox.setChecked(False)
         self.aa_file_under_edit.setPlainText('')
         self.web_source_list_edit.setText('')
         self.web_lyrics_checkbox.setChecked(False)
@@ -1632,6 +1728,18 @@ class DiscogsOptionsPage(OptionsPage):
         self.pick_likely_checkbox.setChecked(bool(s['pick_likely']))
         self.web_sources_checkbox.setChecked(bool(s['web_sources']))
         self.aa_lead_checkbox.setChecked(bool(s['aa_lead']))
+        i = self.ed_album_combo.findData(str(s['ed_album'] or 'off'))
+        self.ed_album_combo.setCurrentIndex(max(0, i))
+        self.ed_version_tags_checkbox.setChecked(bool(s['ed_version_tags']))
+        self.mark_grouping_checkbox.setChecked(bool(s['mark_grouping']))
+        self.vinyl_comment_checkbox.setChecked(bool(s['vinyl_comment']))
+        self.comments_remove_checkbox.setChecked(str(s['comments'] or 'keep') == 'remove')
+        self.comp_single_checkbox.setChecked(bool(s['comp_single_artist']))
+        self.comp_flags_checkbox.setChecked(bool(s['comp_extra_flags']))
+        self.comp_grouping_checkbox.setChecked(bool(s['comp_grouping']))
+        self.genre_max_spin.setValue(int(s['genre_max'] or 0))
+        self.genre_map_edit.setPlainText(str(s['genre_map'] or ''))
+        self.lyrics_lrc_checkbox.setChecked(bool(s['lyrics_lrc']))
         self.aa_bands_checkbox.setChecked(bool(s['aa_bands']))
         self.aa_file_under_edit.setPlainText(str(s['aa_file_under'] or ''))
         self.aa_bands_checkbox.setEnabled(self.aa_lead_checkbox.isChecked())
@@ -1680,6 +1788,17 @@ class DiscogsOptionsPage(OptionsPage):
         s['pick_likely'] = self.pick_likely_checkbox.isChecked()
         s['web_sources'] = self.web_sources_checkbox.isChecked()
         s['aa_lead'] = self.aa_lead_checkbox.isChecked()
+        s['ed_album'] = self.ed_album_combo.currentData() or 'off'
+        s['ed_version_tags'] = self.ed_version_tags_checkbox.isChecked()
+        s['mark_grouping'] = self.mark_grouping_checkbox.isChecked()
+        s['vinyl_comment'] = self.vinyl_comment_checkbox.isChecked()
+        s['comments'] = 'remove' if self.comments_remove_checkbox.isChecked() else 'keep'
+        s['comp_single_artist'] = self.comp_single_checkbox.isChecked()
+        s['comp_extra_flags'] = self.comp_flags_checkbox.isChecked()
+        s['comp_grouping'] = self.comp_grouping_checkbox.isChecked()
+        s['genre_max'] = self.genre_max_spin.value()
+        s['genre_map'] = self.genre_map_edit.toPlainText()
+        s['lyrics_lrc'] = self.lyrics_lrc_checkbox.isChecked()
         s['aa_bands'] = self.aa_bands_checkbox.isChecked()
         s['aa_file_under'] = self.aa_file_under_edit.toPlainText()
         s['web_source_list'] = self.web_source_list_edit.text().strip()
@@ -2553,6 +2672,7 @@ def enable(api) -> None:
     # Closes the race between the asynchronous Discogs reply and Picard
     # linking files to tracks; see apply_to_late_file().
     api.register_file_post_addition_to_track_processor(apply_to_late_file)
+    api.register_file_post_save_processor(save_lrc)
     api.register_options_page(DiscogsOptionsPage)
 
     api.register_album_action(DiscogsSearchAction)

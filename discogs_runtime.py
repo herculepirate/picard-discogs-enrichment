@@ -71,6 +71,20 @@ DEFAULTS: dict[str, Any] = {
     'aa_lead': True,
     'aa_bands': True,
     'aa_file_under': '',
+    # what your copy is (discogs_copy), TagMender's rules: the edition in the Album tag
+    # (off / edition / edition_year), ALBUMVERSION + RELEASECOMMENT with it, Grouping marks,
+    # the vinyl rip's comment line, comments kept or removed, compilation flags, genres
+    'ed_album': 'off',
+    'ed_version_tags': True,
+    'mark_grouping': True,
+    'vinyl_comment': True,
+    'comments': 'keep',
+    'comp_extra_flags': False,
+    'comp_grouping': False,
+    'comp_single_artist': False,
+    'genre_max': 5,
+    'genre_map': '',
+    'lyrics_lrc': False,
     # web sources (discogs_web): off by default. Fill empty genres/credits and add cover art from
     # the first source that proves the album; lyrics from LRCLIB where a track has none.
     'web_sources': False,

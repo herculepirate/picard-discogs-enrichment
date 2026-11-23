@@ -350,6 +350,32 @@ PDF booklets (OCR)"**.
 
 ---
 
+## Your copy and editions
+
+What your copy is, written where a player shows it — TagMender's rules
+(`tm_editions.py`, `tm_marks.py`, `tm_vinylrip.py`, generated from its
+`naming.py`, `marks.py` and `vinylrip.py`). Under **Options → Plugins →
+Discogs Enrichment → Your copy and editions**:
+
+| Option | Default | What it does |
+| --- | --- | --- |
+| **Edition in the Album tag** | Off | *Nightfall [2004 Remaster]*, *25 [2015 Vinyl Rip]*, *Brave [1999 SACD]*, *[HD]*. SACD, DVD-Audio, Blu-ray and vinyl or tape rips always; a CD or download only as a newer remaster or reissue (its date later than the first release's) or by the name it calls itself (*[2023 Deluxe Edition]*). The original CD or download has none; a bootleg is no remaster. A *(Remastered)* the title carries gives way. "Edition" alone: *[Remaster]*, *[Vinyl Rip]* |
+| **ALBUMVERSION and RELEASECOMMENT** | On | With the edition: ALBUMVERSION holds it, RELEASECOMMENT MusicBrainz's disambiguation — for LMS and other media servers |
+| **Mark HD audio, vinyl and tape rips in Grouping** | On | *HD Audio* (above 16 bits or 44.1 kHz, DSD too), *Vinyl Rip*, *Tape Rip* — only where Grouping is empty |
+| **A vinyl rip's details in the comment** | On | *Vinyl rip: PBTHAL · 24-bit/96 kHz · ripped 2012 · turntable*, from the folder name and its notes, beside what the comment says |
+| **Remove the files' comments** | Off | A ripper's or shop's note is taken off (the vinyl rip line stays) |
+| **Single-artist compilations** | Off | A best-of (release type Compilation) is flagged COMPILATION too |
+| **ITUNESCOMPILATION and COMP** | Off | In FLAC, Ogg, Opus, APE and WavPack files of a compilation (ID3 and MP4 have their own flag) |
+| **Grouping "Compilation"** | Off | Where Grouping is empty |
+| **Genres: at most** | 5 | Per album; 0 for no limit. With **your own genre names** (`funeral doom metal = Doom Metal`) |
+| **Time-synced lyrics as .lrc** | Off | `01 Track.lrc` beside the track when it is saved, never over one that is there |
+
+The files are measured (bit depth, rate) and the folder's rip notes read off
+Picard's main thread, and everything is written again when Discogs writes its
+tags or a file joins its track, so the edition follows the release finally
+chosen. Picard's own **Various artists** name (Options → Metadata) stays
+Picard's.
+
 ## Album artist
 
 The album artist is filed as TagMender files it (its `album_artist.py`,
@@ -462,7 +488,7 @@ Pure logic lives in `discogs_mapping.py`, `discogs_evidence.py` and
 `discogs_decide.py` with no Qt
 or Picard imports, so it can be tested directly (`python3 tests/test_*.py`).
 
-`tm_match_core.py`, `tm_readers.py`, `tm_ocr.py`, `tm_web.py`, `tm_album_artist.py`, `tm_album_artist_deps.py` and `tm_ocr_order.json` are
+`tm_match_core.py`, `tm_readers.py`, `tm_ocr.py`, `tm_web.py`, `tm_album_artist.py`, `tm_album_artist_deps.py`, `tm_editions.py`, `tm_marks.py`, `tm_vinylrip.py` and `tm_ocr_order.json` are
 **generated** from a
 [TagMender](https://github.com/herculepirate/tagmender) checkout by
 `tools/vendor_tagmender.py`: its pressing scorer verbatim, and the folder
@@ -492,9 +518,12 @@ discogs_ocr_bridge.py    starts the helper (flatpak-spawn --host in a Flatpak)
 discogs_ocr.py           pure logic — what the scans read, added as TagMender adds it
 tm_web.py                generated from TagMender: web sources (web_tag)
 tm_album_artist*.py      generated from TagMender: album_artist.py, as it is
+tm_editions.py           generated from TagMender: naming.edition (ED-1..7)
+tm_marks.py, tm_vinylrip.py  generated from TagMender: marks.py, vinylrip.py
 discogs_web.py           pure logic — web sources, VGMdb, LRCLIB, the proof
 discogs_webenrich.py     web sources in Picard: fills, lyrics, cover art, cluster action
 discogs_albumartist.py   the album artist as TagMender files it (tm_album_artist.py)
+discogs_copy.py          edition, Grouping marks, vinyl rip comment, compilations, genres, .lrc
 tools/vendor_tagmender.py  regenerates the tm_* files
 tools/library_check.py   what the plugin reads and decides, over a music folder
 discogs_client.py        Discogs API over Picard's web service

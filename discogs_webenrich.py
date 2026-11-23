@@ -172,6 +172,10 @@ def _apply(album, metadata, op, result, targets_of, refresh) -> None:
         text = (hit.get('synced') if synced and hit.get('synced') else hit.get('plain')) or ''
         if text.strip():
             per_track[i] = {'lyrics': text}
+            if hit.get('synced'):
+                # (never saved: a hidden variable; the .lrc beside the track is written from it -
+                # discogs_copy.write_lrc)
+                per_track[i]['~lyrics_synced'] = hit['synced']
     if result.get('lyrics') is not None and settings.get('web_lyrics'):
         plugin_log.event(op, f'lyrics (LRCLIB): {len(per_track)} track(s)')
     album_done, track_done = {}, {}
