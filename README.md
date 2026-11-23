@@ -281,6 +281,15 @@ What it does with them, when your copy says anything of its pressing:
    An unofficial release (a bootleg) is taken only when no official release
    carries what proves it (TagMender's rule: bootlegs copy official barcodes).
 
+   **Picard matched another pressing.** When the disc ID in your rip log or
+   cue sheet is on one *other* MusicBrainz release than Picard matched (Picard
+   took the vinyl, you ripped the CD), your files are moved to that release —
+   as Picard's own disc lookup would put them — and the album left empty is
+   removed; the right release then loads and is looked up afresh, so its
+   media, barcode and Grouping are your copy's too. On several releases, or
+   for a copy of more than one disc, you are asked. Turn off with **"Move my
+   files to the MusicBrainz release my disc ID is on"**.
+
 5. **Otherwise you choose.** The release picker opens with TagMender's
    candidates, best first; its Match column shows TagMender's confidence and
    every clue for and against (*"Proven: 100% | for: disc ID (track positions

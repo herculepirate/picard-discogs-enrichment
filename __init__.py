@@ -1007,7 +1007,10 @@ def process_album(api, album, metadata, release) -> None:
                 rest = ', '.join(str(x['cand'].get('id')) for x in verdict.get('others') or ())
                 _apply(rid, f'Discogs release {rid}: {verdict["why"][0]}; also possible: {rest} '
                             f'(Search Discogs… to choose another)')
-            elif status == 'review':
+            elif status == 'move' and settings['move_to_discid_release'] \
+                    and _move_to_release(album, verdict['move_to'], loc, op):
+                return
+            elif status in ('review', 'move'):
                 _review(verdict, http)
             else:
                 plugin_log.decision(op, 'TagMender found no Discogs release; trying the plain search')
@@ -1039,6 +1042,39 @@ def process_album(api, album, metadata, release) -> None:
     Worker.shared().submit(_job, _done)
 
 
+
+
+# album folders already moved to the MusicBrainz release their disc ID is on (never twice)
+_MOVED: set = set()
+
+
+def _move_to_release(album, mbid, loc, op) -> bool:
+    """Your disc ID is on MusicBrainz release MBID, not the one Picard matched: the album's files
+    go to it (as Picard's own disc lookup would put them) and the album left empty is removed.
+    That release then loads, and is looked up afresh. False: not moved (already moved once)."""
+    folder = (loc or {}).get('album_dir') or ''
+    if not mbid or (folder, mbid) in _MOVED:
+        return False
+    files = list(album.iterfiles())
+    if not files:
+        return False
+    _MOVED.add((folder, mbid))
+    tagger = album.tagger
+    plugin_log.decision(op, f'your disc ID is on MusicBrainz release {mbid}, not the one Picard '
+                            f'matched ({getattr(album, "id", "")}): moving your {len(files)} file(s) '
+                            f'there - it is looked up afresh')
+    log.info('Discogs Enrichment: moving %d file(s) of %r to MusicBrainz release %s, where '
+             'their disc ID is', len(files), album, mbid)
+    tagger.move_files_to_album(files, albumid=mbid)
+    if not list(album.iterfiles()):
+        tagger.remove_album(album)
+    try:
+        tagger.window.set_statusbar_message(
+            'Discogs Enrichment: your disc ID is on another MusicBrainz release - files moved there',
+            timeout=15000, echo=None, translate=None)
+    except Exception:
+        pass
+    return True
 
 
 # the OCR helper: probed once in a while, one album's scans at a time (the worker's)
@@ -1362,6 +1398,13 @@ class DiscogsOptionsPage(OptionsPage):
             'and a 1999 run of one CD). With this on, the one TagMender scores clearly highest\n'
             '(year, country, label, track lengths, the text of your scans) is applied, and the\n'
             'others are named in the log; off, you are asked.')
+        self.move_to_discid_checkbox = QtWidgets.QCheckBox(
+            'Move my files to the MusicBrainz release my disc ID is on', self)
+        self.move_to_discid_checkbox.setToolTip(
+            'Picard may match an album to another pressing than yours (the vinyl, when you\n'
+            'ripped the CD). When the disc ID in your rip log or cue sheet is on exactly one\n'
+            'other MusicBrainz release, your files are moved there - as Picard\'s own disc\n'
+            'lookup would - and that release is looked up afresh. Off, you are asked.')
         self.ocr_scans_checkbox = QtWidgets.QCheckBox(
             'Read my scans and PDF booklets (OCR)', self)
         self.ocr_scans_checkbox.setToolTip(
@@ -1376,7 +1419,7 @@ class DiscogsOptionsPage(OptionsPage):
                     self.auto_disc_map_checkbox, self.use_cache_checkbox,
                     self.split_collab_checkbox, self.folder_evidence_checkbox,
                     self.picker_when_unsure_checkbox, self.pick_likely_checkbox,
-                    self.ocr_scans_checkbox):
+                    self.move_to_discid_checkbox, self.ocr_scans_checkbox):
             layout.addWidget(box)
 
         # --- your copy and editions ---------------------------------------
@@ -1669,6 +1712,7 @@ class DiscogsOptionsPage(OptionsPage):
         self.picker_when_unsure_checkbox.setChecked(True)
         self.ocr_scans_checkbox.setChecked(True)
         self.pick_likely_checkbox.setChecked(True)
+        self.move_to_discid_checkbox.setChecked(True)
         self.web_sources_checkbox.setChecked(False)
         self.aa_lead_checkbox.setChecked(True)
         self.aa_bands_checkbox.setChecked(True)
@@ -1726,6 +1770,7 @@ class DiscogsOptionsPage(OptionsPage):
         self.picker_when_unsure_checkbox.setChecked(bool(s['picker_when_unsure']))
         self.ocr_scans_checkbox.setChecked(bool(s['ocr_scans']))
         self.pick_likely_checkbox.setChecked(bool(s['pick_likely']))
+        self.move_to_discid_checkbox.setChecked(bool(s['move_to_discid_release']))
         self.web_sources_checkbox.setChecked(bool(s['web_sources']))
         self.aa_lead_checkbox.setChecked(bool(s['aa_lead']))
         i = self.ed_album_combo.findData(str(s['ed_album'] or 'off'))
@@ -1786,6 +1831,7 @@ class DiscogsOptionsPage(OptionsPage):
         s['picker_when_unsure'] = self.picker_when_unsure_checkbox.isChecked()
         s['ocr_scans'] = self.ocr_scans_checkbox.isChecked()
         s['pick_likely'] = self.pick_likely_checkbox.isChecked()
+        s['move_to_discid_release'] = self.move_to_discid_checkbox.isChecked()
         s['web_sources'] = self.web_sources_checkbox.isChecked()
         s['aa_lead'] = self.aa_lead_checkbox.isChecked()
         s['ed_album'] = self.ed_album_combo.currentData() or 'off'

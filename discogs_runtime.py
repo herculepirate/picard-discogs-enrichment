@@ -63,6 +63,8 @@ DEFAULTS: dict[str, Any] = {
     'picker_when_unsure': True,
     # several pressings carry what your copy proves: apply the one TagMender scores clearly highest
     'pick_likely': True,
+    # your disc ID is on one other MusicBrainz release than Picard matched: move the files there
+    'move_to_discid_release': True,
     # your scans and PDF booklets read (OCR, on your system's Python: discogs_ocr_helper)
     'ocr_scans': True,
     'ocr_max_images': 15,

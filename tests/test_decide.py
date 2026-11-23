@@ -226,11 +226,22 @@ class Decide(unittest.TestCase):
         self.assertEqual(str(r['best']['cand']['id']), '2')
         self.assertEqual(dd.proof_rank(r['best']), 3)
 
-    def test_disc_id_on_another_musicbrainz_release_asks_you(self):
+    def test_disc_id_on_one_other_musicbrainz_release_moves_your_files_there(self):
+        # Picard matched the vinyl; your rip log's disc ID is on the CD's MusicBrainz release
         album = self._copy('Nightfall (1987)')
         did = tr.mb_discid(album['tocs'][1])
         http = FakeHttp([release(1, 'ACTLP 1')], discids={did: ['mbid-other']},
                         mb_links={'mbid-other': ['1']})
+        r = self._decide(album, http, mb_release_id='mbid-matched', mb_discids=set(), linked=[])
+        self.assertTrue(r['discid_on'].startswith('other:'), r['discid_on'])
+        self.assertEqual(r['status'], 'move', r['why'])
+        self.assertEqual(r['move_to'], 'mbid-other')
+
+    def test_disc_id_on_several_other_musicbrainz_releases_asks_you(self):
+        album = self._copy('Nightfall (1987)')
+        did = tr.mb_discid(album['tocs'][1])
+        http = FakeHttp([release(1, 'ACTLP 1')], discids={did: ['mbid-a', 'mbid-b']},
+                        mb_links={'mbid-a': ['1']})
         r = self._decide(album, http, mb_release_id='mbid-matched', mb_discids=set(), linked=[])
         self.assertTrue(r['discid_on'].startswith('other:'), r['discid_on'])
         self.assertEqual(r['status'], 'review')

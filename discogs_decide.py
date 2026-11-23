@@ -249,6 +249,8 @@ def decide(album: dict, http, dm, *, mb_release_id: str = '', mb_discids=(), lin
                   number and year), when your copy proves nothing else and is not against it
     "likely"      (LIKELY) several pressings carry what your copy proves as strongly, and
                   TagMender scores one clearly highest (most_likely); "others" lists the rest
+    "move"        your disc ID is on one other MusicBrainz release than Picard matched (and your
+                  copy is one disc): "move_to" is that release, where your files belong
     "review"      you choose (the picker); "nomatch" nothing found
     """
     cfg = _cfg(cfg)
@@ -279,7 +281,15 @@ def decide(album: dict, http, dm, *, mb_release_id: str = '', mb_discids=(), lin
 
     if discid_on.startswith('other:'):
         # your disc ID is on another MusicBrainz release than the one Picard matched: the
-        # MusicBrainz match and your copy disagree - you decide
+        # MusicBrainz match and your copy disagree. On exactly one other release (and your copy
+        # one disc), that release is yours: "move" - the files go there, as Picard's own disc
+        # lookup would put them; on several, you decide
+        others = [x for x in discid_on[6:].split(',') if x]
+        if len(others) == 1 and len(album.get('tocs') or {}) == 1:
+            out.update(status='move', move_to=others[0])
+            out['why'].insert(0, f'your disc ID is on MusicBrainz release {others[0]}, not the one '
+                                 f'Picard matched: your files belong there')
+            return out
         out['status'] = 'review'
         out['why'].insert(0, f'your disc ID is on MusicBrainz release {discid_on[6:]}, '
                              f'not the one Picard matched')
