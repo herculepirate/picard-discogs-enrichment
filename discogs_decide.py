@@ -429,6 +429,37 @@ def settled_without_scans(verdict: dict | None) -> bool:
     return v.get('status') == 'move' or (v.get('status') == 'auto' and proof_rank(v.get('best')) == 3)
 
 
+# how many candidates' own pages are read for their matrix codes (the best-scored first)
+MATRIX_CANDIDATES = 8
+
+
+def matrix_pick(scored: list, http, ocr_text: str, album: dict | None, cfg: dict) -> tuple[dict | None, str]:
+    """The one candidate whose matrix / runout code (Discogs' "Matrix / Runout" identifiers) is
+    printed on your scans - the code pressed into your own disc, proof of the pressing for a
+    bootleg too (Steve Howe / Tomorrow - Beginnings / Tomorrow: "SHWCD 14120201" on the disc
+    scan, the matrix of Discogs 8752298). It must fit your files (every track; half its track
+    titles or lengths) with nothing of your copy against it, and no other candidate's matrix may
+    be printed too. Returns (candidate or None, the code)."""
+    if not (ocr_text or '').strip():
+        return None, ''
+    upper = _ocr_upper(ocr_text)
+    compact = re.sub(r'[^A-Z0-9]', '', upper)
+    hits = []
+    for x in sorted(scored, key=lambda x: -(x.get('confidence') or 0))[:MATRIX_CANDIDATES]:
+        det = _details(http, (x.get('cand') or {}).get('id'))
+        codes = [m[1] for m in printed_marks(det) if m[0] == 'matrix' and mark_printed(m, upper, compact)]
+        if codes:
+            hits.append((x, codes[0]))
+    if len(hits) != 1:
+        return None, ''
+    x, code = hits[0]
+    fits = (x.get('tracks_ok') and not x.get('clues_against') and not x.get('conflict')
+            and not mc._ruled_out_by_copy(x) and (x.get('artist_sim') or 0) >= cfg['auto_min_artist']
+            and ((x.get('dur_frac') or 0) >= 0.5
+                 or titles_agree((album or {}).get('tracks'), (x.get('cand') or {}).get('tracks')) >= 0.5))
+    return (x, code) if fits else (None, '')
+
+
 def decide(album: dict, http, dm, *, mb_release_id: str = '', mb_discids=(), linked=(),
            mb_facts: dict | None = None, cfg: dict | None = None, ocr_text: str = '',
            scan_probe: dict | None = None, likely: bool = True) -> dict[str, Any]:
@@ -514,6 +545,13 @@ def decide(album: dict, http, dm, *, mb_release_id: str = '', mb_discids=(), lin
             and all(x is best or proof_rank(x) < rank for x in proven):
         return out              # proven by your copy, and no other pressing as strongly
     held = {str(best['cand'].get('id'))} if best and mc.R9_HELD in out['why'] else set()
+    pick, code = matrix_pick(scored, http, ocr_text, album, cfg)
+    if pick is not None:
+        out.update(status='auto', best=pick)
+        out['why'].insert(0, f'its matrix {code} is printed on your scans: the code pressed into your '
+                             f'own disc, on no other candidate')
+        pick['notes'] = list(pick.get('notes') or []) + [f'matrix {code} printed on your scans']
+        return out
     first = proof_first(scored, cfg, held, album)
     if first is not None:
         out.update(status='auto', best=first)

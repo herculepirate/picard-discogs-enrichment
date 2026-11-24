@@ -757,6 +757,7 @@ def process_album(api, album, metadata, release) -> None:
         # the pressing is written, the album stays the one Picard matched
         part_of = holds_more_than_album(release_data, metadata.get('album') or '',
                                         len(getattr(album, 'tracks', None) or ()))
+        full_fields = dict(fields)
         if part_of:
             fields = pressing_only(fields)
             plugin_log.decision(op, f'Discogs release {release_data.get("id")} '
@@ -769,6 +770,14 @@ def process_album(api, album, metadata, release) -> None:
                 log.debug('Discogs Enrichment: album %r went away before the '
                           'Discogs result arrived, discarding it', album)
                 return
+            # the release is ALL your files (a two-on-one CD whose files Picard matched to one of
+            # its albums): they are tagged as that release, in a cluster of their own
+            if part_of:
+                try:
+                    if _tag_whole_release(album, release_data, full_fields, op):
+                        return
+                except Exception:
+                    log.error('Discogs Enrichment: tagging the whole release failed', exc_info=True)
             disc_count = release_disc_count(release_data)
             before = {k: list(metadata.getall(k)) for k in fields}
 
@@ -1239,13 +1248,91 @@ def _split_other_part(album, metadata, release_data, op) -> None:
         f.update()
     tagger = album.tagger
     cluster = tagger.load_cluster(part['title'], part['artist'])
-    for f in files:
+    pressing = pressing_only(_shape_fields(extract_discogs_fields(release_data)))
+    for f, t in zip(files, part['tracks']):
         f.move(cluster)
+        m = f.metadata
+        for key, value in pressing.items():
+            m[key] = value
+        f.update()
     _CHOSEN_FOR_FOLDER.setdefault(_folder_of(album), str(release_data.get('id')))
+    # (not looked up on MusicBrainz: an album named as this part may be another track list -
+    # Tomorrow's 1968 LP shares 5 of the bootleg's 12 Tomorrow tracks)
     plugin_log.decision(op, f'the other album of Discogs release {release_data.get("id")}: {n} unmatched '
-                            f'file(s) set apart as "{part["artist"]} - {part["title"]}" and looked up on '
-                            f'MusicBrainz')
-    cluster.lookup_metadata()
+                            f'file(s) tagged as "{part["artist"]} - {part["title"]}" from it, in a cluster '
+                            f'of their own (save them from there)')
+
+
+def _natural(path):
+    import re as _re
+    return [int(x) if x.isdigit() else x.casefold() for x in _re.split(r'(\d+)', str(path))]
+
+
+def _tag_whole_release(album, release_data, fields, op) -> bool:
+    """The Discogs release is all of the album's files - as many as its tracks, their titles
+    agreeing in order - while Picard matched them to one of its albums (Steve Howe / Tomorrow:
+    21 files of "Beginnings / Tomorrow" matched to the 9-track "Beginnings"). They leave that
+    album for a cluster of their own and are tagged as the release; the emptied album goes.
+    False (nothing done) when they are not exactly the release."""
+    import re as _re
+    files = list(album.iterfiles())
+    discs = parse_discs(release_data)
+    tracks = [t for d in discs for t in (d.get('tracks') or ())]
+    if not files or len(files) != len(tracks):
+        return False
+
+    def order(f):
+        m = getattr(f, 'orig_metadata', None) or f.metadata
+        try:
+            return (int(str(m['discnumber'] or 1).split('/')[0]), int(str(m['tracknumber'] or 0).split('/')[0]),
+                    _natural(f.filename))
+        except ValueError:
+            return (1, 0, _natural(f.filename))
+    files.sort(key=order)
+
+    def fold(text):
+        return _re.sub(r'[^0-9a-z]+', ' ', str(text or '').casefold()).strip()
+    pairs = [(fold((getattr(f, 'orig_metadata', None) or f.metadata)['title']), fold(t.get('title')))
+             for f, t in zip(files, tracks)]
+    if sum(1 for a, b in pairs if a and b and (a == b or a.endswith(' ' + b))) * 2 < len(pairs):
+        return False
+    title = str(fields.get('album') or release_data.get('title') or '')
+    artist = fields.get('albumartist') or ''
+    artist = artist[0] if isinstance(artist, list) else str(artist)
+    # each track's artist, when Discogs credits only the release ("Steve Howe / Tomorrow (2)"):
+    # the files Picard matched to its album are that album's artist's, the others the other part's
+    matched = {id(f) for tr in getattr(album, 'tracks', None) or () for f in tr.iterfiles()}
+    part = other_part(release_data, album.metadata['album'], album.metadata['albumartist'],
+                      [tr.metadata['title'] for tr in getattr(album, 'tracks', None) or ()])
+    by_part = {True: album.metadata['albumartist'], False: part['artist']} if part and matched else None
+    disc_of = [n for n, d in enumerate(discs, 1) for _t in (d.get('tracks') or ())]
+    tagger = album.tagger
+    cluster = tagger.load_cluster(title, artist)
+    disc_count = release_disc_count(release_data)
+    for i, (f, t) in enumerate(zip(files, tracks)):
+        own = id(f) in matched
+        f.move(cluster)                      # (its MusicBrainz track's tags leave with it)
+        m = f.metadata
+        for key in [k for k in m.keys() if k.startswith('musicbrainz_')]:
+            m.delete(key)
+        _apply_discogs_fields(m, fields, disc_count)
+        track_tags = extract_track_fields(t, i + 1, len(tracks))
+        for key, value in track_tags.items():
+            m[key] = value
+        m['discnumber'] = str(disc_of[i])
+        m['totaldiscs'] = str(len(discs))
+        if by_part and 'artist' not in track_tags:
+            m['artist'] = by_part[own]
+            m.delete('artistsort')
+        f.update()
+    _CHOSEN_FOR_FOLDER.setdefault(_folder_of(album) or os.path.dirname(files[0].filename),
+                                  str(release_data.get('id')))
+    plugin_log.decision(op, f'Discogs release {release_data.get("id")} ("{title}") is all {len(files)} of '
+                            f'your files, not only "{album.metadata["album"]}": they are tagged as it, in a '
+                            f'cluster of their own (save them from there)')
+    if not list(album.iterfiles()):
+        tagger.remove_album(album)
+    return True
 
 
 # album folders already moved to the MusicBrainz release their disc ID is on (never twice)

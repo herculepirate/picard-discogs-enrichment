@@ -273,6 +273,7 @@ What it does with them, when your copy says anything of its pressing:
    | | |
    | --- | --- |
    | **Proven** | TagMender is sure *and* your copy proves the pick: your disc ID, your barcode or your catalogue number, with no other pressing proven as strongly (a disc ID beats a barcode, a barcode a catalogue number; a number two pressings share proves neither) |
+   | **Matrix on your disc** | A matrix / runout code Discogs lists for one candidate is printed on your scans (the disc scan: *SHWCD 14120201*), no other candidate's is, and it fits your files — proof of the pressing, a bootleg's too |
    | **Only one proven** | Your disc ID or barcode is on exactly one candidate, it fits every track, its artist and title are the album's, and nothing of your copy is against it — even when TagMender's overall confidence is under 90% (five pressings of one album at 82%, one of them with your exact disc ID). A release titled as your album *with a subtitle* counts (*Mothballs* → *Mothballs - Groups & Sessions 64-69*) when half its track titles agree — a leading "Group - " in yours aside — or half its lengths |
    | **Linked** | MusicBrainz links that Discogs release to the release Picard matched, and nothing of your copy is against it |
    | **Same as MusicBrainz** | It carries the matched MusicBrainz release's barcode (or its catalogue number and year), and nothing of your copy is against it |
@@ -318,12 +319,15 @@ What it does with them, when your copy says anything of its pressing:
    its pressing is written (date, country, label, catalogue number, barcode,
    media, genre, the Discogs links). The album's own title, artists, original
    date, credits and track titles stay those of the album Picard matched.
-   Files Picard left unmatched in that album that are exactly the release's
-   *other* album (the 12 *Tomorrow* tracks of *Beginnings / Tomorrow*) are
-   given its titles, track numbers, artist and title, set in a cluster of
-   their own and looked up on MusicBrainz, where they become that album; the
-   Discogs release you chose for the folder is then given to it as well,
-   without asking again.
+   When the release is **all** your files — as many as its tracks, their
+   titles agreeing in order (the 21 files of *Beginnings / Tomorrow* Picard
+   matched to the 9-track *Beginnings*) — they leave that album for a cluster
+   of their own and are tagged as the release: its title, artists (each
+   track its own half's), track numbers, disc and pressing; the emptied album
+   is removed, and you save them from the cluster. Unmatched files that are
+   only the release's *other* album are tagged as that part, in a cluster of
+   their own (not looked up on MusicBrainz: an album of that name may be
+   another track list).
 
    A folder with a CD rip log is never marked *Vinyl Rip* or *Tape Rip*
    because the MusicBrainz release Picard matched is an LP or cassette.

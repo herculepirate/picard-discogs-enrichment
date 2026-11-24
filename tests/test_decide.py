@@ -529,3 +529,40 @@ class OtherPart(unittest.TestCase):
     def test_not_for_a_release_of_one_album(self):
         self.assertIsNone(dm.other_part(dict(self.REL, title='Beginnings'), 'Beginnings', 'Steve Howe', []))
         self.assertIsNone(dm.other_part(dict(self.REL, title='Relayer / Tormato'), 'Beginnings', 'Steve Howe', []))
+
+
+class MatrixOnYourDisc(unittest.TestCase):
+    CFG = dd._cfg()
+
+    class Http:
+        def __init__(self, details):
+            self.releases = {str(k): v for k, v in details.items()}
+
+    def _s(self, rid, **kw):
+        tracks = [{'title': f'T{i}'} for i in range(3)]
+        return dict({'cand': {'id': rid, 'tracks': tracks}, 'confidence': 88.0, 'clues': {}, 'code': '',
+                     'clues_against': [], 'tracks_ok': True, 'artist_sim': 1.0, 'title_sim': 0.77,
+                     'dur_frac': 0.9}, **kw)
+
+    def _det(self, matrix):
+        return {'identifiers': [{'type': 'Matrix / Runout', 'value': matrix}]}
+
+    def test_the_one_whose_matrix_is_printed(self):
+        x, y = self._s(8752298), self._s(2032967)
+        http = self.Http({8752298: self._det('SHWCD 14120201'), 2032967: self._det('ST-A-752345')})
+        pick, code = dd.matrix_pick([x, y], http, 'SHWCD 14120201 © 1975/1967', {}, self.CFG)
+        self.assertIs(pick, x)
+        self.assertEqual(code, 'SHWCD14120201')
+
+    def test_not_when_two_are_printed_or_none(self):
+        x, y = self._s(1), self._s(2)
+        http = self.Http({1: self._det('ABC 123456'), 2: self._det('ABC 123456-2')})
+        self.assertIsNone(dd.matrix_pick([x, y], http, 'ABC 123456 ABC 123456-2', {}, self.CFG)[0])
+        self.assertIsNone(dd.matrix_pick([x, y], http, 'nothing here', {}, self.CFG)[0])
+
+    def test_not_when_the_tracks_do_not_fit(self):
+        x = self._s(1, tracks_ok=False)
+        http = self.Http({1: self._det('SHWCD 14120201')})
+        self.assertIsNone(dd.matrix_pick([x], http, 'SHWCD 14120201', {}, self.CFG)[0])
+        y = self._s(1, clues_against=['your folder has a CD rip log, so not this vinyl release'])
+        self.assertIsNone(dd.matrix_pick([y], http, 'SHWCD 14120201', {}, self.CFG)[0])
