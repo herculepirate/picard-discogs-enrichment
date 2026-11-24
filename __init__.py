@@ -46,6 +46,7 @@ from .discogs_logging import (LEVEL_BASIC, LEVEL_DETAILED, LEVEL_OFF,
 from .discogs_coverart import ART_ALL, ART_FRONT, ART_FRONT_BACK
 from .discogs_mapping import (
     holds_more_than_album,
+    other_part,
     picker_search_terms,
     pressing_only,
     release_artists_for,
@@ -816,6 +817,12 @@ def process_album(api, album, metadata, release) -> None:
             # Files that attach to their track after this point are handled
             # by apply_to_late_file(), which needs the same field set.
             _remember_applied(album, fields, track_fields, disc_count)
+            if part_of:
+                try:
+                    _split_other_part(album, metadata, release_data, op)
+                except Exception:
+                    log.error('Discogs Enrichment: the other album of the release could not be set apart',
+                              exc_info=True)
             _refresh_album_ui(album)
             # Discogs may have written its own credit: the album artist is chosen again from it
             try:
@@ -1079,8 +1086,11 @@ def process_album(api, album, metadata, release) -> None:
             elif status == 'move' and settings['move_to_discid_release'] \
                     and _move_to_release(album, verdict['move_to'], loc, op):
                 return
+            elif status in ('review', 'move') and _CHOSEN_FOR_FOLDER.get(loc.get('album_dir') or ''):
+                rid = _CHOSEN_FOR_FOLDER[loc['album_dir']]
+                _apply(rid, f'Discogs release {rid}: you chose it for this folder\'s other album')
             elif status in ('review', 'move'):
-                _review(verdict, http)
+                _review(verdict, http, loc)
             elif verdict.get('ruled_out'):
                 plugin_log.decision(op, f'{verdict["why"][0]}: no Discogs data for this album '
                                         f'(Search Discogs\u2026 to choose one anyway)')
@@ -1090,7 +1100,7 @@ def process_album(api, album, metadata, release) -> None:
         except Exception:
             log.error('Discogs Enrichment: folder evidence failed', exc_info=True)
 
-    def _review(verdict, http):
+    def _review(verdict, http, result_loc=None):
         why = '; '.join(verdict.get('why') or ()) or 'nothing proves one pressing'
         if not settings['picker_when_unsure']:
             plugin_log.decision(op, f'not sure which pressing ({why}); not tagging automatically '
@@ -1108,8 +1118,12 @@ def process_album(api, album, metadata, release) -> None:
             return
         plugin_log.decision(op, f'not sure which pressing ({why}): asking you')
         title = f'{metadata.get("albumartist") or metadata.get("artist")} \u2014 {metadata.get("album")}'
-        queue_picker(album, title, why, rows, details, client,
-                     lambda rid: _apply(rid, f'you chose Discogs release {rid}'))
+        def _chosen(rid):
+            folder = (result_loc.get('album_dir') if result_loc else '') or _folder_of(album)
+            if folder:
+                _CHOSEN_FOR_FOLDER[folder] = str(rid)
+            _apply(rid, f'you chose Discogs release {rid}')
+        queue_picker(album, title, why, rows, details, client, _chosen)
 
     Worker.shared().submit(_job, _done)
 
@@ -1160,6 +1174,78 @@ def _save_embedded_art(album_dir: str, images) -> list:
     except OSError:
         return []
     return [str(folder)]
+
+
+# the Discogs release you chose for an album folder this session: the folder's other album (the
+# other half of a two-on-one CD) is given it too, without asking again
+_CHOSEN_FOR_FOLDER: dict = {}
+
+
+def _folder_of(album) -> str:
+    try:
+        loc = album_location([f.filename for f in album.iterfiles() if getattr(f, 'filename', None)])
+    except Exception:
+        loc = None
+    return (loc or {}).get('album_dir') or ''
+
+
+def _split_other_part(album, metadata, release_data, op) -> None:
+    """A two-on-one release applied to one of its albums: the album's unmatched files that are
+    exactly the release's other album (Steve Howe / Tomorrow - "Beginnings / Tomorrow": the 12
+    Tomorrow files Picard left unmatched in "Beginnings") are given that album's titles, track
+    numbers, artist and title, set in a cluster of their own and looked up on MusicBrainz -
+    where they become that album. Nothing is done unless they are exactly it: as many files as
+    its tracks, in one folder, and any titles they carry agreeing."""
+    import re as _re
+    files = list(album.unmatched_files.iterfiles()) if getattr(album, 'unmatched_files', None) else []
+    if not files:
+        return
+    titles = [t.metadata['title'] for t in getattr(album, 'tracks', None) or ()]
+    part = other_part(release_data, metadata.get('album') or '', metadata.get('albumartist') or '', titles)
+    if not part or len(part['tracks']) != len(files):
+        if part:
+            plugin_log.decision(op, f'{len(files)} unmatched file(s) here, but "{part["title"]}" on the release '
+                                    f'has {len(part["tracks"])} track(s): left as they are')
+        return
+    if len({os.path.dirname(f.filename) for f in files}) != 1:
+        return
+
+    def natural(path):
+        return [int(x) if x.isdigit() else x.casefold() for x in _re.split(r'(\d+)', path)]
+    files.sort(key=lambda f: natural(f.filename))
+
+    def fold(text):
+        return _re.sub(r'[^0-9a-z]+', ' ', str(text or '').casefold()).strip()
+    have = [(fold(f.metadata['title']), fold(t['title'])) for f, t in zip(files, part['tracks'])
+            if f.metadata['title']]
+    if have and sum(1 for a, b in have if a == b or a.endswith(' ' + b)) * 2 < len(have):
+        plugin_log.decision(op, f'the unmatched files\' titles are not those of "{part["title"]}": left as they are')
+        return
+    n = len(files)
+    for i, (f, t) in enumerate(zip(files, part['tracks']), 1):
+        m = f.metadata
+        m['title'] = t['title']
+        m['artist'] = t['artist'] or part['artist']
+        m['albumartist'] = part['artist']
+        m['album'] = part['title']
+        m['tracknumber'] = str(i)
+        m['totaltracks'] = str(n)
+        m['discnumber'] = '1'
+        m['totaldiscs'] = '1'
+        for key in ('musicbrainz_albumid', 'musicbrainz_releasegroupid', 'musicbrainz_trackid',
+                    'musicbrainz_recordingid', 'musicbrainz_albumartistid', 'catalognumber', 'barcode',
+                    'date', 'originaldate', 'label', 'releasecountry'):
+            m.delete(key)
+        f.update()
+    tagger = album.tagger
+    cluster = tagger.load_cluster(part['title'], part['artist'])
+    for f in files:
+        f.move(cluster)
+    _CHOSEN_FOR_FOLDER.setdefault(_folder_of(album), str(release_data.get('id')))
+    plugin_log.decision(op, f'the other album of Discogs release {release_data.get("id")}: {n} unmatched '
+                            f'file(s) set apart as "{part["artist"]} - {part["title"]}" and looked up on '
+                            f'MusicBrainz')
+    cluster.lookup_metadata()
 
 
 # album folders already moved to the MusicBrainz release their disc ID is on (never twice)

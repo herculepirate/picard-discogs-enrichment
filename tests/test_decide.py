@@ -505,3 +505,27 @@ class Mothballs(unittest.TestCase):
         self.assertEqual(proven['label'], 'Proven (barcode)')
         self.assertEqual(doubtful['label'], 'Doubtful')
         self.assertGreater(proven['score'], doubtful['score'])
+
+
+class OtherPart(unittest.TestCase):
+    REL = {'title': 'Beginnings / Tomorrow',
+           'artists': [{'name': 'Steve Howe'}, {'name': 'Tomorrow (2)'}],
+           'tracklist': [{'type_': 'track', 'title': t, 'artists': [{'name': a}]} for a, t in
+                         [('Steve Howe', 'Doors Of Sleep'), ('Steve Howe', 'Beginnings'),
+                          ('Tomorrow (2)', 'Am I Glad To See You'), ('Tomorrow (2)', 'Revolution'),
+                          ('Tomorrow (2)', 'My White Bicycle ')]]}
+
+    def test_the_other_album(self):
+        o = dm.other_part(self.REL, 'Beginnings', 'Steve Howe', ['Doors of Sleep', 'Beginnings'])
+        self.assertEqual((o['title'], o['artist']), ('Tomorrow', 'Tomorrow'))
+        self.assertEqual([t['title'] for t in o['tracks']], ['Am I Glad To See You', 'Revolution', 'My White Bicycle'])
+        self.assertEqual({t['artist'] for t in o['tracks']}, {'Tomorrow'})
+
+    def test_from_the_other_side(self):
+        o = dm.other_part(self.REL, 'Tomorrow', 'Tomorrow', ['Am I Glad To See You', 'Revolution', 'My White Bicycle'])
+        self.assertEqual((o['title'], o['artist']), ('Beginnings', 'Steve Howe'))
+        self.assertEqual(len(o['tracks']), 2)
+
+    def test_not_for_a_release_of_one_album(self):
+        self.assertIsNone(dm.other_part(dict(self.REL, title='Beginnings'), 'Beginnings', 'Steve Howe', []))
+        self.assertIsNone(dm.other_part(dict(self.REL, title='Relayer / Tormato'), 'Beginnings', 'Steve Howe', []))

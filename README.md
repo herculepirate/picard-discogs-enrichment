@@ -318,6 +318,12 @@ What it does with them, when your copy says anything of its pressing:
    its pressing is written (date, country, label, catalogue number, barcode,
    media, genre, the Discogs links). The album's own title, artists, original
    date, credits and track titles stay those of the album Picard matched.
+   Files Picard left unmatched in that album that are exactly the release's
+   *other* album (the 12 *Tomorrow* tracks of *Beginnings / Tomorrow*) are
+   given its titles, track numbers, artist and title, set in a cluster of
+   their own and looked up on MusicBrainz, where they become that album; the
+   Discogs release you chose for the folder is then given to it as well,
+   without asking again.
 
    A folder with a CD rip log is never marked *Vinyl Rip* or *Tape Rip*
    because the MusicBrainz release Picard matched is an LP or cassette.

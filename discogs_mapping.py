@@ -2354,3 +2354,27 @@ def picker_search_terms(text: str) -> dict:
     if re.search(r'\d', text) and len(tokens) <= 3 and not any(len(t) > 10 and t.isalpha() for t in tokens):
         return {'catalog_number': text}
     return {'query': text}
+
+
+def other_part(release: dict, album_title: str, album_artist: str, track_titles) -> dict | None:
+    """The other album of a two-on-one RELEASE ("Beginnings / Tomorrow") than the one Picard
+    matched (ALBUM_TITLE, with TRACK_TITLES): {"title", "artist", "tracks": [{"title", "artist",
+    "duration"}]} in the release's order - its tracks those whose titles are not the matched
+    album's. None unless the release title has exactly one other part."""
+    parts = [p.strip() for p in _PARTS.split(str((release or {}).get('title') or '')) if p.strip()]
+    others = [p for p in parts if _folded(p) != _folded(album_title)]
+    if len(parts) < 2 or len(others) != 1 or len(others) == len(parts):
+        return None
+    mine = {_folded(t) for t in track_titles or () if _folded(t)}
+    rel_artists = [clean_artist_name(a.get('name') or '') for a in (release or {}).get('artists') or ()
+                   if isinstance(a, dict)]
+    part_artist = next((a for a in rel_artists if _folded(a) != _folded(album_artist)), '') or \
+        (rel_artists[0] if rel_artists else '')
+    tracks = []
+    for t in (release or {}).get('tracklist') or ():
+        if str(t.get('type_') or 'track') != 'track' or _folded(t.get('title')) in mine:
+            continue
+        names = [clean_artist_name(a.get('name') or '') for a in t.get('artists') or () if isinstance(a, dict)]
+        tracks.append({'title': str(t.get('title') or '').strip(), 'artist': ' & '.join(n for n in names if n) or part_artist,
+                       'duration': str(t.get('duration') or '')})
+    return {'title': others[0], 'artist': part_artist, 'tracks': tracks} if tracks else None
