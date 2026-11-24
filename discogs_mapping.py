@@ -2308,3 +2308,35 @@ def stale_discogs_tags(existing_names, protected=None) -> list:
             continue
         out.append(name)
     return sorted(out)
+
+
+# ---- one album of several on one release ("two on one") ---------------------------------------
+# The tags that say which pressing your copy is: written even when the release holds more than
+# the album Picard matched. The album's own identity (title, artists, original date, credits,
+# track titles and numbers) stays the matched album's.
+PRESSING_TAGS = frozenset({'date', 'releasecountry', 'catalognumber', 'label', 'media', 'barcode',
+                           'genre', 'releasestatus'})
+_PARTS = re.compile(r'\s+(?:/|\+|&|and|-)\s+|\s*/\s*', re.I)
+
+
+def _folded(text) -> str:
+    return re.sub(r'[^0-9a-z]+', ' ', unicodedata.normalize('NFKD', str(text or '')).encode(
+        'ascii', 'ignore').decode().casefold()).strip()
+
+
+def holds_more_than_album(release: dict, album_title: str, album_tracks: int) -> bool:
+    """The Discogs RELEASE holds more than the album Picard matched: more tracks, and its title
+    is several albums' (Steve Howe / Tomorrow - "Beginnings / Tomorrow", a "Two On One" CD: the
+    matched album "Beginnings" is one of its parts)."""
+    tracks = sum(1 for t in (release or {}).get('tracklist') or ()
+                 if str(t.get('type_') or 'track') == 'track')
+    if not album_tracks or tracks <= album_tracks:
+        return False
+    parts = [_folded(p) for p in _PARTS.split(str((release or {}).get('title') or '')) if _folded(p)]
+    return len(parts) >= 2 and _folded(album_title) in parts
+
+
+def pressing_only(fields: dict) -> dict:
+    """FIELDS less everything but the pressing's tags (PRESSING_TAGS and Discogs' own)."""
+    return {k: v for k, v in fields.items()
+            if k in PRESSING_TAGS or (k.startswith('discogs_') and not k.startswith('~'))}

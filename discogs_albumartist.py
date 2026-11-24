@@ -100,6 +100,15 @@ def apply_choice(metadata, lead) -> dict:
     metadata object. An unknown sort name or ID is taken off rather than left naming the whole
     credit. Returns {tag: (before, after)} of what changed."""
     name, sort, mbid = lead[0], lead[1] or '', lead[2] or ''
+    if not sort:
+        # the sort name the tags already give that artist, at its place in the credit
+        # (["Steve Howe", "Tomorrow"] sorted ["Howe, Steve", "Tomorrow"]: "Howe, Steve")
+        for names_key, sorts_key in (('albumartists', '~albumartists_sort'), ('albumartist', 'albumartistsort'),
+                                     ('albumartists', 'albumartistsort')):
+            names, sorts = _getall(metadata, names_key), _getall(metadata, sorts_key)
+            if name in names and len(sorts) == len(names):
+                sort = sorts[names.index(name)]
+                break
     changed = {}
 
     def put(key, values):

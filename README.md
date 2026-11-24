@@ -306,6 +306,13 @@ What it does with them, when your copy says anything of its pressing:
    rules out (only an MP3 download, for a CD rip), the album gets no Discogs
    data and no picker opens.
 
+   **One album of several on a release.** When the Discogs release holds more
+   than the album Picard matched — a "two on one" CD (*Beginnings / Tomorrow*)
+   whose title has the album's as one of its parts, with more tracks — only
+   its pressing is written (date, country, label, catalogue number, barcode,
+   media, genre, the Discogs links). The album's own title, artists, original
+   date, credits and track titles stay those of the album Picard matched.
+
    A folder with a CD rip log is never marked *Vinyl Rip* or *Tape Rip*
    because the MusicBrainz release Picard matched is an LP or cassette.
 

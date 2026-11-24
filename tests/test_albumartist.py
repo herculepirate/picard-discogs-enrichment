@@ -162,5 +162,12 @@ class Picard(unittest.TestCase):
         self.assertNotIn('musicbrainz_albumartistid', m)
 
 
+    def test_sort_kept_from_its_place_in_the_credit(self):
+        m = Meta(albumartist=['Steve Howe', 'Tomorrow'], albumartistsort=['Howe, Steve', 'Tomorrow'])
+        da.apply_choice(m, ('Steve Howe', '', '', ''))
+        self.assertEqual(m.getall('albumartist'), ['Steve Howe'])
+        self.assertEqual(m.getall('albumartistsort'), ['Howe, Steve'])
+
+
 if __name__ == '__main__':
     unittest.main()

@@ -45,6 +45,8 @@ from .discogs_logging import (LEVEL_BASIC, LEVEL_DETAILED, LEVEL_OFF,
                               log_path, plugin_log)
 from .discogs_coverart import ART_ALL, ART_FRONT, ART_FRONT_BACK
 from .discogs_mapping import (
+    holds_more_than_album,
+    pressing_only,
     release_artists_for,
     settle_artist_credits,
     snapshot_artist_credits,
@@ -749,6 +751,16 @@ def process_album(api, album, metadata, release) -> None:
         fields = _shape_fields(extract_discogs_fields(release_data))
         if not settings['import_notes']:
             fields.pop('discogs_notes', None)
+        # one album of several on the release ("Beginnings / Tomorrow", a two-on-one CD): only
+        # the pressing is written, the album stays the one Picard matched
+        part_of = holds_more_than_album(release_data, metadata.get('album') or '',
+                                        len(getattr(album, 'tracks', None) or ()))
+        if part_of:
+            fields = pressing_only(fields)
+            plugin_log.decision(op, f'Discogs release {release_data.get("id")} '
+                                    f'("{release_data.get("title")}") holds more than '
+                                    f'"{metadata.get("album")}": only its pressing is written '
+                                    f'(date, country, label, catalogue number, media)')
 
         def _finish():
             if not _album_is_alive(album):
@@ -766,7 +778,7 @@ def process_album(api, album, metadata, release) -> None:
             # which is exactly why automatic lookups produced no discogs_*
             # tags while the manual search did.
             targets = _album_metadata_targets(album, metadata)
-            track_fields = _album_track_fields(album, release_data)
+            track_fields = {} if part_of else _album_track_fields(album, release_data)
             # what the web filled and Discogs now supplies is Discogs' (the web fills only gaps)
             drop_web_fills(album, targets, set(fields) | {k for v in track_fields.values() for k in v})
             discogs_only = (settings['merge_mode'] or MODE_COMBINE) == MODE_DISCOGS_ONLY
@@ -784,7 +796,7 @@ def process_album(api, album, metadata, release) -> None:
                         settings['merge_mode'] or MODE_COMBINE, field=field)
                     if resolved is not None:
                         target[field] = resolved
-                if discogs_only:
+                if discogs_only and not part_of:
                     # The supplied set must include the track tags, or the
                     # clear would delete the very title just written.
                     supplied = set(fields) | set(per_track)
@@ -824,7 +836,8 @@ def process_album(api, album, metadata, release) -> None:
             return
 
         def _on_master(master_data):
-            fields.update(extract_original_year(master_data))
+            if not part_of:
+                fields.update(extract_original_year(master_data))
             _prefer_original_date(fields)
             _finish()
 

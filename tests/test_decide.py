@@ -415,3 +415,27 @@ class CopyMedia(unittest.TestCase):
             kept, ignored = dc.media_of_copy(['12" Vinyl'], d)
             self.assertEqual((kept, ignored), ([], ['12" Vinyl']))
             self.assertEqual(dc.media_of_copy(['CD'], d), (['CD'], []))
+
+
+class TwoOnOne(unittest.TestCase):
+    REL = {'id': 8752298, 'title': 'Beginnings / Tomorrow',
+           'tracklist': [{'type_': 'track', 'title': f't{i}'} for i in range(21)]}
+
+    def test_one_album_of_a_two_on_one(self):
+        self.assertTrue(dm.holds_more_than_album(self.REL, 'Beginnings', 9))
+        self.assertTrue(dm.holds_more_than_album(self.REL, 'Tomorrow', 12))
+
+    def test_not_the_whole_release_or_another_title(self):
+        self.assertFalse(dm.holds_more_than_album(self.REL, 'Beginnings / Tomorrow', 21))
+        self.assertFalse(dm.holds_more_than_album(self.REL, 'Beginnings', 21))
+        self.assertFalse(dm.holds_more_than_album(self.REL, 'Relayer', 9))
+        one = dict(self.REL, title='Beginnings (Deluxe Edition)')
+        self.assertFalse(dm.holds_more_than_album(one, 'Beginnings', 9))   # bonus tracks: not two albums
+
+    def test_only_the_pressing_is_written(self):
+        fields = {'album': 'Beginnings / Tomorrow', 'artist': ['Steve Howe', 'Tomorrow'], 'date': '2002',
+                  'originaldate': '2002', 'releasecountry': 'RU', 'catalognumber': 'SHWCD 14120201',
+                  'label': 'Not On Label', 'media': 'CD', 'discogs_release_id': '8752298',
+                  'performer:guitar': 'Steve Howe', '~discogs_track_length': '1:00'}
+        self.assertEqual(set(dm.pressing_only(fields)),
+                         {'date', 'releasecountry', 'catalognumber', 'label', 'media', 'discogs_release_id'})
