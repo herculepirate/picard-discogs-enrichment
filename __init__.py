@@ -88,7 +88,7 @@ from .discogs_disc_dialog import CONFIDENT_DISC_SCORE, DiscMappingDialog, auto_m
 from .discogs_evidence import (album_location, contradicts_release, copy_evidence,
                                discid_verdict, evidence_summary, has_copy_evidence, match_facts,
                                mb_release_discids, read_copy, search_terms, with_matched_names)
-from .discogs_decide import decide, match_detail, release_row
+from .discogs_decide import decide, match_detail, release_row, settled_without_scans
 from .discogs_decide import explain as explain_verdict
 from .discogs_http_bridge import PicardHttp, Worker
 from .discogs_ocr import merge_scans, scans_summary
@@ -949,11 +949,31 @@ def process_album(api, album, metadata, release) -> None:
         loc = album_location(paths)
         if loc is None:
             return {'loc': None}
-        album_d = read_copy(loc)
-        named_by = with_matched_names(album_d, matched_artist, matched_title)
+        quick = read_copy(loc)
+        named_by = with_matched_names(quick, matched_artist, matched_title)
         job = {'loc': loc, 'named_by': named_by, 'ocr': None, 'scans': None, 'merged': {}, 'verdict': None, 'http': None}
         scans = None
         extra = _save_embedded_art(loc['album_dir'], embedded)
+        http = PicardHttp(client, webservice)
+
+        def _decide(a, m):
+            return decide(a, http, _dm, mb_release_id=getattr(album, 'id', '') or '',
+                          mb_discids=mb_discids, linked=all_linked, mb_facts=mb_facts,
+                          ocr_text=m.get('text') or '', scan_probe=m.get('probe'),
+                          likely=bool(settings['pick_likely']))
+
+        # fast: what your copy says without its scans (rip log, disc ID, cue, folder name, tags,
+        # notes). The strongest proof - your exact disc ID - settles it now; the scans (minutes
+        # the first time) are read only when it does not
+        quick_merged = merge_scans(quick, loc['album_dir'], None)
+        quick_ev = copy_evidence(quick)
+        if has_copy_evidence(quick_ev):
+            verdict = _decide(quick, quick_merged)
+            if settled_without_scans(verdict):
+                job.update(merged=quick_merged, ev=quick_ev, http=http, verdict=verdict, fast=True)
+                return job
+        album_d = read_copy(loc)                # (afresh: deciding marks the album it reads)
+        with_matched_names(album_d, matched_artist, matched_title)
         if want_ocr:
             job['ocr'] = probe = OCR.probe()
             if probe.get('ok'):
@@ -966,14 +986,7 @@ def process_album(api, album, metadata, release) -> None:
         ev = job['ev'] = copy_evidence(album_d)
         if not has_copy_evidence(ev):
             return job
-        http = job['http'] = PicardHttp(client, webservice)
-
-        def _decide(a, m):
-            return decide(a, http, _dm, mb_release_id=getattr(album, 'id', '') or '',
-                          mb_discids=mb_discids, linked=all_linked, mb_facts=mb_facts,
-                          ocr_text=m.get('text') or '', scan_probe=m.get('probe'),
-                          likely=bool(settings['pick_likely']))
-
+        job['http'] = http
         verdict = job['verdict'] = _decide(album_d, merged)
         # undecided: the scans (and cover art) read again, harder, and decided again (Discogs'
         # answers are cached, so deciding again costs few requests)
@@ -1025,6 +1038,9 @@ def process_album(api, album, metadata, release) -> None:
             if result.get('named_by'):
                 plugin_log.detail(op, "your files carry no artist tag: Discogs is searched by the "
                                       "MusicBrainz release's artist and title")
+            if result.get('fast'):
+                plugin_log.event(op, 'decided from your rip log, disc ID and folder alone: '
+                                     'the scans were not needed')
             scanned = scans_summary(result.get('scans'), result.get('merged') or {})
             if scanned:
                 plugin_log.event(op, f'your scans and documents: {scanned}')

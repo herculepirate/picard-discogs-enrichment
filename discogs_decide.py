@@ -376,6 +376,14 @@ def codeless_pick(scored: list, album: dict, cfg: dict) -> dict | None:
     return bare[0]
 
 
+def settled_without_scans(verdict: dict | None) -> bool:
+    """A verdict nothing on the scans could change: your files belong to another MusicBrainz
+    release (your disc ID is on it), or your exact disc ID proves the pressing (TagMender's
+    strongest proof) - so the scans need not be read first."""
+    v = verdict or {}
+    return v.get('status') == 'move' or (v.get('status') == 'auto' and proof_rank(v.get('best')) == 3)
+
+
 def decide(album: dict, http, dm, *, mb_release_id: str = '', mb_discids=(), linked=(),
            mb_facts: dict | None = None, cfg: dict | None = None, ocr_text: str = '',
            scan_probe: dict | None = None, likely: bool = True) -> dict[str, Any]:

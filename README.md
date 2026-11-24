@@ -296,6 +296,12 @@ What it does with them, when your copy says anything of its pressing:
    *PEL 349*). Otherwise, or for a copy of more than one disc, you are asked. Turn off with **"Move my
    files to the MusicBrainz release my disc ID is on"**.
 
+   **Fast first.** Your copy is first decided from what costs no OCR: the rip
+   log, disc ID, cue sheet, folder name, tags and notes. When that already
+   settles it by the strongest proof — your exact disc ID, or your disc ID on
+   another MusicBrainz release than Picard matched — it is acted on at once,
+   and the scans (minutes the first time) are not read.
+
    **Read again, harder.** When the first reading leaves the pressing
    undecided, the scans — and the cover art embedded in your files — are read
    again: every page in all four turns, its small print in tiles, barcodes

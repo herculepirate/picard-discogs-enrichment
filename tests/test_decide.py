@@ -439,3 +439,16 @@ class TwoOnOne(unittest.TestCase):
                   'performer:guitar': 'Steve Howe', '~discogs_track_length': '1:00'}
         self.assertEqual(set(dm.pressing_only(fields)),
                          {'date', 'releasecountry', 'catalognumber', 'label', 'media', 'discogs_release_id'})
+
+
+class FastFirst(unittest.TestCase):
+    def test_settled_without_scans(self):
+        disc = {'cand': {'id': 1}, 'clues': {'disc TOC': 'x'}, 'code': ''}
+        barcode_only = {'cand': {'id': 2}, 'clues': {}, 'code': 'barcode'}
+        self.assertTrue(dd.settled_without_scans({'status': 'move', 'move_to': 'x'}))
+        self.assertTrue(dd.settled_without_scans({'status': 'auto', 'best': disc}))
+        # a barcode or catalogue number, a likely pick, a review: the scans are read first
+        self.assertFalse(dd.settled_without_scans({'status': 'auto', 'best': barcode_only}))
+        self.assertFalse(dd.settled_without_scans({'status': 'likely', 'best': disc}))
+        self.assertFalse(dd.settled_without_scans({'status': 'review'}))
+        self.assertFalse(dd.settled_without_scans(None))
