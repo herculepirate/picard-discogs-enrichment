@@ -277,7 +277,7 @@ What it does with them, when your copy says anything of its pressing:
    | **Linked** | MusicBrainz links that Discogs release to the release Picard matched, and nothing of your copy is against it |
    | **Same as MusicBrainz** | It carries the matched MusicBrainz release's barcode (or its catalogue number and year), and nothing of your copy is against it |
    | **Printed on your scans** | Several pressings carry what your copy proves (one barcode on a 1994 and a 1999 run), and only one of them lists a mark your scans print: a copyright line (*"© 1994 Movieplay S.A."*), a rights society (SPA, MCPS, GEMA …) or a matrix code. If a mark another pressing lists is printed too, you are asked |
-   | **Only one unopposed** | Several pressings carry your barcode, and only one has nothing of your copy against it *and* its country printed on your scans (*"Made in the EU"* on a *UK & Europe* pressing, the Taiwan, Brazil and Mexico runs of the same barcode ruled out). Under **"…take the most likely"** |
+   | **Only one unopposed** | Several pressings carry your barcode or catalogue number, and only one has nothing of your copy against it, the country your copy names telling them apart: printed on your scans for it (*"Made in the EU"* on a *UK & Europe* pressing; the Taiwan, Brazil and Mexico runs of the same barcode ruled out), or against every other (*Germany* in the folder name: the *Europe* CD, not the *Russia* one). Under **"…take the most likely"** |
    | **No code printed** | Your back cover was scanned and read whole, no barcode is on it or in your tags, and of the pressings that fit only one lists neither a barcode nor a catalogue number (a codeless promo-style CD, not the Japanese or reissue pressings that print theirs). Under **"…take the most likely"** |
    | **Most likely** | Several pressings carry what your copy proves and nothing printed tells them apart, but TagMender scores one clearly highest (at least 90%, a point or more ahead): its year, country, label and track lengths fit best. The others are named in the log. Turn off with **"When several pressings share my proof, take the most likely"** |
 
@@ -305,6 +305,9 @@ What it does with them, when your copy says anything of its pressing:
    **Nothing your copy can be.** When every Discogs entry is one your copy
    rules out (only an MP3 download, for a CD rip), the album gets no Discogs
    data and no picker opens.
+
+   A folder with a CD rip log is never marked *Vinyl Rip* or *Tape Rip*
+   because the MusicBrainz release Picard matched is an LP or cassette.
 
    A 12–13 digit "catalogue number" one digit off your decoded barcode, and no
    valid barcode itself, is a misread or mistyped barcode: it is not held

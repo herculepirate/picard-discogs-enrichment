@@ -341,11 +341,20 @@ class NoInterventionRules(unittest.TestCase):
         eu = self._s(1, 99, clues={'country': 'made in the EU on the scans (a European pressing)'})
         others = [self._s(i, 99, against=['scans say made in XE, this pressing is from Taiwan']) for i in (2, 3)]
         self.assertIs(dd.only_unopposed([eu] + others), eu)
-        # nothing printed for it: not enough
+        # nothing printed for it, but the country your copy names rules out every other: taken
         bare = self._s(1, 99)
-        self.assertIsNone(dd.only_unopposed([bare] + others))
+        self.assertIs(dd.only_unopposed([bare] + others), bare)
+        # the others ruled out for another reason (not a country your copy names): not enough
+        other_reason = [self._s(i, 99, against=['your rip log is dated 2010; this pressing came out in 2015'])
+                        for i in (2, 3)]
+        self.assertIsNone(dd.only_unopposed([bare] + other_reason))
+
+    def test_only_unopposed_by_the_folder_names_country(self):
+        europe = self._s(3203195, 100)
+        russia = self._s(12837163, 100, against=['folder name says DE, this pressing is from Russia'])
+        self.assertIs(dd.only_unopposed([europe, russia]), europe)
         # two unopposed: not decided
-        self.assertIsNone(dd.only_unopposed([eu, self._s(4, 99)] + others))
+        self.assertIsNone(dd.only_unopposed([europe, self._s(4, 100), russia]))
 
 
 class DeepReading(unittest.TestCase):
@@ -388,3 +397,21 @@ class CodelessCopy(unittest.TestCase):
         self.assertIsNone(dd.codeless_pick([self._s(1), self._s(2)], self._album(), self.CFG))
         scored = [self._s(1), self._s(2, catnos=['PDIP-6537'])]
         self.assertIsNone(dd.codeless_pick(scored, self._album(printed_text='PDIP-6537'), self.CFG))
+
+
+class CopyMedia(unittest.TestCase):
+    def test_a_cd_rip_log_rules_out_the_matched_vinyl(self):
+        import tempfile
+        import discogs_copy as dc
+        with tempfile.TemporaryDirectory() as d:
+            self.assertEqual(dc.media_of_copy(['12" Vinyl'], d), (['12" Vinyl'], []))   # no log
+            Path(d, 'rip.log').write_text(
+                'Exact Audio Copy V1.0 beta 3\n\nTOC of the extracted CD\n\n'
+                '     Track |   Start  |  Length  | Start sector | End sector \n'
+                '    ---------------------------------------------------------\n'
+                '        1  |  0:00.00 |  4:00.00 |         0    |    17999   \n'
+                '        2  |  4:00.00 |  3:00.00 |     18000    |    31499   \n'
+                '        3  |  7:00.00 |  5:00.00 |     31500    |    53999   \n', encoding='utf-8')
+            kept, ignored = dc.media_of_copy(['12" Vinyl'], d)
+            self.assertEqual((kept, ignored), ([], ['12" Vinyl']))
+            self.assertEqual(dc.media_of_copy(['CD'], d), (['CD'], []))

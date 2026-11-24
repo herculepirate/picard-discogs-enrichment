@@ -324,13 +324,25 @@ def proof_first(scored: list, cfg: dict, held=()) -> dict | None:
     return x
 
 
+# a country your copy names, against a pressing: its folder name or its scans
+_COUNTRY_AGAINST = ('folder name says', 'scans say made in')
+
+
 def only_unopposed(tied: list) -> dict | None:
-    """Of pressings your copy proves equally, the only one nothing of your copy is against AND
-    whose country your scans print (Joy Division - Total: one barcode on six CDs; "Made in the
-    EU" on the scans; only "UK & Europe" is left). None otherwise."""
+    """Of pressings your copy proves equally, the only one nothing of your copy is against, when
+    the country your copy names is what tells them apart: printed on your scans for it (Joy
+    Division - Total: one barcode on six CDs; "Made in the EU" on the scans; only "UK & Europe"
+    is left), or against every other (Steve Howe - The Steve Howe Album: 7567-81559-2 on a
+    "Europe" and a "Russia" CD; the folder name says Germany). None otherwise."""
     free = [x for x in tied if not x.get('clues_against') and not x.get('conflict') and x.get('tracks_ok')]
-    if len(tied) > 1 and len(free) == 1 and 'country' in (free[0].get('clues') or {}):
-        return free[0]
+    if len(tied) < 2 or len(free) != 1:
+        return None
+    lone = free[0]
+    if 'country' in (lone.get('clues') or {}):
+        return lone
+    if all(any(str(a).startswith(_COUNTRY_AGAINST) for a in x.get('clues_against') or ())
+           for x in tied if x is not lone):
+        return lone
     return None
 
 
@@ -497,8 +509,9 @@ def decide(album: dict, http, dm, *, mb_release_id: str = '', mb_discids=(), lin
         lone = only_unopposed(tied) if likely else None
         if lone is not None and str(lone['cand'].get('id')) not in held:
             out.update(status='likely', best=lone, others=[x for x in tied if x is not lone])
+            where = (lone.get('clues') or {}).get('country') or 'the country your copy names rules out the others'
             out['why'].insert(0, f'{len(tied)} pressings carry what your copy proves; only this one has '
-                                 f'nothing of your copy against it, and {lone["clues"]["country"]}')
+                                 f'nothing of your copy against it, and {where}')
             return out
     top, others = most_likely(scored, proven, held) if likely else (None, [])
     if top is not None and others:

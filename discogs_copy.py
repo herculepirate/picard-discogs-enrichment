@@ -36,12 +36,14 @@ try:
     from . import tm_editions as ted
     from . import tm_marks as tmarks
     from . import tm_match_core as mc
+    from . import tm_readers as tr
     from . import tm_vinylrip as tvr
 except ImportError:  # run outside Picard (tests)
     import tm_album_artist_deps as comp
     import tm_editions as ted
     import tm_marks as tmarks
     import tm_match_core as mc
+    import tm_readers as tr
     import tm_vinylrip as tvr
 
 EDITION_MODES = ('off', 'edition', 'edition_year')
@@ -185,6 +187,7 @@ def copy_facts(paths: list[str], folder: str, media: list[str], p: dict, release
     folder's notes - on a worker, never Picard's main thread."""
     lossless = [x for x in paths if os.path.splitext(x)[1].lower() in tmarks.LOSSLESS]
     hd = any(tmarks.is_hd(x) for x in lossless[:HD_FILES])
+    media, ignored = media_of_copy(media, folder)
     mark = tmarks.of_album([{'media': media}], [], folder) if paths or media else ''
     if hd and not mark:
         mark = tmarks.HD
@@ -198,7 +201,26 @@ def copy_facts(paths: list[str], folder: str, media: list[str], p: dict, release
             rip_line = tvr.comment_line(d)
         except Exception:
             rip_line = ''
-    return {'hd': hd, 'mark': mark, 'rip_line': rip_line}
+    return {'hd': hd, 'mark': mark, 'rip_line': rip_line, 'media_ignored': ignored}
+
+
+def media_of_copy(media, folder: str) -> tuple[list, list]:
+    """The release's media, less a vinyl or tape your copy cannot be: a folder with a CD rip
+    log (one with the disc's table of contents: EAC, XLD, CUERipper ...) was ripped from a CD,
+    whatever the release Picard matched says (Steve Howe - The Steve Howe Album: Picard matched
+    the 1979 LP; the folder holds the 1995 CD and its EAC log). Not when the folder name says
+    vinyl. Returns (media kept, media ignored)."""
+    media = list(media or ())
+    off = [m for m in media if mc.media_kind(m) in ('vinyl', 'cassette')]
+    if not off or not folder or mc.folder_says_vinyl(os.path.basename(str(folder))):
+        return media, []
+    try:
+        cd_log = any(log.get('toc') for log in tr.rip_logs(folder))
+    except Exception:
+        cd_log = False
+    if not cd_log:
+        return media, []
+    return [m for m in media if m not in off], off
 
 
 # ---- writing one metadata object -------------------------------------------------------------
@@ -352,6 +374,10 @@ def _write(album, metadata, op, targets_of, ui_refresh, p, facts, st) -> None:
             ed_now = ed
             changed_any.update(changed)
     st['edition']['*'] = ed_now
+    if facts.get('media_ignored') and not st.get('told_ignored'):
+        st['told_ignored'] = True
+        plugin_log.decision(op, f'your copy: the matched release is {", ".join(facts["media_ignored"])}, '
+                                f'but your folder has a CD rip log - no vinyl or tape marks')
     if changed_any:
         what = ', '.join(f'{k}: {now}' for k, (_was, now) in sorted(changed_any.items()))
         plugin_log.decision(op, f'your copy: {what[:300]}')
