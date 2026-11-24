@@ -1053,6 +1053,14 @@ def process_album(api, album, metadata, release) -> None:
                 _start()                      # (your copy says nothing of its pressing: as 0.4.0)
                 return
             _log_verdict(op, verdict, http)
+            if 'mb' in getattr(http, 'unavailable', ()) and verdict.get('status') not in ('auto', 'move'):
+                msg = ('Discogs Enrichment: MusicBrainz did not answer, so your disc ID could not be '
+                       'checked for this album - reload it later')
+                plugin_log.event(op, msg)
+                try:
+                    album.tagger.window.set_statusbar_message(msg, timeout=15000, echo=None, translate=None)
+                except Exception:
+                    pass
             best = verdict.get('best') or {}
             rid = (best.get('cand') or {}).get('id')
             status = verdict['status']
@@ -2145,9 +2153,9 @@ class _DiscogsSearchBase(BaseAction):
 
         # Everything the dialog collected except the direct-ID box and the
         # result-scope radio, which are not search terms.
-        search_terms = {name: value for name, value in values.items()
+        query_terms = {name: value for name, value in values.items()
                         if name not in ('direct', 'release_type')}
-        if not any(search_terms.values()):
+        if not any(query_terms.values()):
             log.debug('Discogs Enrichment: search dialog closed with nothing to search on')
             return
 
@@ -2206,7 +2214,7 @@ class _DiscogsSearchBase(BaseAction):
             handler=self._guard(_on_results),
             on_relaxed=_note_relaxed,
             release_type=values.get('release_type') or 'release',
-            **search_terms,
+            **query_terms,
         )
 
     def _make_detail_fetcher(self, client):

@@ -20,3 +20,20 @@ class Manifest(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class NoShadowedImports(unittest.TestCase):
+    """A function assigning a name the module imports makes that name local to the whole
+    function: an earlier call of the import fails (UnboundLocalError - Search Discogs, 0.9.3)."""
+
+    def test_no_function_assigns_an_imported_name(self):
+        import ast
+        for name in ('__init__.py', 'discogs_decide.py', 'discogs_copy.py', 'discogs_albumartist.py',
+                     'discogs_webenrich.py', 'discogs_http_bridge.py', 'discogs_ocr.py'):
+            tree = ast.parse((ROOT / name).read_text())
+            imported = {a.asname or a.name.split('.')[0] for n in tree.body
+                        if isinstance(n, (ast.Import, ast.ImportFrom)) for a in n.names}
+            for f in ast.walk(tree):
+                if isinstance(f, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    assigned = {n.id for n in ast.walk(f) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)}
+                    self.assertFalse(assigned & imported, f'{name}:{f.lineno} {f.name} assigns {assigned & imported}')

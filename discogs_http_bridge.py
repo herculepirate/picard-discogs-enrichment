@@ -45,6 +45,8 @@ class PicardHttp:
         self.spent = False
         self.releases: dict[str, dict] = {}
         self.last_status = 0
+        # sites that could not be asked (an error other than "not found": 503, timeout ...)
+        self.unavailable: set[str] = set()
 
     def _wait(self, start: Callable[[Callable], None]) -> tuple[Any, Any]:
         """Run START(done) on the main thread; block until done(document, reply, error)."""
@@ -105,6 +107,8 @@ class PicardHttp:
                 self.releases[str(document['id'])] = document
             return document
         document, error = self._wait(lambda done: self._send(url, 'json', done))
+        if error and self.last_status != 404:
+            self.unavailable.add(host)
         return document if not error and isinstance(document, dict) else None
 
     def get_text(self, url: str, host: str) -> str:
