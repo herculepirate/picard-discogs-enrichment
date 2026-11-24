@@ -303,11 +303,51 @@ def pick_discid_release(album: dict, others: list, mb_facts: dict | None, likely
     return None, ''
 
 
-def proof_first(scored: list, cfg: dict, held=()) -> dict | None:
+def _bare_title(text) -> str:
+    """An album title without its bracketed remarks ("Mothballs [2001 ReIssue]": "mothballs")."""
+    return mc.fold(re.sub(r'\s*[\[(][^\])]*[\])]', ' ', str(text or '')))
+
+
+def subtitled(copy_title, cand_title) -> bool:
+    """The release's title is your album's with a subtitle ("Mothballs" - "Mothballs - Groups &
+    Sessions 64-69", "Mothballs: The Early Years", "Mothballs (Groups & Sessions)")."""
+    words = _bare_title(copy_title).split()
+    if not words:
+        return False
+    lead = r'\W*'.join(re.escape(w) for w in words)
+    return re.match(rf'\s*(?:(?:the|a|an|le|la|les|der|die|das|el|los)\s+)?{lead}\s*(?:[-:\u2013\u2014(/]|\[)\s*\w',
+                    _ascii_lower(cand_title), re.I) is not None
+
+
+def _ascii_lower(text) -> str:
+    import unicodedata
+    return unicodedata.normalize('NFKD', str(text or '')).encode('ascii', 'ignore').decode().casefold()
+
+
+def titles_agree(album_tracks, cand_tracks) -> float:
+    """The share of your files whose title is the release's track title at the same place, a
+    leading "Group - " in yours aside (a compilation of several groups: "Syndicats - Maybellene"
+    for "Maybellene"). 0.0 when the counts differ or nothing can be compared."""
+    mine = sorted(album_tracks or (), key=lambda t: (t.get('disc') or 1, t.get('num') or 0))
+    theirs = list(cand_tracks or ())
+    if not mine or len(mine) != len(theirs):
+        return 0.0
+    good = 0
+    for m, t in zip(mine, theirs):
+        a, b = mc.fold(str(m.get('title') or '')), mc.fold(str(t.get('title') or ''))
+        if b and (a == b or a.endswith(' ' + b)):
+            good += 1
+    return good / len(mine)
+
+
+def proof_first(scored: list, cfg: dict, held=(), album: dict | None = None) -> dict | None:
     """The one candidate your copy proves by disc ID or barcode, when no other is proven as
     strongly - whatever TagMender's confidence ranked first (Dustin O'Halloran - Piano Solos:
     five pressings at 82%, one with your exact disc ID). It must fit every track, carry the
-    album's artist and title, and have nothing of your copy against it."""
+    album's artist and title, and have nothing of your copy against it. A title that is your
+    album's with a subtitle counts as the album's (Steve Howe - Mothballs: your barcode on
+    "Mothballs - Groups & Sessions 64-69") when the album itself agrees: half its track titles
+    or half its lengths."""
     proven = [x for x in scored if proven_by_copy(x) and x.get('tracks_ok')]
     if not proven:
         return None
@@ -318,10 +358,15 @@ def proof_first(scored: list, cfg: dict, held=()) -> dict | None:
     x = tied[0]
     if (x.get('clues_against') or x.get('conflict') or mc._ruled_out_by_copy(x)
             or str(x['cand'].get('id')) in held
-            or (x.get('artist_sim') or 0) < cfg['auto_min_artist']
-            or (x.get('title_sim') or 0) < cfg['auto_min_title']):
+            or (x.get('artist_sim') or 0) < cfg['auto_min_artist']):
         return None
-    return x
+    if (x.get('title_sim') or 0) >= cfg['auto_min_title']:
+        return x
+    if album and subtitled(album.get('title'), x['cand'].get('title')) and (
+            (x.get('dur_frac') or 0) >= 0.5
+            or titles_agree(album.get('tracks'), x['cand'].get('tracks')) >= 0.5):
+        return x
+    return None
 
 
 # a country your copy names, against a pressing: its folder name or its scans
@@ -469,7 +514,7 @@ def decide(album: dict, http, dm, *, mb_release_id: str = '', mb_discids=(), lin
             and all(x is best or proof_rank(x) < rank for x in proven):
         return out              # proven by your copy, and no other pressing as strongly
     held = {str(best['cand'].get('id'))} if best and mc.R9_HELD in out['why'] else set()
-    first = proof_first(scored, cfg, held)
+    first = proof_first(scored, cfg, held, album)
     if first is not None:
         out.update(status='auto', best=first)
         out['why'].insert(0, f'only this pressing is proven by your copy '
@@ -575,8 +620,12 @@ def release_row(det: dict) -> dict:
 def match_detail(s: dict, best: dict | None = None) -> dict:
     """The picker's Match cell for one scored candidate: TagMender's confidence and clues."""
     conf = float((s or {}).get('confidence') or 0)
-    if proven_by_copy(s):
-        label = 'Proven'
+    rank = proof_rank(s) if proven_by_copy(s) else 0
+    against = bool((s or {}).get('clues_against') or (s or {}).get('conflict'))
+    if rank:
+        label = 'Proven (' + {3: 'disc ID', 2: 'barcode', 1: 'cat. no.'}[rank] + ')'
+    elif against:
+        label = 'Doubtful'
     elif conf >= 90:
         label = 'Strong'
     elif conf >= 60:
@@ -585,7 +634,10 @@ def match_detail(s: dict, best: dict | None = None) -> dict:
         label = 'Weak'
     else:
         label = 'No match'
-    return {'score': round(conf), 'label': label,
+    # sorted on: what your copy proves (disc ID > barcode > catalogue number), then nothing of
+    # your copy against it, then TagMender's confidence - never the label's alphabet
+    order = rank * 1000 + (0 if against else 500) + round(conf)
+    return {'score': order, 'label': label,
             'text': f'{label}: {explain(s)}' + (' (TagMender\'s pick)' if best is not None and s is best else '')}
 
 

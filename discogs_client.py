@@ -32,7 +32,7 @@ from picard.webservice import WSRequest
 
 DISCOGS_HOST = 'api.discogs.com'
 MUSICBRAINZ_HOST = 'musicbrainz.org'
-USER_AGENT = 'PicardDiscogsEnrichment/0.9.4 +https://github.com/herculepirate/picard-discogs-enrichment'
+USER_AGENT = 'PicardDiscogsEnrichment/0.9.5 +https://github.com/herculepirate/picard-discogs-enrichment'
 
 
 # Process-wide response cache. Tagging a box set, re-running a lookup, or

@@ -2340,3 +2340,17 @@ def pressing_only(fields: dict) -> dict:
     """FIELDS less everything but the pressing's tags (PRESSING_TAGS and Discogs' own)."""
     return {k: v for k, v in fields.items()
             if k in PRESSING_TAGS or (k.startswith('discogs_') and not k.startswith('~'))}
+
+
+def picker_search_terms(text: str) -> dict:
+    """What the picker's search box was given, as Discogs search terms: a barcode (8-14 digits,
+    spaces or dashes between them: "6 66496 40312 3"), a catalogue number (a short code with
+    digits: "BIG 4031-2", "C5CD 528"), or words searched as they are."""
+    text = str(text or '').strip()
+    digits = re.sub(r'[\s-]', '', text)
+    if digits.isdigit() and 8 <= len(digits) <= 14:
+        return {'barcode': digits}
+    tokens = text.split()
+    if re.search(r'\d', text) and len(tokens) <= 3 and not any(len(t) > 10 and t.isalpha() for t in tokens):
+        return {'catalog_number': text}
+    return {'query': text}

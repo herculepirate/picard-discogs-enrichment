@@ -265,7 +265,7 @@ class PickerRows(unittest.TestCase):
         s = {'confidence': 95.0, 'clues': {'catalogue number': 'x'}, 'code': 'catalogue number (folder name)',
              'clues_against': []}
         label, text = dm.describe_match(dd.match_detail(s, s))
-        self.assertEqual(label, 'Proven')
+        self.assertEqual(label, 'Proven (cat. no.)')
         self.assertIn("TagMender's pick", text)
 
 
@@ -452,3 +452,56 @@ class FastFirst(unittest.TestCase):
         self.assertFalse(dd.settled_without_scans({'status': 'likely', 'best': disc}))
         self.assertFalse(dd.settled_without_scans({'status': 'review'}))
         self.assertFalse(dd.settled_without_scans(None))
+
+
+class Mothballs(unittest.TestCase):
+    """Your barcode on "Mothballs - Groups & Sessions 64-69"; your files titled "Group - Title"."""
+    CFG = dd._cfg()
+
+    def test_subtitled(self):
+        self.assertTrue(dd.subtitled('Mothballs [2001 ReIssue]', 'Mothballs - Groups & Sessions 64-69'))
+        self.assertTrue(dd.subtitled('The Early Years', 'The Early Years - Live'))
+        self.assertFalse(dd.subtitled('Mothballs', 'Mothballs'))
+        self.assertFalse(dd.subtitled('Mothballs', 'Mothballs Two'))
+        self.assertFalse(dd.subtitled('Moth', 'Mothballs - X'))
+
+    def test_titles_agree_with_a_group_in_front(self):
+        mine = [{'num': 1, 'title': 'Syndicats - Maybellene'}, {'num': 2, 'title': 'In Crowd - On The Horizon'},
+                {'num': 3, 'title': 'Something Else'}]
+        theirs = [{'title': 'Maybellene'}, {'title': 'On The Horizon'}, {'title': 'Other'}]
+        self.assertAlmostEqual(dd.titles_agree(mine, theirs), 2 / 3)
+        self.assertEqual(dd.titles_agree(mine, theirs[:2]), 0.0)          # counts differ
+
+    def _s(self, title, **kw):
+        tracks = [{'title': f'T{i}'} for i in range(4)]
+        return dict({'cand': {'id': 9847398, 'title': title, 'tracks': tracks}, 'confidence': 75.0,
+                     'clues': {}, 'code': 'barcode', 'clues_against': [], 'tracks_ok': True,
+                     'artist_sim': 1.0, 'title_sim': 0.49, 'dur_frac': 0.2}, **kw)
+
+    def test_barcode_on_a_subtitled_release_whose_tracks_agree(self):
+        album = {'title': 'Mothballs [2001 ReIssue]',
+                 'tracks': [{'num': i + 1, 'title': f'Group - T{i}'} for i in range(4)]}
+        x = self._s('Mothballs - Groups & Sessions 64-69')
+        self.assertIs(dd.proof_first([x], self.CFG, album=album), x)
+
+    def test_not_when_neither_titles_nor_lengths_agree(self):
+        album = {'title': 'Mothballs', 'tracks': [{'num': i + 1, 'title': f'Other {i}'} for i in range(4)]}
+        self.assertIsNone(dd.proof_first([self._s('Mothballs - Groups & Sessions 64-69')], self.CFG, album=album))
+
+    def test_not_for_another_title(self):
+        album = {'title': 'Mothballs', 'tracks': [{'num': i + 1, 'title': f'T{i}'} for i in range(4)]}
+        self.assertIsNone(dd.proof_first([self._s('Beginnings')], self.CFG, album=album))
+
+    def test_picker_search_terms(self):
+        self.assertEqual(dm.picker_search_terms('666496403123'), {'barcode': '666496403123'})
+        self.assertEqual(dm.picker_search_terms('6 66496 40312 3'), {'barcode': '666496403123'})
+        self.assertEqual(dm.picker_search_terms('BIG 4031-2'), {'catalog_number': 'BIG 4031-2'})
+        self.assertEqual(dm.picker_search_terms('Steve Howe Mothballs'), {'query': 'Steve Howe Mothballs'})
+
+    def test_match_order_proof_before_doubt(self):
+        proven = dd.match_detail(self._s('Mothballs - X'))
+        doubtful = dd.match_detail(dict(self._s('Mothballs'), code='', clues_against=['scans say made in US'],
+                                        confidence=75.0))
+        self.assertEqual(proven['label'], 'Proven (barcode)')
+        self.assertEqual(doubtful['label'], 'Doubtful')
+        self.assertGreater(proven['score'], doubtful['score'])

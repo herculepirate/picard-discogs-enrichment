@@ -273,7 +273,7 @@ What it does with them, when your copy says anything of its pressing:
    | | |
    | --- | --- |
    | **Proven** | TagMender is sure *and* your copy proves the pick: your disc ID, your barcode or your catalogue number, with no other pressing proven as strongly (a disc ID beats a barcode, a barcode a catalogue number; a number two pressings share proves neither) |
-   | **Only one proven** | Your disc ID or barcode is on exactly one candidate, it fits every track, its artist and title are the album's, and nothing of your copy is against it — even when TagMender's overall confidence is under 90% (five pressings of one album at 82%, one of them with your exact disc ID) |
+   | **Only one proven** | Your disc ID or barcode is on exactly one candidate, it fits every track, its artist and title are the album's, and nothing of your copy is against it — even when TagMender's overall confidence is under 90% (five pressings of one album at 82%, one of them with your exact disc ID). A release titled as your album *with a subtitle* counts (*Mothballs* → *Mothballs - Groups & Sessions 64-69*) when half its track titles agree — a leading "Group - " in yours aside — or half its lengths |
    | **Linked** | MusicBrainz links that Discogs release to the release Picard matched, and nothing of your copy is against it |
    | **Same as MusicBrainz** | It carries the matched MusicBrainz release's barcode (or its catalogue number and year), and nothing of your copy is against it |
    | **Printed on your scans** | Several pressings carry what your copy proves (one barcode on a 1994 and a 1999 run), and only one of them lists a mark your scans print: a copyright line (*"© 1994 Movieplay S.A."*), a rights society (SPA, MCPS, GEMA …) or a matrix code. If a mark another pressing lists is printed too, you are asked |
@@ -328,7 +328,11 @@ What it does with them, when your copy says anything of its pressing:
    Europe.
 
 5. **Otherwise you choose.** The release picker opens with TagMender's
-   candidates, best first; its Match column shows TagMender's confidence and
+   candidates, best first — what your copy proves first (*Proven (disc ID)*,
+   *Proven (barcode)*, *Proven (cat. no.)*), a pressing your copy is against
+   last (*Doubtful*). It shows each release's **barcode**, and its **Search
+   Discogs** box adds releases to the list: type a barcode, a catalogue
+   number, or artist and title words. Its Match column shows TagMender's confidence and
    every clue for and against (*"Proven: 100% | for: disc ID (track positions
    of the CD) matches; label Century Media, 77219-2 in the tags"*). Pickers
    open one album at a time and do not block Picard. Turn this off with

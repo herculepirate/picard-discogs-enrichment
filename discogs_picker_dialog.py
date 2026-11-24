@@ -59,6 +59,8 @@ COLUMNS: tuple[tuple[str, str, bool, int, str], ...] = (
      'Promo, Mono and so on.'),
     ('Label', 'label', False, 125, 'Record label(s) on this pressing.'),
     ('Cat #', 'catno', False, 115, 'Catalogue number — often the single most reliable identifier.'),
+    ('Barcode', 'barcode', False, 120,
+     'Barcode(s) Discogs lists for this pressing — compare with the one on your copy.'),
     ('Have / Want', 'community', True, 0,
      'How many Discogs users own this pressing versus want it. A high "have" '
      'usually marks the common, well-documented pressing.'),
@@ -197,6 +199,7 @@ class DiscogsPickerDialog(QtWidgets.QDialog):
         parent=None,
         match_details: list[dict[str, Any]] | None = None,
         detail_fetcher: Callable[[Any, Callable[[Any], None]], None] | None = None,
+        searcher: Callable[[str, Callable[[list], None]], None] | None = None,
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle('Choose Discogs Release')
@@ -204,6 +207,7 @@ class DiscogsPickerDialog(QtWidgets.QDialog):
 
         self._results = list(results or [])
         self._detail_fetcher = detail_fetcher
+        self._searcher = searcher
         self._detail_requested: set[Any] = set()
         self.selected_result: dict[str, Any] | None = None
 
@@ -239,6 +243,25 @@ class DiscogsPickerDialog(QtWidgets.QDialog):
         self.filter_field.textChanged.connect(self._apply_filter)
         filter_row.addWidget(self.filter_field, 1)
         layout.addLayout(filter_row)
+
+        # a new Discogs search from here: a barcode, a catalogue number or words; what it finds
+        # is added to the list (Filter only narrows what is listed)
+        if searcher is not None:
+            search_row = QtWidgets.QHBoxLayout()
+            search_row.addWidget(QtWidgets.QLabel('Search Discogs:'))
+            self.search_field = QtWidgets.QLineEdit(self)
+            self.search_field.setPlaceholderText(
+                'A barcode (e.g. 666496403123), a catalogue number, or artist and title words')
+            self.search_field.setClearButtonEnabled(True)
+            self.search_field.returnPressed.connect(self._search)
+            search_row.addWidget(self.search_field, 1)
+            self.search_button = QtWidgets.QPushButton('Search', self)
+            self.search_button.setAutoDefault(False)
+            self.search_button.clicked.connect(self._search)
+            search_row.addWidget(self.search_button)
+            self.search_status = QtWidgets.QLabel('', self)
+            search_row.addWidget(self.search_status)
+            layout.addLayout(search_row)
 
         self.table = QtWidgets.QTableWidget(len(self._rows), len(COLUMNS), self)
         self.table.setHorizontalHeaderLabels([c[0] for c in COLUMNS])
@@ -343,6 +366,8 @@ class DiscogsPickerDialog(QtWidgets.QDialog):
         row = self._rows[row_index]
         was_sorting = self.table.isSortingEnabled()
         self.table.setSortingEnabled(False)
+        # the table row showing this release: after sorting it is not ROW_INDEX's place
+        view_row = self._view_row_of(row_index)
         try:
             for column, (_label, key, numeric, _width, _tooltip) in enumerate(COLUMNS):
                 text, sort_key = self._cell_for(row, key, numeric)
@@ -362,9 +387,21 @@ class DiscogsPickerDialog(QtWidgets.QDialog):
                         font = item.font()
                         font.setItalic(True)
                         item.setFont(font)
-                self.table.setItem(row_index, column, item)
+                self.table.setItem(view_row, column, item)
         finally:
             self.table.setSortingEnabled(was_sorting)
+
+    def _view_row_of(self, row_index: int) -> int:
+        """The table row holding release ROW_INDEX (its first cell carries the index); the first
+        empty row for one not shown yet."""
+        empty = None
+        for view_row in range(self.table.rowCount()):
+            item = self.table.item(view_row, 0)
+            if item is None:
+                empty = view_row if empty is None else empty
+            elif item.data(QtCore.Qt.ItemDataRole.UserRole) == row_index:
+                return view_row
+        return row_index if empty is None else empty
 
     def _cell_for(self, row: dict[str, Any], key: str, numeric: bool) -> tuple[str, Any]:
         if key == 'community':
@@ -391,6 +428,40 @@ class DiscogsPickerDialog(QtWidgets.QDialog):
             except (TypeError, ValueError):
                 return str(value), None
         return str(value), str(value).casefold()
+
+    # -- searching from the picker ----------------------------------------
+    def _search(self) -> None:
+        text = self.search_field.text().strip()
+        if not text or self._searcher is None:
+            return
+        self.search_button.setEnabled(False)
+        self.search_status.setText('searching…')
+        self._searcher(text, self._add_results)
+
+    def _add_results(self, results) -> None:
+        """Releases a search found, added below those listed (each release once)."""
+        if not self._is_alive():
+            return
+        self.search_button.setEnabled(True)
+        known = {r.get('release_id') for r in self._rows}
+        added = 0
+        for result in results or ():
+            row = summarize_search_result(result, score=-1)   # (below every scored release)
+            if row.get('release_id') in known or row.get('is_master'):
+                continue
+            known.add(row.get('release_id'))
+            row['match_label'] = 'Searched'
+            row['match_explanation'] = 'Found by your search; not scored against your files.'
+            self._results.append(result)
+            self._rows.append(row)
+            was_sorting = self.table.isSortingEnabled()
+            self.table.setSortingEnabled(False)
+            self.table.insertRow(self.table.rowCount())
+            self.table.setSortingEnabled(was_sorting)
+            self._populate_row(len(self._rows) - 1)
+            added += 1
+        self.search_status.setText(f'{added} added' if added else 'nothing new found')
+        self._apply_filter(self.filter_field.text())
 
     # -- selection and filtering -----------------------------------------
     def _row_index_at(self, view_row: int) -> int | None:

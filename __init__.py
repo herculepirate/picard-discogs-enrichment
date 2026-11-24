@@ -46,6 +46,7 @@ from .discogs_logging import (LEVEL_BASIC, LEVEL_DETAILED, LEVEL_OFF,
 from .discogs_coverart import ART_ALL, ART_FRONT, ART_FRONT_BACK
 from .discogs_mapping import (
     holds_more_than_album,
+    picker_search_terms,
     pressing_only,
     release_artists_for,
     settle_artist_credits,
@@ -1250,7 +1251,11 @@ def _show_next_picker() -> None:
 
         def _fetch(release_id, callback):
             client.get_release(release_id, _guard_async(callback))
-        picker = DiscogsPickerDialog(rows, parent=parent, match_details=details, detail_fetcher=_fetch)
+
+        def _search(text, callback):
+            client.search_broadening(handler=_guard_async(callback), **picker_search_terms(text))
+        picker = DiscogsPickerDialog(rows, parent=parent, match_details=details, detail_fetcher=_fetch,
+                                     searcher=_search)
         picker.setWindowTitle(f'Choose Discogs Release \u2014 {title}')
         picker.setModal(False)
         picker.setToolTip(f'Not sure which pressing: {why}')
@@ -2201,9 +2206,11 @@ class _DiscogsSearchBase(BaseAction):
                     'applying one.',
                 )
 
+            def _search_more(text, callback):
+                client.search_broadening(handler=self._guard(callback), **picker_search_terms(text))
             picker = DiscogsPickerDialog(
                 results, parent=parent, match_details=match_details,
-                detail_fetcher=self._make_detail_fetcher(client),
+                detail_fetcher=self._make_detail_fetcher(client), searcher=_search_more,
             )
             if picker.exec() and picker.selected_result:
                 resource_url = (picker.selected_result.get('resource_url')
