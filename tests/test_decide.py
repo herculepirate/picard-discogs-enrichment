@@ -531,6 +531,22 @@ class OtherPart(unittest.TestCase):
         self.assertIsNone(dm.other_part(dict(self.REL, title='Relayer / Tormato'), 'Beginnings', 'Steve Howe', []))
 
 
+class DiscIdOfTheMasterOnly(unittest.TestCase):
+    """Curved Air - Air Conditioning, the 2015 SHM-CD: its disc ID is the 2007 Japanese and 1997
+    European CDs' on MusicBrainz; its barcode, on neither, proves the pressing on Discogs."""
+    INFO = {'2f6e30a1': {'barcode': '4943674069446'}, '6bd4fca8': {'barcode': '075992643320'}}
+
+    def test_none_is_yours(self):
+        album = {'discid_mb': self.INFO, 'barcodes': {'4943674205684'}}
+        self.assertTrue(dd.none_is_yours(album, list(self.INFO)))
+
+    def test_one_is_yours_or_unknown(self):
+        self.assertFalse(dd.none_is_yours({'discid_mb': self.INFO, 'barcodes': {'4943674069446'}}, list(self.INFO)))
+        self.assertFalse(dd.none_is_yours({'discid_mb': self.INFO, 'barcodes': set()}, list(self.INFO)))
+        info = dict(self.INFO, **{'6bd4fca8': {'barcode': ''}})       # (one lists none: it may be yours)
+        self.assertFalse(dd.none_is_yours({'discid_mb': info, 'barcodes': {'4943674205684'}}, list(info)))
+
+
 class OfficialOverBootlegs(unittest.TestCase):
     """Steve Howe - Homebrew 6: one barcode and HSCD006 on the 2016 US CD and a Russian bootleg."""
     def _s(self, rid, unofficial=False, **kw):

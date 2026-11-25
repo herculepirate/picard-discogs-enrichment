@@ -334,6 +334,17 @@ def pick_discid_release(album: dict, others: list, mb_facts: dict | None, likely
     return None, ''
 
 
+def none_is_yours(album: dict, others: list) -> bool:
+    """Your disc ID is on several MusicBrainz releases, and your barcode - read off your copy -
+    is on none of them, each listing another: your pressing is not among them, only cut from
+    the same master (Curved Air - Air Conditioning: the 2015 SHM-CD, 4943674205684, not on
+    MusicBrainz; its disc ID is the 2007 Japanese CD's and the 1997 European CD's)."""
+    info = album.get('discid_mb') or {}
+    own = {re.sub(r'\D', '', str(b)).lstrip('0') for b in album.get('barcodes') or ()} - {''}
+    theirs = [re.sub(r'\D', '', str((info.get(m) or {}).get('barcode') or '')).lstrip('0') for m in others]
+    return bool(own) and bool(others) and all(t and t not in own for t in theirs)
+
+
 def _bare_title(text) -> str:
     """An album title without its bracketed remarks ("Mothballs [2001 ReIssue]": "mothballs")."""
     return mc.fold(re.sub(r'\s*[\[(][^\])]*[\])]', ' ', str(text or '')))
@@ -534,6 +545,13 @@ def decide(album: dict, http, dm, *, mb_release_id: str = '', mb_discids=(), lin
     cfg = _cfg(cfg)
     linked = [str(x) for x in linked or () if str(x).isdigit()]
     discid_on = _disc_ids(album, http, mb_release_id, set(mb_discids or ()), linked)
+    others = [x for x in discid_on[6:].split(',') if x] if discid_on.startswith('other:') else []
+    not_mine = len(others) > 1 and none_is_yours(album, others)
+    if not_mine:
+        # your disc ID names the master, not your pressing: the Discogs releases those MusicBrainz
+        # releases link to are proven by nothing of yours
+        album['toc_discogs'] = set()
+        album['toc_discogs_fuzzy'] = {}
 
     misread = drop_misread_numbers(album)
     cands = tr.discogs_search(http, album, cfg, dm)
@@ -579,10 +597,15 @@ def decide(album: dict, http, dm, *, mb_release_id: str = '', mb_discids=(), lin
             out['why'].insert(0, f'your disc ID is on MusicBrainz releases {", ".join(others)}; '
                                  f'{pick} is yours: {how}')
             return out
-        out['status'] = 'review'
-        out['why'].insert(0, f'your disc ID is on MusicBrainz release {discid_on[6:]}, '
-                             f'not the one Picard matched')
-        return out
+        if not_mine:
+            # (your pressing is none of them: what your copy proves on Discogs decides, below)
+            out['why'].append(f'your disc ID is on MusicBrainz releases {", ".join(others)}, but your '
+                              f'barcode is on none of them: your pressing is not on MusicBrainz')
+        else:
+            out['status'] = 'review'
+            out['why'].insert(0, f'your disc ID is on MusicBrainz release {discid_on[6:]}, '
+                                 f'not the one Picard matched')
+            return out
 
     proven = [x for x in scored if proven_by_copy(x) and x.get('tracks_ok')]
     rank = proof_rank(best)

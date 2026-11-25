@@ -446,6 +446,25 @@ def _remember_applied(album, fields: dict, track_fields: dict, disc_count: int) 
     _APPLIED_BY_ALBUM[id(album)] = (ref, dict(fields), dict(track_fields), disc_count)
 
 
+def _withdraw_applied(album, metadata, op, release_id) -> None:
+    """Take off the album, its tracks and files what only Discogs release RELEASE_ID added (its
+    discogs_* tags, credits, performers): another pressing replaces it."""
+    entry = _APPLIED_BY_ALBUM.get(id(album))
+    if not entry or entry[0]() is not album:
+        return
+    keys = {k for k in entry[1] if is_supplementary_field(k)}
+    keys |= {k for v in entry[2].values() for k in v if is_supplementary_field(k)}
+    for target, _index in _album_metadata_targets(album, metadata):
+        for k in keys:
+            try:
+                if k in target:
+                    del target[k]
+            except Exception:
+                pass
+    _forget_applied(album)
+    plugin_log.detail(op, f'Discogs release {release_id}\'s own tags withdrawn ({len(keys)})')
+
+
 def _forget_applied(album) -> None:
     _APPLIED_BY_ALBUM.pop(id(album), None)
 
@@ -752,7 +771,7 @@ def process_album(api, album, metadata, release) -> None:
     album_title = metadata.get('album') or None
     # What your copy says of its pressing (discogs_evidence), read from the album folder on a
     # worker thread before anything is searched. Stays None when the folder is not read.
-    state = {'ev': None}
+    state = {'ev': None, 'early': None}
 
     def _on_release_detail(release_data):
         """Shared by both routes: the MusicBrainz-linked release fetch and
@@ -951,6 +970,8 @@ def process_album(api, album, metadata, release) -> None:
                 log.info('Discogs Enrichment: %s; searching Discogs by your copy instead', why)
                 _search(terms['barcode'], terms['catalog_number'])
                 return
+            if state['early'] == str(linked_id):
+                return                    # (applied when the album loaded; nothing of your copy against it)
             _on_release_detail(release_data)
 
         client.get_release(linked_id, _guard_async(_on_linked))
@@ -963,6 +984,14 @@ def process_album(api, album, metadata, release) -> None:
         plugin_log.detail(op, 'no files on the album yet \u2014 the folder is not read')
         _start()
         return
+    if linked_id:
+        # MusicBrainz's link is applied at once: reading your copy waits its turn behind other
+        # albums' scans (minutes), and an album saved meanwhile would get no Discogs data at all.
+        # A pressing your copy proves instead replaces it when the reading is done.
+        state['early'] = str(linked_id)
+        plugin_log.decision(op, f'Discogs release {linked_id} applied now (MusicBrainz links it); your '
+                                f'copy is read after, and a pressing it proves instead replaces it')
+        client.get_release(str(linked_id), _guard_async(_on_release_detail))
     mb_discids = mb_release_discids(release)
     mb_facts = _mb_match_facts(metadata)
     all_linked = mb_linked_discogs_ids(release or {})
@@ -1048,6 +1077,13 @@ def process_album(api, album, metadata, release) -> None:
         return job
 
     def _apply(release_id, why):
+        if state['early'] == str(release_id):
+            plugin_log.decision(op, f'{why} - already applied when the album loaded')
+            return
+        if state['early']:
+            # (another pressing than the one applied at load: its Discogs-only tags go first)
+            _withdraw_applied(album, metadata, op, state['early'])
+            state['early'] = None
         plugin_log.decision(op, why)
         client.get_release(str(release_id), _guard_async(_on_release_detail))
 
