@@ -51,12 +51,13 @@ MODULES = {
     "vinylrip": "vinylrip.py",
     "marks": "marks.py",
     "plan": "plan.py",
+    "mbt": "mb_tags.py",
 }
 # other spellings of the same modules in TagMender's imports
 ALIASES = {"exclusions": "ex", "match_albums": "ma", "engine": "engine", "tagio": "tagio",
            "companions": "companions", "ocr_order": "ocr_order", "web_tag": "web",
            "compilations": "comp", "classical": "cls", "naming": "naming", "vinylrip": "vinylrip",
-           "marks": "marks", "plan": "plan"}
+           "marks": "marks", "plan": "plan", "mb_tags": "mbt"}
 
 # what the plugin calls (through discogs_evidence.py); everything they reach comes along
 ROOTS = {
@@ -100,6 +101,8 @@ VINYLRIP_ROOTS = {"vinylrip": ["describe", "comment_line", "merged_values", "res
                                "own_line", "PREFIX"]}
 # Grouping marks: Vinyl Rip, Tape Rip, HD Audio (MED-6, MED-8)
 MARKS_ROOTS = {"marks": ["of_album", "is_hd", "HD", "VINYL", "TAPE"]}
+# a hybrid SACD's layers listed as media of their own: one physical disc each (MED-22)
+LAYER_ROOTS = {"mbt": ["layer_groups", "one_layer", "_pick_layer", "_layer_kind", "layer_label"]}
 # album_artist.py's own imports of them, and what they become
 AA_IMPORTS = (
     ("import compilations\n",
@@ -288,6 +291,7 @@ def build(root: Path) -> dict[str, str]:
             "tm_editions.py": _closure(mods, EDITION_ROOTS, hdr),
             "tm_vinylrip.py": _closure(mods, VINYLRIP_ROOTS, hdr),
             "tm_marks.py": _closure(mods, MARKS_ROOTS, hdr),
+            "tm_layers.py": _closure(mods, LAYER_ROOTS, hdr),
             "tm_ocr_order.json": (root / "assets" / "ocr_order.json").read_text()}
 
 
@@ -381,6 +385,8 @@ def _closure(mods: dict, roots: dict, hdr: str) -> str:
                           r"\1pass  # (vendored: the names it imported are this module's)", text)
             text = re.sub(r"(?m)^(\s*)import (?:" + "|".join(map(re.escape, ALIASES)) + r")(?: as \w+)?\s*$",
                           r"\1pass  # (vendored)", text)
+            # a function's own "import match_core as mc": mc is this module's (imported at its top)
+            text = re.sub(r"(?m)^(\s*)import match_core as mc\s*$", r"\1pass  # (vendored: mc)", text)
             # "volume_number = ma.volume_number" became "volume_number = volume_number": dropped
             if re.fullmatch(r"(\w+) = \1\s*(#.*)?", text.strip()):
                 continue

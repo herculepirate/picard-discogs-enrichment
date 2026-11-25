@@ -132,6 +132,37 @@ def proof_rank(s: dict | None) -> int:
     return 1 if mc._own_catno_on(s) else 0
 
 
+def musicbrainz_release_of(http, verdict: dict, album: dict, mb_release_id: str = '', linked=()) -> str:
+    """The MusicBrainz release of the Discogs pressing your copy proves, when it is not the one
+    Picard matched: the one release MusicBrainz links to that Discogs release, else (proof by
+    barcode) the one release with your barcode. "" when Picard's match is it, links to it, or
+    MusicBrainz names none or several (Jacqueline du Pre - The Great Cello Concertos: Picard
+    matched the 2024 download, 5021732413130; your scans' 5021732520296 is the 2025 SACD box,
+    7389e942, linked to Discogs 33632313)."""
+    best = verdict.get('best') or {}
+    cid = str((best.get('cand') or {}).get('id') or '')
+    if verdict.get('status') != 'auto' or not cid.isdigit() or cid in {str(x) for x in linked or ()}:
+        return ''
+    from urllib.parse import quote
+    found = []
+    doc = http.get_json('https://musicbrainz.org/ws/2/url?resource='
+                        + quote(f'https://www.discogs.com/release/{cid}', safe='')
+                        + '&inc=release-rels&fmt=json', 'mb') or {}
+    for r in doc.get('relations') or ():
+        rid = ((r or {}).get('release') or {}).get('id')
+        if rid and rid not in found:
+            found.append(rid)
+    if not found and proof_rank(best) == 2:
+        mine = [b for b in album.get('barcodes') or () if any(_same_code(b, c) for c in best['cand'].get('barcodes') or ())]
+        if mine:
+            doc = http.get_json(f'https://musicbrainz.org/ws/2/release/?query=barcode:{mine[0]}&fmt=json', 'mb') or {}
+            found = [r['id'] for r in doc.get('releases') or ()
+                     if r.get('id') and _same_code(r.get('barcode') or '', mine[0])]
+    if len(found) == 1 and found[0] != mb_release_id:
+        return found[0]
+    return ''
+
+
 def _same_code(a, b) -> bool:
     """Two barcodes or catalogue numbers are one: punctuation, case and leading zeros aside
     (a UPC is its EAN with a leading 0)."""

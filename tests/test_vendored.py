@@ -82,7 +82,7 @@ class Generated(unittest.TestCase):
     def test_no_undefined_names(self):
         for name in ("tm_readers.py", "tm_match_core.py", "tm_ocr.py", "tm_web.py",
                      "tm_album_artist.py", "tm_album_artist_deps.py", "tm_editions.py",
-                     "tm_vinylrip.py", "tm_marks.py"):
+                     "tm_vinylrip.py", "tm_marks.py", "tm_layers.py"):
             self.assertEqual(_undefined_names(ROOT / name), [], name)
 
     def test_tagmender_state_never_read(self):

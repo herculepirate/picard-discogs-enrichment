@@ -324,6 +324,18 @@ What it does with them, when your copy says anything of its pressing:
    *PEL 349*). Otherwise, or for a copy of more than one disc, you are asked. Turn off with **"Move my
    files to the MusicBrainz release my disc ID is on"**.
 
+   **The MusicBrainz release of your pressing.** When your copy proves a
+   Discogs release (barcode, disc ID, matrix) that the release Picard matched
+   does not link to, MusicBrainz is asked which release links to it — or,
+   proven by barcode, which one release has your barcode. When that is
+   another release, your files move there (same option). *Jacqueline du Pré —
+   The Great Cello Concertos*: Picard matched the 2024 download; your scans'
+   barcode is the 2025 SACD box. Each file goes to its own track by its disc
+   and track number — the tags, else "Disc 2" and "07 …" — and a hybrid SACD
+   listed as CD and SACD layers (8 media for 4 discs) takes your hi-res files
+   on its SACD layers, a 16/44.1 rip on its CD layers (TagMender's MED-22).
+   When a disc does not fit that way, Picard's own matching places them.
+
    **Fast first.** Your copy is first decided from what costs no OCR: the rip
    log, disc ID, cue sheet, folder name, tags and notes. When that already
    settles it by the strongest proof — your exact disc ID, or your disc ID on

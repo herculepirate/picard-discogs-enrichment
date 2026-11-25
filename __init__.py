@@ -90,7 +90,7 @@ from .discogs_disc_dialog import CONFIDENT_DISC_SCORE, DiscMappingDialog, auto_m
 from .discogs_evidence import (album_location, contradicts_release, copy_evidence,
                                discid_verdict, evidence_summary, has_copy_evidence, match_facts,
                                mb_release_discids, read_copy, search_terms, with_matched_names)
-from .discogs_decide import decide, match_detail, release_row, settled_without_scans
+from .discogs_decide import decide, match_detail, musicbrainz_release_of, release_row, settled_without_scans
 from .discogs_decide import explain as explain_verdict
 from .discogs_http_bridge import PicardHttp, Worker
 from .discogs_ocr import merge_scans, scans_summary
@@ -989,10 +989,18 @@ def process_album(api, album, metadata, release) -> None:
         http = PicardHttp(client, webservice)
 
         def _decide(a, m):
-            return decide(a, http, _dm, mb_release_id=getattr(album, 'id', '') or '',
-                          mb_discids=mb_discids, linked=all_linked, mb_facts=mb_facts,
-                          ocr_text=m.get('text') or '', scan_probe=m.get('probe'),
-                          likely=bool(settings['pick_likely']))
+            v = decide(a, http, _dm, mb_release_id=getattr(album, 'id', '') or '',
+                       mb_discids=mb_discids, linked=all_linked, mb_facts=mb_facts,
+                       ocr_text=m.get('text') or '', scan_probe=m.get('probe'),
+                       likely=bool(settings['pick_likely']))
+            # the pressing your copy proves is on another MusicBrainz release than Picard matched
+            if settings['move_to_discid_release']:
+                try:
+                    v['mb_release'] = musicbrainz_release_of(http, v, a, getattr(album, 'id', '') or '',
+                                                             all_linked)
+                except Exception:
+                    log.debug('Discogs Enrichment: MusicBrainz release of the pick not found', exc_info=True)
+            return v
 
         # fast: what your copy says without its scans (rip log, disc ID, cue, folder name, tags,
         # notes). The strongest proof - your exact disc ID - settles it now; the scans (minutes
@@ -1096,6 +1104,11 @@ def process_album(api, album, metadata, release) -> None:
             best = verdict.get('best') or {}
             rid = (best.get('cand') or {}).get('id')
             status = verdict['status']
+            if status == 'auto' and verdict.get('mb_release') and _move_to_release(
+                    album, verdict['mb_release'], loc, op,
+                    why=f'your copy proves Discogs release {rid} ({explain_verdict(best)}), and '
+                        f'MusicBrainz has it as release {verdict["mb_release"]}'):
+                return
             if status == 'auto':
                 _apply(rid, f'Discogs release {rid} is proven by your copy: {explain_verdict(best)}')
             elif status == 'linked':
@@ -1404,10 +1417,13 @@ def _tag_whole_release(album, release_data, fields, op) -> bool:
 _MOVED: set = set()
 
 
-def _move_to_release(album, mbid, loc, op) -> bool:
-    """Your disc ID is on MusicBrainz release MBID, not the one Picard matched: the album's files
-    go to it (as Picard's own disc lookup would put them) and the album left empty is removed.
-    That release then loads, and is looked up afresh. False: not moved (already moved once)."""
+def _move_to_release(album, mbid, loc, op, why: str = '') -> bool:
+    """Your copy is MusicBrainz release MBID, not the one Picard matched (your disc ID is on it,
+    or the pressing your copy proves is): the album's files go to it and the album left empty is
+    removed. That release then loads, and is looked up afresh. Each file goes to its own track
+    (place_on_release: its disc and track number, a hybrid SACD's layer as your audio is) - or,
+    when that cannot be told, where Picard's own matching puts it. False: not moved (already
+    moved once)."""
     folder = (loc or {}).get('album_dir') or ''
     if not mbid or (folder, mbid) in _MOVED:
         return False
@@ -1416,21 +1432,75 @@ def _move_to_release(album, mbid, loc, op) -> bool:
         return False
     _MOVED.add((folder, mbid))
     tagger = album.tagger
-    plugin_log.decision(op, f'your disc ID is on MusicBrainz release {mbid}, not the one Picard '
-                            f'matched ({getattr(album, "id", "")}): moving your {len(files)} file(s) '
-                            f'there - it is looked up afresh')
-    log.info('Discogs Enrichment: moving %d file(s) of %r to MusicBrainz release %s, where '
-             'their disc ID is', len(files), album, mbid)
-    tagger.move_files_to_album(files, albumid=mbid)
-    if not list(album.iterfiles()):
-        tagger.remove_album(album)
+    why = why or f'your disc ID is on MusicBrainz release {mbid}'
+    plugin_log.decision(op, f'{why}, not the one Picard matched ({getattr(album, "id", "")}): moving '
+                            f'your {len(files)} file(s) there - it is looked up afresh')
+    log.info('Discogs Enrichment: moving %d file(s) of %r to MusicBrainz release %s', len(files), album, mbid)
+    target = tagger.load_album(mbid)
+
+    def place():
+        try:
+            placed = place_on_release(target, files)
+        except Exception:
+            log.error('Discogs Enrichment: placing the files on their tracks failed', exc_info=True)
+            placed = None
+        if placed:
+            plugin_log.decision(op, f'your files placed on release {mbid}: {placed}')
+        else:
+            tagger.move_files_to_album(files, album=target)
+        if _album_is_alive(album) and not list(album.iterfiles()):
+            tagger.remove_album(album)
+    target.run_when_loaded(place)
     try:
         tagger.window.set_statusbar_message(
-            'Discogs Enrichment: your disc ID is on another MusicBrainz release - files moved there',
+            'Discogs Enrichment: your copy is another MusicBrainz release - files moved there',
             timeout=15000, echo=None, translate=None)
     except Exception:
         pass
     return True
+
+
+def place_on_release(target, files) -> str:
+    """Each file on its own track of TARGET (a loaded album): its disc and track number (the
+    file's tags, else its "Disc 2" folder and "07 ..." name) on the release's physical discs -
+    a hybrid SACD's layers listed as media of their own (MED-22: "Hybrid SACD (CD layer)",
+    "... (SACD layer, 2 channels)") are one disc, and your audio says which layer it is (finer
+    than a CD: the SACD layer of its channel count; else the CD layer). Picard's own matching
+    reads "disc 2" as medium 2, which there is disc 1's SACD layer. Returns what was done, or
+    "" (nothing moved) when any file cannot be placed so."""
+    from .discogs_placement import plan_placement
+    plan = plan_placement(_tracks_as_media(target), [_file_facts(f) for f in files])
+    if not plan:
+        return ''
+    tracks = list(getattr(target, 'tracks', None) or ())
+    for f, index in zip(files, plan['tracks']):
+        f.move(tracks[index])
+    return plan['summary']
+
+
+def _tracks_as_media(target) -> list:
+    """[(disc number, medium format, track index)] of a loaded album's tracks."""
+    out = []
+    for i, t in enumerate(getattr(target, 'tracks', None) or ()):
+        m = t.metadata
+        try:
+            disc = int(str(m['discnumber'] or 1).split('/')[0])
+        except ValueError:
+            disc = 1
+        out.append((disc, str(m['media'] or ''), i))
+    return out
+
+
+def _file_facts(f) -> dict:
+    m = getattr(f, 'orig_metadata', None) or f.metadata
+    def num(v):
+        try:
+            return int(str(v or '').split('/')[0])
+        except ValueError:
+            return 0
+    return {'path': f.filename, 'disc': num(m['discnumber']), 'track': num(m['tracknumber']),
+            'bits': num(m['~bits_per_sample']), 'rate': num(m['~sample_rate']),
+            'channels': num(m['~channels'])}
 
 
 # the OCR helper: probed once in a while, one album's scans at a time (the worker's)
@@ -1769,12 +1839,13 @@ class DiscogsOptionsPage(OptionsPage):
             '(year, country, label, track lengths, the text of your scans) is applied, and the\n'
             'others are named in the log; off, you are asked.')
         self.move_to_discid_checkbox = QtWidgets.QCheckBox(
-            'Move my files to the MusicBrainz release my disc ID is on', self)
+            'Move my files to the MusicBrainz release my copy proves (disc ID, barcode)', self)
         self.move_to_discid_checkbox.setToolTip(
             'Picard may match an album to another pressing than yours (the vinyl, when you\n'
             'ripped the CD). When the disc ID in your rip log or cue sheet is on exactly one\n'
-            'other MusicBrainz release, your files are moved there - as Picard\'s own disc\n'
-            'lookup would - and that release is looked up afresh. Off, you are asked.')
+            'other MusicBrainz release, or the Discogs pressing your copy proves is another\n'
+            'MusicBrainz release, your files are moved there, each to its own track, and\n'
+            'that release is looked up afresh. Off, you are asked.')
         self.ocr_scans_checkbox = QtWidgets.QCheckBox(
             'Read my scans and PDF booklets (OCR)', self)
         self.ocr_scans_checkbox.setToolTip(
