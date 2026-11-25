@@ -722,6 +722,12 @@ def extract_discogs_fields(release: dict[str, Any]) -> dict[str, str | list[str]
         # catalogue number; that is not a catalogue number.
         catnos = dedupe(entry.get('catno', '') for entry in labels
                         if str(entry.get('catno') or '').strip().casefold() != 'none')
+        # a "catalogue number" that is the release's barcode is no catalogue number (Derek
+        # Sherinian - Mythology: "6 93723 40582 7" listed beside IOMCD 191 and IOMACD 2099)
+        barcode_digits = {re.sub(r'\D', '', str(i.get('value') or '')).lstrip('0')
+                          for i in release.get('identifiers') or () if i.get('type') == 'Barcode'} - {''}
+        catnos = [c for c in catnos if not (re.fullmatch(r'[\d\s-]+', str(c).strip())
+                                            and re.sub(r'\D', '', str(c)).lstrip('0') in barcode_digits)]
         if label_names:
             out['label'] = label_names
         if catnos:
@@ -1297,6 +1303,17 @@ def resolve_field_value(
 
     if not existing_list:
         return new_list  # nothing to preserve either way — just fill it
+
+    # Discogs has no sort names: its "artists_sort" is the credit as shown ("Derek Sherinian"),
+    # never MusicBrainz's "Sherinian, Derek" - it only fills a sort tag that is empty
+    if field in ('albumartistsort', 'artistsort'):
+        return None
+    # a date that says less of the same day ("2004" for "2004-11-08": a master's year) is
+    # no reason to replace the full one
+    if field in ('date', 'originaldate') and len(new_list) == 1 and len(existing_list) == 1 \
+            and str(existing_list[0]).startswith(str(new_list[0])) \
+            and len(str(existing_list[0])) > len(str(new_list[0])):
+        return None
 
     if mode == MODE_FILL_GAPS:
         return None
