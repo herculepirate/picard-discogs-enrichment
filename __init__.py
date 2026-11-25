@@ -90,7 +90,7 @@ from .discogs_disc_dialog import CONFIDENT_DISC_SCORE, DiscMappingDialog, auto_m
 from .discogs_evidence import (album_location, contradicts_release, copy_evidence,
                                discid_verdict, evidence_summary, has_copy_evidence, match_facts,
                                mb_release_discids, read_copy, search_terms, with_matched_names)
-from .discogs_decide import decide, match_detail, musicbrainz_release_of, release_row, settled_without_scans
+from .discogs_decide import decide, match_detail, musicbrainz_release_of, proof_rank, release_row, settled_without_scans
 from .discogs_decide import explain as explain_verdict
 from .discogs_http_bridge import PicardHttp, Worker
 from .discogs_ocr import merge_scans, scans_summary
@@ -1123,6 +1123,9 @@ def process_album(api, album, metadata, release) -> None:
             elif status == 'move' and settings['move_to_discid_release'] \
                     and _move_to_release(album, verdict['move_to'], loc, op):
                 return
+            elif status == 'move' and best and proof_rank(best) == 3:
+                # (not moved: the Discogs release your disc ID proves is still yours)
+                _apply(rid, f'Discogs release {rid} is proven by your disc ID: {explain_verdict(best)}')
             elif status in ('review', 'move') and _CHOSEN_FOR_FOLDER.get(loc.get('album_dir') or ''):
                 rid = _CHOSEN_FOR_FOLDER[loc['album_dir']]
                 _apply(rid, f'Discogs release {rid}: you chose it for this folder\'s other album')
@@ -1414,7 +1417,10 @@ def _tag_whole_release(album, release_data, fields, op) -> bool:
 
 
 # album folders already moved to the MusicBrainz release their disc ID is on (never twice)
-_MOVED: set = set()
+# {(folder, release): when}: a folder is moved to one release at most once in a short while (no
+# loop between releases); a reload of the folder later is moved again
+_MOVED: dict = {}
+MOVE_AGAIN_AFTER = 120.0
 
 
 def _move_to_release(album, mbid, loc, op, why: str = '') -> bool:
@@ -1425,12 +1431,14 @@ def _move_to_release(album, mbid, loc, op, why: str = '') -> bool:
     when that cannot be told, where Picard's own matching puts it. False: not moved (already
     moved once)."""
     folder = (loc or {}).get('album_dir') or ''
-    if not mbid or (folder, mbid) in _MOVED:
+    import time
+    now = time.monotonic()
+    if not mbid or now - _MOVED.get((folder, mbid), -1e9) < MOVE_AGAIN_AFTER:
         return False
     files = list(album.iterfiles())
     if not files:
         return False
-    _MOVED.add((folder, mbid))
+    _MOVED[(folder, mbid)] = now
     tagger = album.tagger
     why = why or f'your disc ID is on MusicBrainz release {mbid}'
     plugin_log.decision(op, f'{why}, not the one Picard matched ({getattr(album, "id", "")}): moving '
