@@ -64,6 +64,7 @@ ROOTS = {
         "read_album", "with_reading",                   # the folder read as TagMender reads it
         "folder_reading", "rip_logs", "log_tocs", "cue_tocs", "cdtoc_tag_toc", "mb_discid",
         "ctdb_toc", "rip_log_year", "sacd_marks", "vinyl_marks", "enhanced_marks",
+        "copy_vinyl",                                   # VIN-10: your copy is a vinyl rip (Grouping)
         "scan_evidence", "packaging_evidence", "notes_text", "codes_from_notes",
         # the folder's documents as text, without OCR (notes, saved pages, a PDF's own text when
         # pdftotext is there); with OCR the helper reads them (tm_ocr)

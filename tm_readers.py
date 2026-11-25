@@ -2978,6 +2978,23 @@ def vinyl_own_evidence(album_dir, audio_names, infos, notes="") -> str:
     return " and ".join(weak) if len(weak) >= 2 else ""
 
 
+# --- match_albums.py:3081
+def copy_vinyl(album_dir, files) -> str:
+    """VIN-10: "vinyl" when these files of ALBUM_DIR are a vinyl rip - by the folder name, the
+    ripper's word (MED-21) or the copy's own evidence (vinyl_own_evidence) - as the matcher read
+    the album (_media_hint), else "". For an album planned in parts, a version of a split or a
+    release you chose (the matcher's own reading is the whole album's or none)."""
+    album_dir = Path(album_dir)
+    files = [Path(f) for f in files or ()]
+    infos = [(f, read_file(f)) for f in files]
+    logs, _foreign = fitting_logs(infos, rip_logs(album_dir))
+    cd = any(log.get("toc") for log in logs) or audio_evidence([i for _p, i in infos])["cd_frames"]
+    hint, _why = _media_hint(album_dir, album_dir.name, files, infos, "", bool(cd), notes_text(album_dir), bool(cd))
+    audio = audio_evidence([i for _p, i in infos])
+    return "vinyl" if mc.record_copy({"media_hint": hint, "audio": audio, "rip_log_toc": bool(cd),
+                                      "folder": album_dir.name}) == "vinyl" else ""
+
+
 # --- match_albums.py:3097
 def _media_hint(album_dir, album_folder, files, infos, artist, rip_log, notes="", cd_said=False):
     """What the copy was made from, and what says so: the folder name first ("[Vinyl Rip]",

@@ -146,12 +146,15 @@ def map_genres(genres, mapping: dict, most: int) -> list[str]:
     return out[:most] if most > 0 else out
 
 
-def compilation_tags(m, path: str, p: dict) -> dict:
+def compilation_tags(m, path: str, p: dict, grouping_free: bool = False) -> dict:
     """TagMender's compilation marks for one file: {tag: values} to write. COMPILATION on a single
     artist's best-of (comp_single_artist), ITUNESCOMPILATION/COMP in Vorbis and APE files
-    (comp_extra_flags), Grouping "Compilation" where empty (comp_grouping)."""
+    (comp_extra_flags), Grouping "Compilation" where empty (comp_grouping). GROUPING_FREE: the
+    Grouping there is one of the marks, so it may be replaced."""
     t = {k: _get(m, k) for k in ('musicbrainz_albumartistid', 'albumartist', 'releasetype', 'compilation',
                                  'grouping')}
+    if grouping_free:
+        t['grouping'] = []
     if any('compilation' in x.casefold() for x in _get(m, 'media')):
         t[comp.HIDDEN_COMPILATION] = ['1']
     va = comp.is_various(t)
@@ -188,7 +191,13 @@ def copy_facts(paths: list[str], folder: str, media: list[str], p: dict, release
     lossless = [x for x in paths if os.path.splitext(x)[1].lower() in tmarks.LOSSLESS]
     hd = any(tmarks.is_hd(x) for x in lossless[:HD_FILES])
     media, ignored = media_of_copy(media, folder)
-    mark = tmarks.of_album([{'media': media}], [], folder) if paths or media else ''
+    # VIN-10: your copy's own word that it is a vinyl rip (its files' sides, the ripper's notes,
+    # an album tag "[Vinyl Rip 24bit 96khz]"), as TagMender passes it - never over a CD rip log
+    try:
+        vinyl = bool(folder and paths) and tr.copy_vinyl(folder, paths) == 'vinyl'
+    except Exception:
+        vinyl = False
+    mark = tmarks.of_album([{'media': media}], [], folder, vinyl) if paths or media else ''
     if hd and not mark:
         mark = tmarks.HD
     rip_line = ''
@@ -201,7 +210,7 @@ def copy_facts(paths: list[str], folder: str, media: list[str], p: dict, release
             rip_line = tvr.comment_line(d)
         except Exception:
             rip_line = ''
-    return {'hd': hd, 'mark': mark, 'rip_line': rip_line, 'media_ignored': ignored}
+    return {'hd': hd, 'mark': mark, 'rip_line': rip_line, 'media_ignored': ignored, 'vinyl_copy': vinyl}
 
 
 def media_of_copy(media, folder: str) -> tuple[list, list]:
@@ -235,15 +244,36 @@ def _put(m, key, values, changed) -> None:
     changed[key] = (before, list(values))
 
 
-def apply_to(m, path: str, p: dict, facts: dict, previous_edition: str = '') -> tuple[dict, str]:
+# what the rules write to Grouping: a Grouping holding only these is theirs to change
+MARKS = frozenset({tmarks.HD, tmarks.VINYL, tmarks.TAPE, 'Compilation'})
+
+
+def apply_to(m, path: str, p: dict, facts: dict, previous_edition: str = '',
+             on_disk_grouping=()) -> tuple[dict, str]:
     """Every rule on one metadata object (the album's, a track's or a file's). Returns
-    ({tag: (before, after)}, the edition now in its Album tag)."""
+    ({tag: (before, after)}, the edition now in its Album tag). ON_DISK_GROUPING: the Grouping
+    already in the file(s) on disk - Picard's metadata never carries it, and saving would replace
+    it. A Grouping of your own is never replaced; one that is only a mark ("HD Audio", "Vinyl
+    Rip", "Tape Rip", "Compilation") follows what the copy is now."""
     changed: dict = {}
+    yours = [v for v in on_disk_grouping or () if v not in MARKS]
+    current = _get(m, 'grouping')
+    free = not yours and all(v in MARKS for v in current)
     # compilations first: Grouping "Compilation" before a copy's mark (TagMender's order)
-    for k, v in compilation_tags(m, path, p).items():
+    comp_tags = compilation_tags(m, path, p, grouping_free=free)
+    wanted = comp_tags.pop('grouping', None)
+    for k, v in comp_tags.items():
         _put(m, k, v, changed)
-    if p['grouping'] and facts.get('mark') and not _get(m, 'grouping'):
-        _put(m, 'grouping', [facts['mark']], changed)
+    if yours:
+        if current != yours:                      # (a mark written before: your own comes back)
+            _put(m, 'grouping', yours, changed)
+    elif free and (p['grouping'] or p['comp_grouping']):
+        if not wanted and p['grouping'] and facts.get('mark'):
+            wanted = [facts['mark']]
+        if wanted and current != list(wanted):
+            _put(m, 'grouping', list(wanted), changed)
+        elif not wanted and current:              # (the copy is no longer HD / vinyl / tape)
+            _put(m, 'grouping', [], changed)
     ed = edition_of(m, p['edition'], facts.get('hd', False))
     album = ''.join(_get(m, 'album')[:1])
     if album:
@@ -365,10 +395,13 @@ def refresh(album, metadata, op, targets_of, ui_refresh, settings=None) -> None:
 def _write(album, metadata, op, targets_of, ui_refresh, p, facts, st) -> None:
     from .discogs_logging import plugin_log
     changed_any, ed_now = {}, ''
-    for target, _index in targets_of(album, metadata):
+    on_disk = _groupings_on_disk(album)
+    everyone = sorted({v for vs in on_disk.values() for v in vs})
+    for target, index in targets_of(album, metadata):
         path = _path_of(album, target)
         key = id(target)
-        changed, ed = apply_to(target, path, p, facts, st['edition'].get(key, '') or st['edition'].get('*', ''))
+        changed, ed = apply_to(target, path, p, facts, st['edition'].get(key, '') or st['edition'].get('*', ''),
+                               everyone if index is None else on_disk.get(index, ()))
         st['edition'][key] = ed
         if target is metadata:
             ed_now = ed
@@ -382,6 +415,20 @@ def _write(album, metadata, op, targets_of, ui_refresh, p, facts, st) -> None:
         what = ', '.join(f'{k}: {now}' for k, (_was, now) in sorted(changed_any.items()))
         plugin_log.decision(op, f'your copy: {what[:300]}')
         ui_refresh(album)
+
+
+def _groupings_on_disk(album) -> dict:
+    """{track index: the Grouping values its files have on disk} (their original tags)."""
+    out = {}
+    for i, track in enumerate(getattr(album, 'tracks', None) or ()):
+        values = []
+        for f in getattr(track, 'files', None) or ():
+            orig = getattr(f, 'orig_metadata', None)
+            if orig is not None:
+                values += [v for v in _get(orig, 'grouping') if v not in values]
+        if values:
+            out[i] = values
+    return out
 
 
 def _paths(album) -> list[str]:

@@ -456,12 +456,12 @@ Discogs Enrichment → Your copy and editions**:
 | --- | --- | --- |
 | **Edition in the Album tag** | Off | *Nightfall [2004 Remaster]*, *25 [2015 Vinyl Rip]*, *Brave [1999 SACD]*, *[HD]*. SACD, DVD-Audio, Blu-ray and vinyl or tape rips always; a CD or download only as a newer remaster or reissue (its date later than the first release's) or by the name it calls itself (*[2023 Deluxe Edition]*). The original CD or download has none; a bootleg is no remaster. A *(Remastered)* the title carries gives way. "Edition" alone: *[Remaster]*, *[Vinyl Rip]* |
 | **ALBUMVERSION and RELEASECOMMENT** | On | With the edition: ALBUMVERSION holds it, RELEASECOMMENT MusicBrainz's disambiguation — for LMS and other media servers |
-| **Mark HD audio, vinyl and tape rips in Grouping** | On | *HD Audio* (above 16 bits or 44.1 kHz, DSD too), *Vinyl Rip*, *Tape Rip* — only where Grouping is empty |
+| **Mark HD audio, vinyl and tape rips in Grouping** | On | *HD Audio* (above 16 bits or 44.1 kHz, DSD too), *Vinyl Rip*, *Tape Rip* — only where your files have no Grouping of their own on disk. *Vinyl Rip* when the release is on vinyl, the folder name says so, or your copy does (a needle-drop picture, the ripper's notes, an album tag "[Vinyl Rip 24bit 96khz]"; never over a CD rip log). A mark follows the copy: *HD Audio* becomes *Vinyl Rip* when Discogs shows an LP |
 | **A vinyl rip's details in the comment** | On | *Vinyl rip: PBTHAL · 24-bit/96 kHz · ripped 2012 · turntable*, from the folder name and its notes, beside what the comment says |
 | **Remove the files' comments** | Off | A ripper's or shop's note is taken off (the vinyl rip line stays) |
 | **Single-artist compilations** | Off | A best-of (release type Compilation) is flagged COMPILATION too |
 | **ITUNESCOMPILATION and COMP** | Off | In FLAC, Ogg, Opus, APE and WavPack files of a compilation (ID3 and MP4 have their own flag) |
-| **Grouping "Compilation"** | Off | Where Grouping is empty |
+| **Grouping "Compilation"** | Off | Where your files have no Grouping of their own; it comes before a copy's mark |
 | **Genres: at most** | 5 | Per album; 0 for no limit. With **your own genre names** (`funeral doom metal = Doom Metal`) |
 | **Time-synced lyrics as .lrc** | Off | `01 Track.lrc` beside the track when it is saved, never over one that is there |
 

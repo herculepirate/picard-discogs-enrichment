@@ -120,6 +120,58 @@ class Marks(unittest.TestCase):
             self.assertEqual((facts['hd'], facts['mark']), (False, ''))
 
 
+class GroupingFollowsTheCopy(unittest.TestCase):
+    """TagMender's marks.py: a mark only where the file has no Grouping of its own, judged on the
+    file on disk (Picard's metadata never carries its Grouping); a mark the plugin wrote follows
+    what the copy turns out to be."""
+
+    def test_a_mark_written_before_is_replaced(self):
+        m = Meta(album=['X'])
+        dc.apply_to(m, '', prefs(ed_album='off'), dict(NO_FACTS, hd=True, mark='HD Audio'))
+        self.assertEqual(m.getall('grouping'), ['HD Audio'])
+        # Discogs then says the release is an LP: a 24-bit vinyl rip
+        dc.apply_to(m, '', prefs(ed_album='off'), dict(NO_FACTS, hd=True, mark='Vinyl Rip'))
+        self.assertEqual(m.getall('grouping'), ['Vinyl Rip'])
+        # and when the copy is no longer HD, vinyl or tape, the mark goes
+        dc.apply_to(m, '', prefs(ed_album='off'), NO_FACTS)
+        self.assertEqual(m.getall('grouping'), [])
+
+    def test_your_grouping_on_disk_is_never_replaced(self):
+        m = Meta(album=['X'])                   # (Picard's file metadata: no Grouping in it)
+        dc.apply_to(m, '/m/01.flac', prefs(ed_album='off'), dict(NO_FACTS, mark='Vinyl Rip'),
+                    on_disk_grouping=['Favourites'])
+        self.assertEqual(m.getall('grouping'), ['Favourites'])
+        m = Meta(album=['X'], grouping=['HD Audio'])      # (written before this fix)
+        dc.apply_to(m, '/m/01.flac', prefs(ed_album='off'), dict(NO_FACTS, mark='HD Audio'),
+                    on_disk_grouping=['Favourites'])
+        self.assertEqual(m.getall('grouping'), ['Favourites'])
+
+    def test_a_mark_on_disk_follows_the_copy(self):
+        m = Meta(album=['X'])
+        dc.apply_to(m, '/m/01.flac', prefs(ed_album='off'), dict(NO_FACTS, mark='Vinyl Rip'),
+                    on_disk_grouping=['HD Audio'])
+        self.assertEqual(m.getall('grouping'), ['Vinyl Rip'])
+
+    def test_compilation_before_the_mark(self):
+        m = Meta(album=['X'], albumartist=['Various Artists'], musicbrainz_albumartistid=[VA],
+                 grouping=['HD Audio'])
+        dc.apply_to(m, '/m/01.flac', prefs(ed_album='off', comp_grouping=True), dict(NO_FACTS, mark='HD Audio'))
+        self.assertEqual(m.getall('grouping'), ['Compilation'])
+
+    def test_vinyl_from_the_copy_itself(self):
+        """VIN-10: a needle-drop picture makes a vinyl rip of a release MusicBrainz lists as CD."""
+        with tempfile.TemporaryDirectory() as d:
+            folder = Path(d) / '1977 - A Farewell to Kings'
+            folder.mkdir()
+            for name in ('01 Xanadu.wav', '02 Closer to the Heart.wav'):
+                wav(folder / name, 24, 96000)
+            (folder / 'needle drop.jpg').write_bytes(b'x')
+            audio = [str(p) for p in sorted(folder.glob('*.wav'))]
+            facts = dc.copy_facts(audio, str(folder), ['CD'], prefs(), {})
+            self.assertTrue(facts['vinyl_copy'])
+            self.assertEqual(facts['mark'], 'Vinyl Rip')
+
+
 class Comments(unittest.TestCase):
     LINE = 'Vinyl rip: PBTHAL · 24-bit/96 kHz · ripped 2012'
 
