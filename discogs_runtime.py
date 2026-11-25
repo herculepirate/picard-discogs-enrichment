@@ -98,6 +98,8 @@ DEFAULTS: dict[str, Any] = {
     'log_level': 'basic',
     'log_max_kb': '2048',
     'prefer_original_date': False,
+    # names in another script written in English when an English form is known
+    'english_only': False,
     # Write track title/number/artist from the Discogs tracklist. Required
     # for "Discogs only" to produce usable files, since that mode clears the
     # MusicBrainz title along with everything else.

@@ -99,6 +99,7 @@ from .discogs_webenrich import (CoverArtProviderWeb, WebTagClusterAction, drop_w
 from .discogs_webenrich import apply_to_late_file as _web_late_file
 from .discogs_albumartist import apply_to_late_file as _aa_late_file
 from .discogs_albumartist import settle as settle_album_artist
+from .discogs_latin import english_names, is_name_tag
 from .discogs_copy import refresh as refresh_copy, refresh_late as _copy_late, write_lrc
 from .discogs_ocr_bridge import OcrBridge, embedded_dir, partial_message, unavailable_message
 from . import discogs_mapping as _dm
@@ -228,6 +229,7 @@ def _log_settings_snapshot() -> None:
         'companies': settings['companies'],
         'identifiers': settings['identifiers'],
         'original_date': settings['prefer_original_date'],
+        'english_only': settings['english_only'],
         'reverse_match': settings['reverse_match'],
         'cover_art': settings['cover_art'],
         'cover_scope': settings['cover_art_scope'],
@@ -696,9 +698,17 @@ def process_album(api, album, metadata, release) -> None:
         enrich_album(album, metadata, release, op, _album_metadata_targets, _refresh_album_ui)
     except Exception:
         log.error('Discogs Enrichment: web sources failed to start', exc_info=True)
+    # English names only: the album's names MusicBrainz writes in another script
+    if settings['english_only']:
+        try:
+            changed, _left = english_names(metadata, {})
+            if changed:
+                plugin_log.decision(op, f'English names only: {sorted(changed)} written in English')
+        except Exception:
+            log.debug('Discogs Enrichment: English names failed', exc_info=True)
     # the album artist as TagMender files it (lead artist, a band named after a member)
     try:
-        settle_album_artist(album, metadata, release, op, _album_metadata_targets, _refresh_album_ui,
+        settle_album_artist(album, metadata, release, op, _album_metadata_targets, _english_refresh_for(op),
                             DiscogsClient(album.tagger.webservice, settings['token'])
                             if settings['token'] else None)
     except Exception:
@@ -823,6 +833,11 @@ def process_album(api, album, metadata, release) -> None:
             unchanged = [k for k in fields if k not in changed]
             if unchanged:
                 plugin_log.detail(op, f'  unchanged ({len(unchanged)}): {sorted(unchanged)[:20]}')
+            # English names only: what Discogs calls each name, then every name in another script
+            import weakref
+            _ENGLISH_ALTS[id(album)] = (weakref.ref(album), {k: v for k, v in (full_fields if not part_of else fields).items()
+                                         if is_name_tag(k)}, track_fields)
+            _english_pass(album, metadata, op)
             # Files that attach to their track after this point are handled
             # by apply_to_late_file(), which needs the same field set.
             _remember_applied(album, fields, track_fields, disc_count)
@@ -836,7 +851,7 @@ def process_album(api, album, metadata, release) -> None:
             # Discogs may have written its own credit: the album artist is chosen again from it
             try:
                 settle_album_artist(album, metadata, release, op, _album_metadata_targets,
-                                    _refresh_album_ui, client)
+                                    _english_refresh_for(op), client)
             except Exception:
                 log.error('Discogs Enrichment: album artist failed to start', exc_info=True)
             # Discogs' media and date may change the edition
@@ -1640,6 +1655,16 @@ class DiscogsOptionsPage(OptionsPage):
             'Off: track titles and numbers are left exactly as they are.')
         layout.addWidget(self.track_tags_checkbox)
 
+        self.english_only_checkbox = QtWidgets.QCheckBox('English names only', self)
+        self.english_only_checkbox.setToolTip(
+            'Names written in another script (Japanese, Cyrillic, Greek, Chinese...) are '
+            'written in English instead, when an English form is known: the album, its '
+            'artists, track titles, label and credits. The English form comes from the name '
+            'itself ("... = English"), from Discogs, or from the artist\'s sort name.\n'
+            'Untouched: accented Latin names (Bj\u00f6rk, Sigur R\u00f3s), lyrics, notes, '
+            'the Language tag, and any name with no English form known.')
+        layout.addWidget(self.english_only_checkbox)
+
         # --- dates ------------------------------------------------------
         layout.addWidget(_section_label(self, 'Dates'))
         self.prefer_original_date_checkbox = QtWidgets.QCheckBox(
@@ -2042,6 +2067,7 @@ class DiscogsOptionsPage(OptionsPage):
         self.reverse_match_checkbox.setChecked(True)
         self.track_tags_checkbox.setChecked(True)
         self.prefer_original_date_checkbox.setChecked(False)
+        self.english_only_checkbox.setChecked(False)
         self.performers_checkbox.setChecked(True)
         self.companies_checkbox.setChecked(True)
         self.identifiers_checkbox.setChecked(True)
@@ -2099,6 +2125,7 @@ class DiscogsOptionsPage(OptionsPage):
         self.reverse_match_checkbox.setChecked(bool(s['reverse_match']))
         self.track_tags_checkbox.setChecked(bool(s['track_tags']))
         self.prefer_original_date_checkbox.setChecked(bool(s['prefer_original_date']))
+        self.english_only_checkbox.setChecked(bool(s['english_only']))
         self.performers_checkbox.setChecked(bool(s['performers']))
         self.companies_checkbox.setChecked(bool(s['companies']))
         self.identifiers_checkbox.setChecked(bool(s['identifiers']))
@@ -2161,6 +2188,7 @@ class DiscogsOptionsPage(OptionsPage):
         s['reverse_match'] = self.reverse_match_checkbox.isChecked()
         s['track_tags'] = self.track_tags_checkbox.isChecked()
         s['prefer_original_date'] = self.prefer_original_date_checkbox.isChecked()
+        s['english_only'] = self.english_only_checkbox.isChecked()
         s['performers'] = self.performers_checkbox.isChecked()
         s['companies'] = self.companies_checkbox.isChecked()
         s['identifiers'] = self.identifiers_checkbox.isChecked()
@@ -3041,6 +3069,58 @@ def split_track_collaborations(api, track, metadata, track_node, release_node=No
     _split_collaborations(metadata, 'mb-track')
 
 
+def english_track_names(api, track, metadata, track_node, release_node=None) -> None:
+    """English names only: each MusicBrainz track's names, before Discogs answers."""
+    if settings['english_only']:
+        try:
+            english_names(metadata, {})
+        except Exception:
+            log.debug('Discogs Enrichment: English names failed on a track', exc_info=True)
+
+
+# English names only: what Discogs wrote for each album's name tags, {id(album): (album, by track)}
+_ENGLISH_ALTS: dict = {}
+
+
+def _english_pass(album, metadata, op) -> None:
+    """English names only: every name in another script on the album, its tracks and their
+    files is replaced by its Latin form (from Discogs, the name itself, or its sort name)."""
+    if not settings['english_only']:
+        return
+    ref, album_alts, by_track = _ENGLISH_ALTS.get(id(album), (None, {}, {}))
+    if ref is None or ref() is not album:
+        album_alts, by_track = {}, {}
+    changed, left = {}, set()
+    for target, track_key in _album_metadata_targets(album, metadata):
+        alts = dict(album_alts)
+        if track_key is not None:
+            alts.update({k: v for k, v in (by_track.get(track_key) or {}).items() if is_name_tag(k)})
+        try:
+            c, lft = english_names(target, alts)
+        except Exception:
+            log.debug('Discogs Enrichment: English names failed', exc_info=True)
+            continue
+        for k, v in c.items():
+            changed.setdefault(k, v)
+        left.update(lft)
+    if changed:
+        plugin_log.decision(op, f'English names only: {len(changed)} tag(s) written in English')
+        for k, (was, now) in sorted(changed.items()):
+            plugin_log.detail(op, f'  {k}: {was} -> {now}')
+    if left:
+        plugin_log.detail(op, f'English names only: no English form known for {sorted(left)[:10]}')
+
+
+def _english_refresh_for(op):
+    def refresh(album):
+        try:
+            _english_pass(album, album.metadata, op)
+        except Exception:
+            log.debug('Discogs Enrichment: English names failed', exc_info=True)
+        _refresh_album_ui(album)
+    return refresh
+
+
 def enable(api) -> None:
     """Picard 3 entry point, called once when the plugin is enabled.
 
@@ -3061,6 +3141,7 @@ def enable(api) -> None:
     # Discogs lookup starts from the already-split names.
     api.register_album_metadata_processor(split_album_collaborations, priority=100)
     api.register_track_metadata_processor(split_track_collaborations, priority=100)
+    api.register_track_metadata_processor(english_track_names, priority=90)
     api.register_album_metadata_processor(process_album)
     # Closes the race between the asynchronous Discogs reply and Picard
     # linking files to tracks; see apply_to_late_file().

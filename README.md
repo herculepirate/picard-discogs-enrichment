@@ -191,6 +191,32 @@ they merge with MusicBrainz's names instead of listing the same person twice.
 (`Italy`, `UK`, `Europe`). A Discogs country that spans several countries
 (`UK & Europe`) has no code, so the existing value is left alone.
 
+### English names only
+
+Off by default (*Options → Plugins → Discogs Enrichment → English names only*).
+MusicBrainz names artists in their own script: *ミステリー金田一バンド*, not
+*The Mystery Kindaichi Band*. With this on, a name written in another script
+(Japanese, Chinese, Korean, Cyrillic, Greek, Arabic, Hebrew, Thai, ...) is
+written in English when an English form is known. The first of these wins:
+
+1. the name itself, when it gives both (*金田一耕助の冒険 = The Adventures Of…*);
+2. what Discogs writes for the same tag: release title, artist credit, track
+   title, credits (Discogs mostly uses English names and romanised titles);
+3. the artist's MusicBrainz sort name, turned back (*Mystery Kindaichi Band,
+   The* → *The Mystery Kindaichi Band*).
+
+| Replaced | Left as it is |
+| --- | --- |
+| Album, disc subtitle, track titles | Accented Latin names: *Björk*, *Sigur Rós*, *Motörhead*, French or German titles (already Latin script) |
+| Album artist(s), artist(s) | Lyrics, notes, comments: the words themselves, not names |
+| Label | Language: the language sung in is a fact about the music |
+| Composer, lyricist, performers, producer, engineer… | Sort names (already Latin) |
+| Script becomes *Latn* once the album and titles are | A name with no English form known: never emptied, only logged |
+
+Picard's own *Options → Metadata → Translate artist names* (locale English)
+does the same for artists from MusicBrainz's aliases, when Discogs has no
+entry. The two work together.
+
 ### Collaborations on every album
 
 The same one-name-per-artist rewrite also runs on MusicBrainz's own data the
