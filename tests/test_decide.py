@@ -531,6 +531,28 @@ class OtherPart(unittest.TestCase):
         self.assertIsNone(dm.other_part(dict(self.REL, title='Relayer / Tormato'), 'Beginnings', 'Steve Howe', []))
 
 
+class OfficialOverBootlegs(unittest.TestCase):
+    """Steve Howe - Homebrew 6: one barcode and HSCD006 on the 2016 US CD and a Russian bootleg."""
+    def _s(self, rid, unofficial=False, **kw):
+        return dict({'cand': {'id': rid, 'title': 'Homebrew 6', 'unofficial': unofficial},
+                     'confidence': 100.0, 'clues': {'barcode': '5024545742923', 'catno': 'HSCD6'},
+                     'code': 'barcode', 'clues_against': [], 'tracks_ok': True, 'artist_sim': 1.0,
+                     'title_sim': 1.0, 'dur_frac': 1.0}, **kw)
+
+    def test_the_official_release_is_taken(self):
+        us, ru = self._s(8554046), self._s(8699194, unofficial=True)
+        self.assertIs(dd.proof_first([ru, us], dd._cfg()), us)
+
+    def test_the_bootleg_when_its_matrix_is_on_your_scans(self):
+        us = self._s(8554046)
+        ru = self._s(8699194, unofficial=True)
+        ru['clues'] = dict(ru['clues'], matrix='00095 53900 808 01')
+        self.assertEqual(dd.official_over_bootlegs([ru, us]), [ru, us])
+
+    def test_two_official_still_ask(self):
+        self.assertIsNone(dd.proof_first([self._s(1), self._s(2)], dd._cfg()))
+
+
 class MatrixOnYourDisc(unittest.TestCase):
     CFG = dd._cfg()
 

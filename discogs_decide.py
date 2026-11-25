@@ -353,6 +353,7 @@ def proof_first(scored: list, cfg: dict, held=(), album: dict | None = None) -> 
         return None
     top = max(proof_rank(x) for x in proven)
     tied = [x for x in proven if proof_rank(x) == top]
+    tied = official_over_bootlegs(tied)
     if top < 2 or len(tied) != 1:
         return None
     x = tied[0]
@@ -367,6 +368,19 @@ def proof_first(scored: list, cfg: dict, held=(), album: dict | None = None) -> 
             or titles_agree(album.get('tracks'), x['cand'].get('tracks')) >= 0.5):
         return x
     return None
+
+
+def official_over_bootlegs(tied: list) -> list:
+    """Of pressings your copy proves equally, the one official release when the others are
+    unofficial copies of it (TagMender R9: a bootleg is never preferred over the official
+    release with the same proof). A bootleg stays only when your copy shows something of its
+    own - its matrix on your scans (Steve Howe - Homebrew 6: the 2016 US CD and a Russian
+    bootleg with the same barcode and HSCD006; the scans print no country, no matrix)."""
+    official = [x for x in tied if not x['cand'].get('unofficial')]
+    bootlegs = [x for x in tied if x['cand'].get('unofficial')]
+    if len(official) == 1 and bootlegs and not any((x.get('clues') or {}).get('matrix') for x in bootlegs):
+        return official
+    return tied
 
 
 # a country your copy names, against a pressing: its folder name or its scans
