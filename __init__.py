@@ -1248,6 +1248,7 @@ def _split_other_part(album, metadata, release_data, op) -> None:
         f.update()
     tagger = album.tagger
     cluster = tagger.load_cluster(part['title'], part['artist'])
+    _keep_from_musicbrainz(cluster, release_data)
     pressing = pressing_only(_shape_fields(extract_discogs_fields(release_data)))
     for f, t in zip(files, part['tracks']):
         f.move(cluster)
@@ -1261,6 +1262,54 @@ def _split_other_part(album, metadata, release_data, op) -> None:
     plugin_log.decision(op, f'the other album of Discogs release {release_data.get("id")}: {n} unmatched '
                             f'file(s) tagged as "{part["artist"]} - {part["title"]}" from it, in a cluster '
                             f'of their own (save them from there)')
+
+
+# clusters tagged from a Discogs release MusicBrainz does not have: Lookup and Scan would match
+# their files back to the MusicBrainz album they were taken out of, so they leave them alone
+_DISCOGS_CLUSTERS: dict = {}
+
+
+def _keep_from_musicbrainz(cluster, release_data) -> None:
+    import weakref
+    try:
+        _DISCOGS_CLUSTERS[id(cluster)] = (weakref.ref(cluster), str(release_data.get('id') or ''))
+    except TypeError:
+        return
+    _patch_lookup()
+
+
+def _discogs_release_of(item):
+    """The Discogs release id when ITEM is (or is a file in) a cluster tagged from Discogs."""
+    for obj in (item, getattr(item, 'parent_item', None), getattr(item, 'parent', None)):
+        entry = _DISCOGS_CLUSTERS.get(id(obj)) if obj is not None else None
+        if entry and entry[0]() is obj:
+            return entry[1]
+    return None
+
+
+def _patch_lookup() -> None:
+    from picard.cluster import Cluster
+    from picard.file import File
+    for cls in (Cluster, File):
+        if getattr(cls.lookup_metadata, '_discogs_guard', False):
+            continue
+        original = cls.lookup_metadata
+
+        def guarded(self, *args, _original=original, **kwargs):
+            release = _discogs_release_of(self)
+            if release:
+                try:
+                    self.tagger.window.set_statusbar_message(
+                        f'Discogs Enrichment: already tagged as Discogs release {release}, which '
+                        f'MusicBrainz does not have - not looked up again. Save it from the cluster.',
+                        timeout=15000, echo=None, translate=None)
+                except Exception:
+                    pass
+                log.debug('Discogs Enrichment: lookup skipped, tagged from Discogs release %s', release)
+                return None
+            return _original(self, *args, **kwargs)
+        guarded._discogs_guard = True
+        cls.lookup_metadata = guarded
 
 
 def _natural(path):
@@ -1308,6 +1357,7 @@ def _tag_whole_release(album, release_data, fields, op) -> bool:
     disc_of = [n for n, d in enumerate(discs, 1) for _t in (d.get('tracks') or ())]
     tagger = album.tagger
     cluster = tagger.load_cluster(title, artist)
+    _keep_from_musicbrainz(cluster, release_data)
     disc_count = release_disc_count(release_data)
     for i, (f, t) in enumerate(zip(files, tracks)):
         own = id(f) in matched

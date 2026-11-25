@@ -328,6 +328,11 @@ What it does with them, when your copy says anything of its pressing:
    only the release's *other* album are tagged as that part, in a cluster of
    their own (not looked up on MusicBrainz: an album of that name may be
    another track list).
+   Such a cluster sits in the left pane because MusicBrainz has no release
+   for it, and only MusicBrainz releases go in the right pane. **Lookup** and
+   **Scan** leave it, and the files in it, alone: they would match the files
+   back to the MusicBrainz album they were taken out of. The status bar says
+   so; select the cluster and **Save**.
 
    A folder with a CD rip log is never marked *Vinyl Rip* or *Tape Rip*
    because the MusicBrainz release Picard matched is an LP or cassette.
