@@ -101,6 +101,8 @@ from .discogs_albumartist import apply_to_late_file as _aa_late_file
 from .discogs_albumartist import settle as settle_album_artist
 from .discogs_latin import english_names, is_name_tag
 from .discogs_copy import refresh as refresh_copy, refresh_late as _copy_late, write_lrc
+from .discogs_copy import _folder as _album_folder_of
+from .discogs_kind import copy_kind, kind_against
 from .discogs_ocr_bridge import OcrBridge, embedded_dir, partial_message, unavailable_message
 from . import discogs_mapping as _dm
 from .tm_readers import mb_linked_discogs_ids
@@ -771,7 +773,7 @@ def process_album(api, album, metadata, release) -> None:
     album_title = metadata.get('album') or None
     # What your copy says of its pressing (discogs_evidence), read from the album folder on a
     # worker thread before anything is searched. Stays None when the folder is not read.
-    state = {'ev': None, 'early': None}
+    state = {'ev': None, 'early': None, 'kind': ('', ''), 'decided': False}
 
     def _on_release_detail(release_data):
         """Shared by both routes: the MusicBrainz-linked release fetch and
@@ -933,7 +935,16 @@ def process_album(api, album, metadata, release) -> None:
                                 f'{len(results)} candidate(s)')
         log.info('Discogs Enrichment: matched Discogs release %r (score %d)',
                  resource_url, best_score)
-        client.get_release(resource_url, _guard_async(_on_release_detail))
+
+        def _searched(release_data):
+            against = kind_against(*state['kind'], release_data)
+            if against:
+                plugin_log.decision(op, f'not Discogs release {best.get("id")}: {against} - no '
+                                        f'Discogs pressing data for this album')
+                return
+            _on_release_detail(release_data)
+
+        client.get_release(resource_url, _guard_async(_searched))
 
     def _search(barcode, catalog_number):
         if not any([barcode, (catalog_number and artist), (artist and album_title)]):
@@ -953,6 +964,7 @@ def process_album(api, album, metadata, release) -> None:
         )
 
     def _start():
+        state['decided'] = True           # (the link or the search applies now, not the early one)
         ev = state['ev']
         # your copy's barcode and catalogue number first, the MusicBrainz release's otherwise
         terms = search_terms(_mb_match_facts(metadata), ev)
@@ -972,6 +984,12 @@ def process_album(api, album, metadata, release) -> None:
                 return
             if state['early'] == str(linked_id):
                 return                    # (applied when the album loaded; nothing of your copy against it)
+            against = kind_against(*state['kind'], release_data)
+            if against:
+                plugin_log.decision(op, f'not using the MusicBrainz link: {against} \u2014 searching '
+                                        f'Discogs by your copy instead')
+                _search(terms['barcode'], terms['catalog_number'])
+                return
             _on_release_detail(release_data)
 
         client.get_release(linked_id, _guard_async(_on_linked))
@@ -984,14 +1002,39 @@ def process_album(api, album, metadata, release) -> None:
         plugin_log.detail(op, 'no files on the album yet \u2014 the folder is not read')
         _start()
         return
+
+    def _kind_job():
+        return copy_kind(paths, _album_folder_of(paths))
+
     if linked_id:
         # MusicBrainz's link is applied at once: reading your copy waits its turn behind other
         # albums' scans (minutes), and an album saved meanwhile would get no Discogs data at all.
-        # A pressing your copy proves instead replaces it when the reading is done.
-        state['early'] = str(linked_id)
-        plugin_log.decision(op, f'Discogs release {linked_id} applied now (MusicBrainz links it); your '
-                                f'copy is read after, and a pressing it proves instead replaces it')
-        client.get_release(str(linked_id), _guard_async(_on_release_detail))
+        # A pressing your copy proves instead replaces it when the reading is done. Not when your
+        # copy is another format than the release (a vinyl rip matched to the CD, a download
+        # matched to the cassette): what it is is read first - seconds, not the scans' minutes.
+        def _on_early(release_data):
+            if not release_data or state['decided'] or not _album_is_alive(album):
+                return
+            why = kind_against(*state['kind'], release_data)
+            if why:
+                plugin_log.decision(op, f'Discogs release {linked_id} not applied at load, though '
+                                        f'MusicBrainz links it: {why}; your copy decides')
+                return
+            state['early'] = str(linked_id)
+            plugin_log.decision(op, f'Discogs release {linked_id} applied now (MusicBrainz links it); your '
+                                    f'copy is read after, and a pressing it proves instead replaces it')
+            _on_release_detail(release_data)
+
+    def _kind_done(result=None, error=None):
+        if error is None and result and not state['kind'][0]:
+            state['kind'] = tuple(result)
+        if state['kind'][0]:
+            plugin_log.detail(op, f'your copy is made from: {state["kind"][0]} ({state["kind"][1]})')
+        if not linked_id or state['decided'] or not _album_is_alive(album):
+            return
+        client.get_release(str(linked_id), _guard_async(_on_early))
+
+    Worker.shared('copy').submit(_kind_job, _kind_done)
     mb_discids = mb_release_discids(release)
     mb_facts = _mb_match_facts(metadata)
     all_linked = mb_linked_discogs_ids(release or {})
@@ -1010,9 +1053,13 @@ def process_album(api, album, metadata, release) -> None:
         loc = album_location(paths)
         if loc is None:
             return {'loc': None}
+        try:
+            kind = copy_kind(paths, loc['album_dir'])
+        except Exception:
+            kind = ('', '')
         quick = read_copy(loc)
         named_by = with_matched_names(quick, matched_artist, matched_title)
-        job = {'loc': loc, 'named_by': named_by, 'ocr': None, 'scans': None, 'merged': {}, 'verdict': None, 'http': None}
+        job = {'loc': loc, 'kind': kind, 'named_by': named_by, 'ocr': None, 'scans': None, 'merged': {}, 'verdict': None, 'http': None}
         scans = None
         extra = _save_embedded_art(loc['album_dir'], embedded)
         http = PicardHttp(client, webservice)
@@ -1076,7 +1123,8 @@ def process_album(api, album, metadata, release) -> None:
                                ev=copy_evidence(again))
         return job
 
-    def _apply(release_id, why):
+    def _apply(release_id, why, proven=False):
+        state['decided'] = True
         if state['early'] == str(release_id):
             plugin_log.decision(op, f'{why} - already applied when the album loaded')
             return
@@ -1084,8 +1132,22 @@ def process_album(api, album, metadata, release) -> None:
             # (another pressing than the one applied at load: its Discogs-only tags go first)
             _withdraw_applied(album, metadata, op, state['early'])
             state['early'] = None
-        plugin_log.decision(op, why)
-        client.get_release(str(release_id), _guard_async(_on_release_detail))
+        if proven:
+            plugin_log.decision(op, why)
+            client.get_release(str(release_id), _guard_async(_on_release_detail))
+            return
+
+        def _checked(release_data):
+            # not proven by your copy: a release of another format than your copy is not yours
+            against = kind_against(*state['kind'], release_data)
+            if against:
+                plugin_log.decision(op, f'not Discogs release {release_id}: {against} - no Discogs '
+                                        f'pressing data for this album')
+                return
+            plugin_log.decision(op, why)
+            _on_release_detail(release_data)
+
+        client.get_release(str(release_id), _guard_async(_checked))
 
     def _done(result=None, error=None):
         try:
@@ -1102,6 +1164,8 @@ def process_album(api, album, metadata, release) -> None:
                 _start()
                 return
             ev, verdict, http = result.get('ev'), result.get('verdict'), result.get('http')
+            if (result.get('kind') or ('', ''))[0]:
+                state['kind'] = tuple(result['kind'])
             if result.get('deep') is not None:
                 d = result['deep']
                 plugin_log.event(op, 'undecided after the first reading: scans read again, harder ('
@@ -1146,7 +1210,7 @@ def process_album(api, album, metadata, release) -> None:
                         f'MusicBrainz has it as release {verdict["mb_release"]}'):
                 return
             if status == 'auto':
-                _apply(rid, f'Discogs release {rid} is proven by your copy: {explain_verdict(best)}')
+                _apply(rid, f'Discogs release {rid} is proven by your copy: {explain_verdict(best)}', True)
             elif status == 'linked':
                 _apply(rid, f'Discogs release {rid}: MusicBrainz links it and nothing of your copy '
                             f'is against it')
@@ -1161,10 +1225,10 @@ def process_album(api, album, metadata, release) -> None:
                 return
             elif status == 'move' and best and proof_rank(best) == 3:
                 # (not moved: the Discogs release your disc ID proves is still yours)
-                _apply(rid, f'Discogs release {rid} is proven by your disc ID: {explain_verdict(best)}')
+                _apply(rid, f'Discogs release {rid} is proven by your disc ID: {explain_verdict(best)}', True)
             elif status in ('review', 'move') and _CHOSEN_FOR_FOLDER.get(loc.get('album_dir') or ''):
                 rid = _CHOSEN_FOR_FOLDER[loc['album_dir']]
-                _apply(rid, f'Discogs release {rid}: you chose it for this folder\'s other album')
+                _apply(rid, f'Discogs release {rid}: you chose it for this folder\'s other album', True)
             elif status in ('review', 'move'):
                 _review(verdict, http, loc)
             elif verdict.get('ruled_out'):
@@ -1198,7 +1262,7 @@ def process_album(api, album, metadata, release) -> None:
             folder = (result_loc.get('album_dir') if result_loc else '') or _folder_of(album)
             if folder:
                 _CHOSEN_FOR_FOLDER[folder] = str(rid)
-            _apply(rid, f'you chose Discogs release {rid}')
+            _apply(rid, f'you chose Discogs release {rid}', True)
         queue_picker(album, title, why, rows, details, client, _chosen)
 
     Worker.shared().submit(_job, _done)

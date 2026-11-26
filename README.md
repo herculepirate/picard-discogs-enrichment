@@ -477,6 +477,17 @@ Discogs Enrichment → Your copy and editions**:
 | **Genres: at most** | 5 | Per album; 0 for no limit. With **your own genre names** (`funeral doom metal = Doom Metal`) |
 | **Time-synced lyrics as .lrc** | Off | `01 Track.lrc` beside the track when it is saved, never over one that is there |
 
+**What your copy was made from** decides, never the format of the release
+Picard matched (`discogs_kind.py`): a record (TagMender's VIN-10: the folder
+name, the ripper's notes, sides), a CD (a rip log with the disc's table of
+contents), a tape (the folder name) or a shop's download (*[WEB]* or a shop in
+the folder name, or UPC, ISRC and the explicit flag in every file's tags, as
+deemix, streamrip and the shops' apps write them). A download matched to the
+only release MusicBrainz has, a cassette, is no *Tape Rip*; and a Discogs
+release of another format than your copy is never written to it unless your
+copy proves it (barcode, disc ID): not the CD MusicBrainz links when your
+folder is a vinyl rip, not even at load.
+
 The files are measured (bit depth, rate) and the folder's rip notes read off
 Picard's main thread, and everything is written again when Discogs writes its
 tags or a file joins its track, so the edition follows the release finally

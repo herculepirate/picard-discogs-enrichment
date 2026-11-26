@@ -38,6 +38,7 @@ try:
     from . import tm_match_core as mc
     from . import tm_readers as tr
     from . import tm_vinylrip as tvr
+    from .discogs_kind import NAMES, copy_kind
 except ImportError:  # run outside Picard (tests)
     import tm_album_artist_deps as comp
     import tm_editions as ted
@@ -45,6 +46,7 @@ except ImportError:  # run outside Picard (tests)
     import tm_match_core as mc
     import tm_readers as tr
     import tm_vinylrip as tvr
+    from discogs_kind import NAMES, copy_kind
 
 EDITION_MODES = ('off', 'edition', 'edition_year')
 COMMENT_MODES = ('keep', 'remove')
@@ -192,11 +194,17 @@ def copy_facts(paths: list[str], folder: str, media: list[str], p: dict, release
     hd = any(tmarks.is_hd(x) for x in lossless[:HD_FILES])
     media, ignored = media_of_copy(media, folder)
     # VIN-10: your copy's own word that it is a vinyl rip (its files' sides, the ripper's notes,
-    # an album tag "[Vinyl Rip 24bit 96khz]"), as TagMender passes it - never over a CD rip log
+    # an album tag "[Vinyl Rip 24bit 96khz]"), as TagMender passes it - never over a CD rip log;
+    # a shop's download (its tags) is no record or tape, whatever release Picard matched
     try:
-        vinyl = bool(folder and paths) and tr.copy_vinyl(folder, paths) == 'vinyl'
+        kind, kind_why = copy_kind(paths, folder) if folder and paths else ('', '')
     except Exception:
-        vinyl = False
+        kind, kind_why = '', ''
+    vinyl = kind == 'vinyl'
+    if kind == 'digital':
+        off = [m for m in media if mc.media_kind(m) in ('vinyl', 'cassette')]
+        media = [m for m in media if m not in off]
+        ignored = ignored + off
     mark = tmarks.of_album([{'media': media}], [], folder, vinyl) if paths or media else ''
     if hd and not mark:
         mark = tmarks.HD
@@ -210,7 +218,8 @@ def copy_facts(paths: list[str], folder: str, media: list[str], p: dict, release
             rip_line = tvr.comment_line(d)
         except Exception:
             rip_line = ''
-    return {'hd': hd, 'mark': mark, 'rip_line': rip_line, 'media_ignored': ignored, 'vinyl_copy': vinyl}
+    return {'hd': hd, 'mark': mark, 'rip_line': rip_line, 'media_ignored': ignored, 'vinyl_copy': vinyl,
+            'kind': kind, 'kind_why': kind_why}
 
 
 def media_of_copy(media, folder: str) -> tuple[list, list]:
@@ -409,8 +418,10 @@ def _write(album, metadata, op, targets_of, ui_refresh, p, facts, st) -> None:
     st['edition']['*'] = ed_now
     if facts.get('media_ignored') and not st.get('told_ignored'):
         st['told_ignored'] = True
+        said = (f'it is {NAMES.get(facts.get("kind"), "")} ({facts.get("kind_why")})'
+                if facts.get('kind') == 'digital' else 'your folder has a CD rip log')
         plugin_log.decision(op, f'your copy: the matched release is {", ".join(facts["media_ignored"])}, '
-                                f'but your folder has a CD rip log - no vinyl or tape marks')
+                                f'but {said} - no vinyl or tape marks')
     if changed_any:
         what = ', '.join(f'{k}: {now}' for k, (_was, now) in sorted(changed_any.items()))
         plugin_log.decision(op, f'your copy: {what[:300]}')
