@@ -21,6 +21,7 @@ from PyQt6.QtNetwork import QNetworkRequest
 from .discogs_runtime import log, settings
 
 from .discogs_logging import plugin_log, timed
+from . import discogs_activity as activity
 from .discogs_mapping import (
     artist_from_mb_url_lookup,
     discogs_release_artists,
@@ -32,7 +33,7 @@ from picard.webservice import WSRequest
 
 DISCOGS_HOST = 'api.discogs.com'
 MUSICBRAINZ_HOST = 'musicbrainz.org'
-USER_AGENT = 'PicardDiscogsEnrichment/0.13.0 +https://github.com/herculepirate/picard-discogs-enrichment'
+USER_AGENT = 'PicardDiscogsEnrichment/0.14.0 +https://github.com/herculepirate/picard-discogs-enrichment'
 
 
 # Process-wide response cache. Tagging a box set, re-running a lookup, or
@@ -138,6 +139,10 @@ class DiscogsClient:
         except Exception:
             pass
         op = getattr(self, 'op', None) or plugin_log.new_operation('discogs')
+        # the album this client works for: busy until the answer is handled (discogs_activity)
+        album = getattr(self, 'album', None)
+        if album is not None:
+            handler = activity.wrap(album, 'asking Discogs', handler, getattr(self, 'album_title', ''))
         if use_cache and path in _RESPONSE_CACHE:
             plugin_log.request(op, 'Discogs', path, cached=True)
             log.debug('Discogs Enrichment: cache hit for %s', path)

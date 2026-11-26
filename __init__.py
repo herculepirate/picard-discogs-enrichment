@@ -106,6 +106,8 @@ from .discogs_latin import english_names, is_name_tag
 from .discogs_copy import refresh as refresh_copy, refresh_late as _copy_late, write_lrc
 from .discogs_copy import _folder as _album_folder_of
 from .discogs_kind import copy_kind, kind_against
+from . import discogs_activity as activity
+from . import discogs_busy_ui as busy_ui
 from .discogs_ocr_bridge import OcrBridge, embedded_dir, partial_message, unavailable_message
 from . import discogs_mapping as _dm
 from .tm_readers import mb_linked_discogs_ids
@@ -799,6 +801,14 @@ def process_album(api, album, metadata, release) -> None:
 
     client = DiscogsClient(album.tagger.webservice, token)
     client.op = op
+    # the album shows as busy while this client's requests are answered (discogs_busy_ui)
+    busy_title = (f'{metadata.get("albumartist") or metadata.get("artist") or ""} \u2014 '
+                  f'{metadata.get("album") or ""}')
+    client.album, client.album_title = album, busy_title
+    try:
+        busy_ui.install(getattr(album.tagger, 'window', None), _album_is_alive)
+    except Exception:
+        log.debug('Discogs Enrichment: busy bar not installed', exc_info=True)
 
     # MusicBrainz often records the exact Discogs release this release
     # corresponds to, as a url-rel. Using it means the pressing Picard
@@ -1093,7 +1103,8 @@ def process_album(api, album, metadata, release) -> None:
             return
         client.get_release(str(linked_id), _guard_async(_on_early))
 
-    Worker.shared('copy').submit(_kind_job, _kind_done)
+    Worker.shared('copy').submit(_kind_job, activity.wrap(album, 'reading what your copy is', _kind_done,
+                                                          busy_title))
     mb_discids = mb_release_discids(release)
     mb_facts = _mb_match_facts(metadata)
     all_linked = mb_linked_discogs_ids(release or {})
@@ -1109,6 +1120,7 @@ def process_album(api, album, metadata, release) -> None:
         """On the plugin's worker thread: read the folder, and your scans and documents (the
         OCR helper, on your system's Python); when your copy says anything of its pressing,
         decide as TagMender does (discogs_decide), its requests sent through Picard."""
+        busy.stage('reading your folder')
         loc = album_location(paths)
         if loc is None:
             return {'loc': None}
@@ -1143,6 +1155,7 @@ def process_album(api, album, metadata, release) -> None:
         quick_merged = merge_scans(quick, loc['album_dir'], None)
         quick_ev = copy_evidence(quick)
         if has_copy_evidence(quick_ev):
+            busy.stage('choosing the pressing')
             verdict = _decide(quick, quick_merged)
             if settled_without_scans(verdict):
                 job.update(merged=quick_merged, ev=quick_ev, http=http, verdict=verdict, fast=True)
@@ -1152,6 +1165,7 @@ def process_album(api, album, metadata, release) -> None:
         if want_ocr:
             job['ocr'] = probe = OCR.probe()
             if probe.get('ok'):
+                busy.stage('reading your scans (OCR)')
                 scans = OCR.read(loc['album_dir'], max_images=max_images,
                                  have_barcode=bool(album_d.get('barcodes')), extra=extra)
                 if not scans.get('ok'):
@@ -1162,11 +1176,13 @@ def process_album(api, album, metadata, release) -> None:
         if not has_copy_evidence(ev) and first != 'discogs':
             return job                  # (Discogs first: Discogs ranks it by your copy all the same)
         job['http'] = http
+        busy.stage('choosing the pressing')
         verdict = job['verdict'] = _decide(album_d, merged)
         # undecided: the scans (and cover art) read again, harder, and decided again (Discogs'
         # answers are cached, so deciding again costs few requests)
         if verdict.get('status') in ('review', 'nomatch') and not verdict.get('ruled_out') \
                 and scans and scans.get('ok') and (scans.get('images') or extra):
+            busy.stage('reading your scans again, harder (OCR)')
             deep = OCR.read(loc['album_dir'], max_images=max_images,
                             have_barcode=bool(album_d.get('barcodes')), deep=True, extra=extra)
             job['deep'] = deep
@@ -1365,7 +1381,15 @@ def process_album(api, album, metadata, release) -> None:
             _apply(rid, f'you chose Discogs release {rid}', True)
         queue_picker(album, title, why, rows, details, client, _chosen)
 
-    Worker.shared().submit(_job, _done)
+    # busy from now: the job waits its turn behind other albums' scans
+    busy = activity.start(album, 'waiting its turn behind other albums', busy_title)
+
+    def _done_then_idle(**kwargs):
+        try:
+            _done(**kwargs)
+        finally:
+            busy.done()
+    Worker.shared().submit(_job, _done_then_idle)
 
 
 
@@ -1755,6 +1779,7 @@ _PICKER_OPEN: list = []
 
 def queue_picker(album, title, why, rows, details, client, on_pick) -> None:
     _PICKERS.append((album, title, why, rows, details, client, on_pick))
+    activity.waiting(album, True, title)
     _show_next_picker()
 
 
@@ -1762,6 +1787,7 @@ def _show_next_picker() -> None:
     while _PICKERS and not _PICKER_OPEN:
         album, title, why, rows, details, client, on_pick = _PICKERS.pop(0)
         if not _album_is_alive(album):
+            activity.waiting(album, False)
             continue
         parent = getattr(album.tagger, 'window', None)
 
@@ -1779,6 +1805,7 @@ def _show_next_picker() -> None:
 
         def _finished(code, picker=picker, album=album, on_pick=on_pick):
             _PICKER_OPEN.clear()
+            activity.waiting(album, False)
             try:
                 if code and picker.selected_result and _album_is_alive(album):
                     on_pick(picker.selected_result.get('id'))
@@ -3459,6 +3486,10 @@ def disable() -> None:
     """
     try:
         clear_cache()
+    except Exception:
+        pass
+    try:
+        busy_ui.uninstall()
     except Exception:
         pass
     log.debug('Discogs Enrichment: disabled')

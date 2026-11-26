@@ -118,6 +118,23 @@ Generate a token at
 Discogs only returns cover images to authenticated requests, so art will not
 download without one.
 
+### Seeing that it is still working
+
+The Discogs look-up runs after Picard has loaded the album, and reading your
+folder and scans can take minutes. While it does:
+
+- **the status bar** (bottom right, beside Picard's own counters) shows a
+  moving bar and **Discogs: 2 albums**. Hover over it, or click it, for each
+  album and what is being done: waiting its turn behind other albums,
+  reading your folder, reading your scans (OCR), choosing the pressing,
+  asking Discogs. It disappears when every album is done;
+- **the album's row** shows **⏳ Discogs…** after its title until its tags are
+  written, and **⚠ choose the Discogs pressing** while the picker waits for
+  you to choose.
+
+Save an album once its marker is gone: saved earlier, it is changed again
+when the Discogs tags arrive, and needs saving again.
+
 ---
 
 ## Tag sources
