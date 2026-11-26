@@ -49,6 +49,9 @@ from .discogs_mapping import (
     other_part,
     picker_search_terms,
     pressing_only,
+    album_wide_only,
+    MB_PRESSING_TAGS,
+    MEDIA_OF_KIND,
     release_artists_for,
     settle_artist_credits,
     snapshot_artist_credits,
@@ -467,6 +470,50 @@ def _withdraw_applied(album, metadata, op, release_id) -> None:
     plugin_log.detail(op, f'Discogs release {release_id}\'s own tags withdrawn ({len(keys)})')
 
 
+def _media_against_copy(metadata, kind) -> list:
+    """The MusicBrainz media your copy cannot be (a cassette for a download, a CD for a vinyl
+    rip); [] when nothing is known or they fit."""
+    k, why = (tuple(kind or ()) + ('', ''))[:2]
+    media = [m for m in metadata.getall('media') if str(m).strip()] if k else []
+    if not media:
+        return []
+    fake = {'id': 'mb', 'formats': [{'name': str(m).split(',')[0].strip()} for m in media]}
+    return media if kind_against(k, why, fake) else []
+
+
+def _media_from_copy(album, metadata, op, kind) -> None:
+    """Media follows your copy: the MusicBrainz release's media is replaced by what your copy
+    was made from when they disagree (a download matched to the only release, a cassette)."""
+    wrong = _media_against_copy(metadata, kind)
+    now = MEDIA_OF_KIND.get(kind[0]) if wrong else None
+    if not now:
+        return
+    for target, _index in _album_metadata_targets(album, metadata):
+        if [m for m in target.getall('media') if str(m).strip()] == wrong:
+            target['media'] = now
+    plugin_log.decision(op, f'Media: {", ".join(wrong)} -> {now}: your copy is made from {kind[0]} ({kind[1]})')
+    _refresh_album_ui(album)
+
+
+def _drop_mb_pressing(album, metadata, op, written: set, kind) -> None:
+    """Discogs first, and the MusicBrainz release Picard matched is another pressing than yours:
+    its pressing details (catalogue number, label, barcode, country, release date) go where
+    Discogs wrote none; Media is your copy's."""
+    gone = [k for k in MB_PRESSING_TAGS if k not in written and k != 'media' and metadata.getall(k)]
+    for target, _index in _album_metadata_targets(album, metadata):
+        for k in gone:
+            try:
+                if k in target:
+                    del target[k]
+            except Exception:
+                pass
+    if 'media' not in written:
+        _media_from_copy(album, metadata, op, kind)
+    if gone:
+        plugin_log.decision(op, f'not from the MusicBrainz release Picard matched (another pressing than '
+                                f'yours): {", ".join(gone)}')
+
+
 def _forget_applied(album) -> None:
     _APPLIED_BY_ALBUM.pop(id(album), None)
 
@@ -773,7 +820,12 @@ def process_album(api, album, metadata, release) -> None:
     album_title = metadata.get('album') or None
     # What your copy says of its pressing (discogs_evidence), read from the album folder on a
     # worker thread before anything is searched. Stays None when the folder is not read.
-    state = {'ev': None, 'early': None, 'kind': ('', ''), 'decided': False}
+    state = {'ev': None, 'early': None, 'kind': ('', ''), 'decided': False,
+             'wide': False, 'mb_foreign': False}
+    # which database decides first: "Discogs preferred" (and Discogs only) - Discogs, from your
+    # copy, MusicBrainz breaking ties and filling what Discogs did not write; the others -
+    # the MusicBrainz release Picard matched, Discogs filling (discogs_decide.decide's FIRST)
+    first = 'discogs' if (settings['merge_mode'] or MODE_COMBINE) in (MODE_OVERRIDE, MODE_DISCOGS_ONLY) else 'mb'
 
     def _on_release_detail(release_data):
         """Shared by both routes: the MusicBrainz-linked release fetch and
@@ -784,6 +836,9 @@ def process_album(api, album, metadata, release) -> None:
         fields = _shape_fields(extract_discogs_fields(release_data))
         if not settings['import_notes']:
             fields.pop('discogs_notes', None)
+        if state['wide']:
+            # another pressing than yours: only what it tells of the album
+            fields = album_wide_only(fields)
         # one album of several on the release ("Beginnings / Tomorrow", a two-on-one CD): only
         # the pressing is written, the album stays the one Picard matched
         part_of = holds_more_than_album(release_data, metadata.get('album') or '',
@@ -845,6 +900,8 @@ def process_album(api, album, metadata, release) -> None:
                     _clear_non_discogs_tags(target, dict.fromkeys(supplied), op)
                 _settle_artist_credits(target, names_before, set(fields) | set(per_track), op)
 
+            if state['mb_foreign']:
+                _drop_mb_pressing(album, metadata, op, set(fields), state['kind'])
             changed = {k: (before.get(k), list(metadata.getall(k)))
                        for k in fields if list(metadata.getall(k)) != before.get(k)}
             plugin_log.event(op, f'applied {len(changed)} of {len(fields)} field(s) '
@@ -1006,7 +1063,7 @@ def process_album(api, album, metadata, release) -> None:
     def _kind_job():
         return copy_kind(paths, _album_folder_of(paths))
 
-    if linked_id:
+    if linked_id and first == 'mb':
         # MusicBrainz's link is applied at once: reading your copy waits its turn behind other
         # albums' scans (minutes), and an album saved meanwhile would get no Discogs data at all.
         # A pressing your copy proves instead replaces it when the reading is done. Not when your
@@ -1030,7 +1087,9 @@ def process_album(api, album, metadata, release) -> None:
             state['kind'] = tuple(result)
         if state['kind'][0]:
             plugin_log.detail(op, f'your copy is made from: {state["kind"][0]} ({state["kind"][1]})')
-        if not linked_id or state['decided'] or not _album_is_alive(album):
+            if _album_is_alive(album):
+                _media_from_copy(album, metadata, op, state['kind'])
+        if not linked_id or first != 'mb' or state['decided'] or not _album_is_alive(album):
             return
         client.get_release(str(linked_id), _guard_async(_on_early))
 
@@ -1068,7 +1127,7 @@ def process_album(api, album, metadata, release) -> None:
             v = decide(a, http, _dm, mb_release_id=getattr(album, 'id', '') or '',
                        mb_discids=mb_discids, linked=all_linked, mb_facts=mb_facts,
                        ocr_text=m.get('text') or '', scan_probe=m.get('probe'),
-                       likely=bool(settings['pick_likely']))
+                       likely=bool(settings['pick_likely']), first=first, kind=kind)
             # the pressing your copy proves is on another MusicBrainz release than Picard matched
             if settings['move_to_discid_release']:
                 try:
@@ -1100,8 +1159,8 @@ def process_album(api, album, metadata, release) -> None:
         job['scans'] = scans
         merged = job['merged'] = merge_scans(album_d, loc['album_dir'], scans)
         ev = job['ev'] = copy_evidence(album_d)
-        if not has_copy_evidence(ev):
-            return job
+        if not has_copy_evidence(ev) and first != 'discogs':
+            return job                  # (Discogs first: Discogs ranks it by your copy all the same)
         job['http'] = http
         verdict = job['verdict'] = _decide(album_d, merged)
         # undecided: the scans (and cover art) read again, harder, and decided again (Discogs'
@@ -1149,6 +1208,41 @@ def process_album(api, album, metadata, release) -> None:
 
         client.get_release(str(release_id), _guard_async(_checked))
 
+    def _mb_not_yours():
+        """Your copy is another format than the MusicBrainz release Picard matched."""
+        return bool(_media_against_copy(metadata, state['kind']))
+
+    def _sources_for(verdict):
+        """What each database may still write once the pick is known (the tag source's order)."""
+        same = verdict.get('same_as_mb')
+        if first == 'mb' and same is False and verdict.get('best'):
+            state['wide'] = True
+            plugin_log.decision(op, 'the Discogs release is another pressing than the MusicBrainz release '
+                                    'Picard matched: it fills only what is true of the album (genre, style, '
+                                    'credits, master, original year), no pressing details')
+        if first == 'discogs' and (same is False or _mb_not_yours()):
+            state['mb_foreign'] = True
+            plugin_log.decision(op, 'the MusicBrainz release Picard matched is another pressing than yours: '
+                                    'it fills only what is true of the album, none of its pressing details')
+
+    def _album_only(verdict):
+        """Discogs first, and Discogs lists no pressing your copy can be: what its master tells of
+        the album (genre, style, original year), from the release of the album TagMender scores
+        highest; MusicBrainz's pressing details go when that release is not yours."""
+        plugin_log.decision(op, f'{verdict["why"][0]}: no Discogs pressing for your copy')
+        if _mb_not_yours():
+            state['mb_foreign'] = True
+            _drop_mb_pressing(album, metadata, op, set(), state['kind'])
+        album_cands = sorted((x for x in verdict.get('scored') or () if x.get('tracks_ok')
+                              and (x.get('confidence') or 0) >= 50),
+                             key=lambda x: -(x.get('confidence') or 0))
+        if not album_cands:
+            return
+        rid = album_cands[0]['cand'].get('id')
+        state['wide'] = True
+        _apply(rid, f'Discogs release {rid} is the album, not your pressing: only what is true of the '
+                    f'album is written (genre, style, master, original year)', True)
+
     def _done(result=None, error=None):
         try:
             if not _album_is_alive(album):
@@ -1166,6 +1260,7 @@ def process_album(api, album, metadata, release) -> None:
             ev, verdict, http = result.get('ev'), result.get('verdict'), result.get('http')
             if (result.get('kind') or ('', ''))[0]:
                 state['kind'] = tuple(result['kind'])
+                _media_from_copy(album, metadata, op, state['kind'])
             if result.get('deep') is not None:
                 d = result['deep']
                 plugin_log.event(op, 'undecided after the first reading: scans read again, harder ('
@@ -1204,6 +1299,7 @@ def process_album(api, album, metadata, release) -> None:
             best = verdict.get('best') or {}
             rid = (best.get('cand') or {}).get('id')
             status = verdict['status']
+            _sources_for(verdict)
             if status == 'auto' and verdict.get('mb_release') and _move_to_release(
                     album, verdict['mb_release'], loc, op,
                     why=f'your copy proves Discogs release {rid} ({explain_verdict(best)}), and '
@@ -1215,6 +1311,8 @@ def process_album(api, album, metadata, release) -> None:
                 _apply(rid, f'Discogs release {rid}: MusicBrainz links it and nothing of your copy '
                             f'is against it')
             elif status == 'musicbrainz':
+                _apply(rid, f'Discogs release {rid}: {verdict["why"][0]}')
+            elif status == 'discogs':
                 _apply(rid, f'Discogs release {rid}: {verdict["why"][0]}')
             elif status == 'likely':
                 rest = ', '.join(str(x['cand'].get('id')) for x in verdict.get('others') or ())
@@ -1231,6 +1329,8 @@ def process_album(api, album, metadata, release) -> None:
                 _apply(rid, f'Discogs release {rid}: you chose it for this folder\'s other album', True)
             elif status in ('review', 'move'):
                 _review(verdict, http, loc)
+            elif verdict.get('ruled_out') and first == 'discogs':
+                _album_only(verdict)
             elif verdict.get('ruled_out'):
                 plugin_log.decision(op, f'{verdict["why"][0]}: no Discogs data for this album '
                                         f'(Search Discogs\u2026 to choose one anyway)')
@@ -1744,11 +1844,16 @@ class DiscogsOptionsPage(OptionsPage):
         self.mb_only_radio.setToolTip('Write no Discogs data at all.')
         self.fill_gaps_radio = QtWidgets.QRadioButton('MusicBrainz preferred', self)
         self.fill_gaps_radio.setToolTip(
-            'Discogs fills only the fields MusicBrainz left empty. One value per field.')
+            'MusicBrainz decides the release: the one Picard matched (moved to the one your disc ID '
+            'proves). Its Discogs release is the one MusicBrainz links, else the one carrying its '
+            'barcode or catalogue number. Discogs fills only the fields MusicBrainz left empty - only '
+            'what is true of the album (genre, style, credits) when it is another pressing.')
         self.override_radio = QtWidgets.QRadioButton('Discogs preferred (recommended)', self)
         self.override_radio.setToolTip(
-            'Discogs wins where it has a value; MusicBrainz is kept where Discogs has '
-            'none. One value per field \u2014 never concatenated.')
+            'Discogs decides the pressing, from your copy (barcode, disc ID, catalogue number, scans, '
+            'what it was made from) and Discogs\' own ranking; MusicBrainz\'s link only breaks a tie. '
+            'Every Discogs tag is written; MusicBrainz fills only what Discogs did not write - only '
+            'what is true of the album when the release Picard matched is another pressing.')
         self.discogs_only_radio = QtWidgets.QRadioButton(
             'Discogs only \u2014 remove tags Discogs does not supply', self)
         self.discogs_only_radio.setToolTip(

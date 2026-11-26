@@ -2353,6 +2353,24 @@ def holds_more_than_album(release: dict, album_title: str, album_tracks: int) ->
     return len(parts) >= 2 and _folded(album_title) in parts
 
 
+# What is true of one pressing only, not of the album: a release of another pressing than yours
+# must not fill these (the tag sources' "album-wide only")
+PRESSING_ONLY_FIELDS = frozenset({'date', 'releasecountry', 'catalognumber', 'label', 'media', 'barcode',
+                                  'asin', 'releasestatus', 'totaldiscs', 'disctotal', 'discsubtitle'})
+ALBUM_WIDE_DISCOGS = frozenset({'discogs_master_id', 'discogs_style', 'discogs_genre'})
+# MusicBrainz's tags of a pressing that is not yours, dropped when Discogs (first) wrote none
+MB_PRESSING_TAGS = ('media', 'catalognumber', 'label', 'barcode', 'releasecountry', 'date', 'asin')
+# what your copy was made from (discogs_kind) as MusicBrainz's media name
+MEDIA_OF_KIND = {'digital': 'Digital Media', 'vinyl': 'Vinyl', 'cassette': 'Cassette', 'cd': 'CD'}
+
+
+def album_wide_only(fields: dict) -> dict:
+    """FIELDS less what is true of one pressing only: what a release of another pressing than
+    yours may still tell of the album (genre, style, credits, master, original year, names)."""
+    return {k: v for k, v in fields.items()
+            if k not in PRESSING_ONLY_FIELDS and (not k.startswith('discogs_') or k in ALBUM_WIDE_DISCOGS)}
+
+
 def pressing_only(fields: dict) -> dict:
     """FIELDS less everything but the pressing's tags (PRESSING_TAGS and Discogs' own)."""
     return {k: v for k, v in fields.items()

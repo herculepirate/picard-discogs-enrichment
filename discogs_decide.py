@@ -516,9 +516,88 @@ def matrix_pick(scored: list, http, ocr_text: str, album: dict | None, cfg: dict
     return (x, code) if fits else (None, '')
 
 
-def decide(album: dict, http, dm, *, mb_release_id: str = '', mb_discids=(), linked=(),
+# ---- which database decides first (the tag source) ---------------------------------------------
+# "Discogs preferred": Discogs decides the pressing from your copy; MusicBrainz's link and its
+# barcode or catalogue number only break a tie. "MusicBrainz preferred" (and the others): the
+# release Picard matched decides; its Discogs link first.
+RANK_MIN_CONFIDENCE = 90.0      # (TagMender's auto_min_confidence)
+RANK_MIN_LEAD = 8.0             # (TagMender's auto_min_margin)
+ALBUM_MIN_CONFIDENCE = 50.0     # below: not the album at all
+
+
+def mark_kind_against(scored: list, kind: tuple) -> None:
+    """A candidate of a format your copy cannot be (a CD for a vinyl rip, a cassette for a
+    download) has that against it: "kind_against", and in its clues_against."""
+    k, why = (tuple(kind or ()) + ('', ''))[:2]
+    if not k:
+        return
+    for x in scored:
+        theirs = set((x.get('cand') or {}).get('formats') or ())
+        if theirs and k not in theirs:
+            what = (f'your copy is {_KIND_NAMES.get(k, k)} ({why}), this pressing is '
+                    f'{"/".join(sorted(theirs))}')
+            x['kind_against'] = what
+            x['clues_against'] = list(x.get('clues_against') or ()) + [what]
+
+
+_KIND_NAMES = {'vinyl': 'a vinyl rip', 'cassette': 'a tape rip', 'cd': 'a CD rip', 'digital': 'a download'}
+
+
+def same_pressing(s: dict | None, linked, mb: dict | None):
+    """Is candidate S the pressing of the MusicBrainz release Picard matched? True: MusicBrainz
+    links it, or it carries that release's barcode or catalogue number. False: MusicBrainz names
+    another (links others, or has a barcode or catalogue number it does not carry). None: nothing
+    to tell by."""
+    if not s:
+        return False
+    c = s.get('cand') or {}
+    if str(c.get('id')) in {str(x) for x in linked or ()}:
+        return True
+    bc = str((mb or {}).get('barcode') or '')
+    catnos = [x for x in str((mb or {}).get('catalognumber') or '').split(';') if x.strip()]
+    if bc and any(_same_code(bc, x) for x in c.get('barcodes') or ()):
+        return True
+    if catnos and any(_same_code(x, y) for x in catnos for y in c.get('catnos') or ()):
+        return True
+    if bc or catnos or linked:
+        return False
+    return None
+
+
+def ranked_pick(scored: list, linked, mb: dict | None) -> tuple[dict | None, str, str]:
+    """Discogs first, when your copy proves nothing: the candidate TagMender ranks first (format,
+    catalogue number, year, country, track lengths, your scans' text) among those nothing of your
+    copy is against. Clearly first: it. Tied (within RANK_MIN_LEAD): MusicBrainz breaks the tie -
+    the release it links, else the one carrying its barcode or catalogue number. Returns (pick,
+    status "discogs" | "linked" | "musicbrainz", why) or (None, "", "")."""
+    pool = sorted((x for x in scored if x.get('tracks_ok') and not x.get('clues_against')
+                   and not x.get('conflict') and (x.get('confidence') or 0) >= ALBUM_MIN_CONFIDENCE),
+                  key=lambda x: -(x.get('confidence') or 0))
+    if not pool:
+        return None, '', ''
+    top = pool[0]
+    conf = top.get('confidence') or 0
+    nxt = pool[1].get('confidence') or 0 if len(pool) > 1 else 0
+    if conf >= RANK_MIN_CONFIDENCE and conf - nxt >= RANK_MIN_LEAD:
+        return top, 'discogs', (f'Discogs ranks it first for your copy ({conf:.0f}%'
+                                + (f' against {nxt:.0f}% for {pool[1]["cand"].get("id")}' if len(pool) > 1 else '')
+                                + '), and nothing of your copy is against it')
+    tied = [x for x in pool if conf - (x.get('confidence') or 0) < RANK_MIN_LEAD]
+    ids = ', '.join(str(x['cand'].get('id')) for x in tied)
+    link = [x for x in tied if str(x['cand'].get('id')) in {str(i) for i in linked or ()}]
+    if len(link) == 1:
+        return link[0], 'linked', f'{len(tied)} pressings fit your copy equally ({ids}); MusicBrainz links this one'
+    by_mb = [x for x in tied if same_pressing(x, (), mb)]
+    if len(by_mb) == 1:
+        return by_mb[0], 'musicbrainz', (f'{len(tied)} pressings fit your copy equally ({ids}); this one carries '
+                                         f'the barcode or catalogue number of the MusicBrainz release Picard matched')
+    return None, '', ''
+
+
+def _decide(album: dict, http, dm, *, mb_release_id: str = '', mb_discids=(), linked=(),
            mb_facts: dict | None = None, cfg: dict | None = None, ocr_text: str = '',
-           scan_probe: dict | None = None, likely: bool = True) -> dict[str, Any]:
+           scan_probe: dict | None = None, likely: bool = True, first: str = 'mb',
+           kind=('', '')) -> dict[str, Any]:
     """Which Discogs release ALBUM (read_album's dict) is.
 
     OCR_TEXT and SCAN_PROBE come from discogs_ocr.merge_scans: the text of your scans and
@@ -541,6 +620,12 @@ def decide(album: dict, http, dm, *, mb_release_id: str = '', mb_discids=(), lin
     "move"        your disc ID is on one other MusicBrainz release than Picard matched (and your
                   copy is one disc): "move_to" is that release, where your files belong
     "review"      you choose (the picker); "nomatch" nothing found
+
+    FIRST "discogs" (the tag source "Discogs preferred"): after what your copy proves, Discogs'
+    own ranking decides ("discogs", ranked_pick); MusicBrainz's link ("linked") and its barcode or
+    catalogue number ("musicbrainz") only break a tie. KIND: what your copy was made from
+    (discogs_kind.copy_kind); a candidate of another format has that against it.
+    "same_as_mb": the pick is the pressing of the MusicBrainz release Picard matched (same_pressing).
     """
     cfg = _cfg(cfg)
     linked = [str(x) for x in linked or () if str(x).isdigit()]
@@ -567,6 +652,7 @@ def decide(album: dict, http, dm, *, mb_release_id: str = '', mb_discids=(), lin
     mc.note_titles(album, cands)
     mc.settle_title_numbers(album, cands)
     scored = mc.code_twins(album, [mc.score_candidate(album, c, cfg, ocr_text) for c in cands], cfg, ocr_text)
+    mark_kind_against(scored, kind)
     res = mc.classify(scored, cfg)
     # TagMender's R9 against Discogs' whole list: a bootleg your copy proves is yours when no
     # official release carries that proof (classify alone never takes one)
@@ -620,12 +706,12 @@ def decide(album: dict, http, dm, *, mb_release_id: str = '', mb_discids=(), lin
                              f'own disc, on no other candidate')
         pick['notes'] = list(pick.get('notes') or []) + [f'matrix {code} printed on your scans']
         return out
-    first = proof_first(scored, cfg, held, album)
-    if first is not None:
-        out.update(status='auto', best=first)
+    lone_proof = proof_first(scored, cfg, held, album)
+    if lone_proof is not None:
+        out.update(status='auto', best=lone_proof)
         out['why'].insert(0, f'only this pressing is proven by your copy '
-                             f'({"disc ID" if proof_rank(first) == 3 else "barcode"}), and nothing of '
-                             f'your copy is against it (TagMender\'s confidence {first.get("confidence", 0):.0f}%)')
+                             f'({"disc ID" if proof_rank(lone_proof) == 3 else "barcode"}), and nothing of '
+                             f'your copy is against it (TagMender\'s confidence {lone_proof.get("confidence", 0):.0f}%)')
         return out
 
     def clean(x):
@@ -638,12 +724,14 @@ def decide(album: dict, http, dm, *, mb_release_id: str = '', mb_discids=(), lin
                              'pressing' if not proven else
                              'more than one pressing carries what your copy shows')
     link = next((x for x in scored if str(x['cand'].get('id')) in linked), None)
+    if first == 'discogs':
+        link = None                 # (Discogs first: MusicBrainz only breaks a tie, below)
     if clean(link):
         out.update(status='linked', best=link)
         out['why'].insert(0, 'MusicBrainz links this Discogs release, and nothing of your copy '
                              'is against it')
         return out
-    by_mb = [(agrees_with_musicbrainz(x, mb_facts), x) for x in scored]
+    by_mb = [(agrees_with_musicbrainz(x, mb_facts), x) for x in scored] if first != 'discogs' else []
     by_mb = [(w, x) for w, x in by_mb if w and clean(x)]
     if len(by_mb) == 1:
         what, x = by_mb[0]
@@ -685,14 +773,43 @@ def decide(album: dict, http, dm, *, mb_release_id: str = '', mb_discids=(), lin
         out['why'].insert(0, 'your copy prints no barcode or catalogue number (its back cover read '
                              'whole), and only this pressing lists none')
         return out
+    if first == 'discogs' and scored:
+        pick, how, why = ranked_pick(scored, linked, mb_facts)
+        if pick is not None and str(pick['cand'].get('id')) not in held:
+            out.update(status=how, best=pick)
+            out['why'].insert(0, why)
+            return out
+        if not any(x.get('tracks_ok') and not x.get('kind_against') and not mc._ruled_out_by_copy(x)
+                   and (x.get('confidence') or 0) >= ALBUM_MIN_CONFIDENCE for x in scored):
+            out.update(status='nomatch', ruled_out=True)
+            out['why'].insert(0, 'Discogs lists no release your copy can be (each is a format your '
+                                 'copy is not, another pressing your copy rules out, or not this album)')
+            return out
     if status == 'nomatch' or not scored:
         out['status'] = 'nomatch'
-    elif not proven and all(mc._ruled_out_by_copy(x) for x in scored):
+    elif not proven and all(mc._ruled_out_by_copy(x) or x.get('kind_against') for x in scored):
         out.update(status='nomatch', ruled_out=True)
         out['why'].insert(0, 'Discogs lists no release your copy can be (each is a format or '
                              'pressing your copy rules out)')
     else:
         out['status'] = 'review'
+    return out
+
+
+def decide(album: dict, http, dm, *, mb_release_id: str = '', mb_discids=(), linked=(),
+           mb_facts: dict | None = None, cfg: dict | None = None, ocr_text: str = '',
+           scan_probe: dict | None = None, likely: bool = True, first: str = 'mb',
+           kind=('', '')) -> dict[str, Any]:
+    """_decide (see there), and "same_as_mb": the pick is the pressing of the MusicBrainz release
+    Picard matched (True), another (False) or nothing tells (None)."""
+    out = _decide(album, http, dm, mb_release_id=mb_release_id, mb_discids=mb_discids, linked=linked,
+                  mb_facts=mb_facts, cfg=cfg, ocr_text=ocr_text, scan_probe=scan_probe, likely=likely,
+                  first=first, kind=kind)
+    if out.get('status') in ('linked', 'musicbrainz'):
+        out['same_as_mb'] = True
+    else:
+        out['same_as_mb'] = same_pressing(out.get('best'), linked, mb_facts) if out.get('best') else None
+    out['first'] = first
     return out
 
 

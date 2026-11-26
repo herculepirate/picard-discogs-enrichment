@@ -129,9 +129,39 @@ in exactly what gets overwritten:
 | --- | --- |
 | **Discogs only** | Every tag is removed and rewritten from Discogs — including title, track and disc numbers, artist and date. See [what survives](#what-discogs-only-keeps). |
 | **MusicBrainz only** | No Discogs data is written, and any Discogs tags a previous run left behind are removed. |
-| **Discogs preferred** | Every field Discogs supplies replaces the MusicBrainz value. MusicBrainz keeps the fields Discogs has no opinion on. |
-| **MusicBrainz preferred** | MusicBrainz wins wherever it has a value; Discogs fills only what MusicBrainz left blank. |
-| **Keep both** | Both values are kept as a multi-value tag, Discogs first. |
+| **Discogs preferred** | **Discogs decides the pressing**, from your copy, and every tag of it is written; MusicBrainz fills only what Discogs did not write. |
+| **MusicBrainz preferred** | **MusicBrainz decides the release** (the one Picard matched); Discogs fills only what MusicBrainz left blank. |
+| **Keep both** | Both values are kept as a multi-value tag, Discogs first; MusicBrainz decides the release. |
+
+### Which database decides first
+
+**Discogs preferred** (and Discogs only):
+
+1. Nothing is applied when the album loads; your copy is read first.
+2. A pressing your copy proves wins: disc ID, barcode, catalogue number, a matrix on your scans.
+3. Else Discogs' own ranking by your copy: format (vinyl, tape, CD, download - a pressing of a
+   format your copy is not is out), catalogue number, year, country, track lengths. One clearly
+   first (90% and 8 points ahead) is applied.
+4. A tie is broken by MusicBrainz: the Discogs release it links, else the one carrying its
+   barcode or catalogue number. Still tied: the most likely, or the picker.
+5. MusicBrainz fills what Discogs did not write. When the release Picard matched is another
+   pressing (it links another, its barcode or catalogue number differ, or it is another format
+   than your copy), only what is true of the album: titles, names, IDs, credits - not its media,
+   catalogue number, label, barcode, country or release date.
+6. Discogs lists no pressing your copy can be: the album's genre, style, master and original
+   year from Discogs, nothing of a pressing.
+
+**MusicBrainz preferred** (and Keep both, MusicBrainz only):
+
+1. The release Picard matched decides (your disc ID moves the files to the release it is on).
+2. MusicBrainz's link to Discogs is applied when the album loads, unless your copy is against it.
+3. Else the Discogs release carrying the MusicBrainz release's barcode or catalogue number; else
+   the pressing your copy proves.
+4. Discogs fills only what MusicBrainz left blank - only what is true of the album when the
+   Discogs release is another pressing than MusicBrainz's.
+
+In both, **Media follows your copy**: a download matched to the only release, a cassette, gets
+*Digital Media*; a vinyl rip matched to the CD gets *Vinyl*.
 
 Single-valued fields — album, artist, albumartist, date, barcode, country,
 media, disc numbers and the sort fields — never become multi-valued, in any
