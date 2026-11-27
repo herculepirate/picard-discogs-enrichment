@@ -226,6 +226,21 @@ class Decide(unittest.TestCase):
         self.assertEqual(str(r['best']['cand']['id']), '2')
         self.assertEqual(dd.proof_rank(r['best']), 3)
 
+    def test_your_catalogue_number_outranks_a_disc_id_on_another_pressing(self):
+        # Yuka & Chronoship - Ship: the rip log names KICS-3687 (the Japanese CD); your disc ID is
+        # on MusicBrainz only for the UK CD YCUK-004, laid out on the disc exactly the same
+        album = self._copy('Nightfall (1987) {ACTLP 1}')
+        did = tr.mb_discid(album['tocs'][1])
+        http = FakeHttp([release(1, 'ACTLP 1', country='Japan'), release(2, 'MASS 2', country='UK')])
+        for first in ('mb', 'discogs'):
+            r = self._decide(album, http, mb_release_id='mbid-uk', mb_discids={did}, linked=['2'],
+                             first=first)
+            self.assertEqual(str(r['best']['cand']['id']), '1', (first, r['why']))
+            self.assertEqual(r['status'], 'auto', (first, r['why']))
+            self.assertFalse(dd.settled_without_scans(r))      # (the scans are still read)
+            uk = next(x for x in r['scored'] if str(x['cand']['id']) == '2')
+            self.assertIn('ACTLP1', uk['code_against'])
+
     def test_disc_id_on_one_other_musicbrainz_release_moves_your_files_there(self):
         # Picard matched the vinyl; your rip log's disc ID is on the CD's MusicBrainz release
         album = self._copy('Nightfall (1987)')

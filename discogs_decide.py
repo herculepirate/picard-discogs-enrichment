@@ -108,6 +108,15 @@ def _disc_ids(album: dict, http, mb_release_id: str, mb_discids: set, linked: li
     return 'matched' if exact else ''
 
 
+def other_product(s: dict | None) -> bool:
+    """Your copy shows it is another product: a barcode that differs (TagMender's "conflict") or
+    a catalogue number another candidate carries (mark_code_against). Whatever else of your copy
+    it carries proves nothing then - a disc ID is the same on every pressing cut from one master
+    (Yuka & Chronoship - Ship: your disc ID on the UK CD, your barcode and number on the
+    Japanese)."""
+    return bool(s and (s.get('conflict') or s.get('code_against')))
+
+
 def proven_by_copy(s: dict) -> bool:
     """Your copy proves this candidate is your pressing: its own barcode (never one typed in
     notes or written by another tagger), your disc ID (on a Discogs candidate the full "disc
@@ -390,7 +399,7 @@ def proof_first(scored: list, cfg: dict, held=(), album: dict | None = None) -> 
     album's with a subtitle counts as the album's (Steve Howe - Mothballs: your barcode on
     "Mothballs - Groups & Sessions 64-69") when the album itself agrees: half its track titles
     or half its lengths."""
-    proven = [x for x in scored if proven_by_copy(x) and x.get('tracks_ok')]
+    proven = [x for x in scored if proven_by_copy(x) and x.get('tracks_ok') and not other_product(x)]
     if not proven:
         return None
     top = max(proof_rank(x) for x in proven)
@@ -540,6 +549,35 @@ def mark_kind_against(scored: list, kind: tuple) -> None:
             x['clues_against'] = list(x.get('clues_against') or ()) + [what]
 
 
+def mark_code_against(scored: list, album: dict) -> None:
+    """A candidate listing another catalogue number than your copy's own, when your number is on
+    another candidate that fits your files: another pressing ("code_against", and in its
+    clues_against). Yuka & Chronoship - Ship: the rip log names KICS-3687 (the Japanese CD,
+    Discogs 11962139); your disc ID is on MusicBrainz only for the UK CD YCUK-004 (Discogs
+    11988370), whose tracks lie on the disc exactly as the Japanese's - the disc ID cannot tell
+    them apart, the number can. A barcode that differs is TagMender's own "conflict" already."""
+    own = {mc.norm_code(c) for c in album.get('catnos') or ()} - {'', 'none'}
+    own = {c for c in own if not mc.tagger_catno(album, {c})}
+    holders = [x for x in scored if x.get('tracks_ok') and not x.get('conflict')
+               and {mc.norm_code(n) for n in (x.get('cand') or {}).get('catnos') or ()} & own]
+    if not own or not holders:
+        return
+    mine = sorted({str(n).upper() for x in holders for n in (x.get('cand') or {}).get('catnos') or ()
+                   if mc.norm_code(n) in own}) or sorted(c.upper() for c in own)
+    ids = ', '.join(str((x.get('cand') or {}).get('id')) for x in holders)
+    for x in scored:
+        if x in holders or mc.barcode_proves(x) or x.get('code_against'):
+            continue
+        theirs = [str(n) for n in (x.get('cand') or {}).get('catnos') or ()
+                  if mc.norm_code(n) not in ('', 'none')]
+        if not theirs or {mc.norm_code(n) for n in theirs} & own:
+            continue
+        what = (f'your catalogue number {", ".join(mine)} is on Discogs {ids}; this pressing is '
+                f'{", ".join(n.upper() for n in theirs)}')
+        x['code_against'] = what
+        x['clues_against'] = list(x.get('clues_against') or ()) + [what]
+
+
 _KIND_NAMES = {'vinyl': 'a vinyl rip', 'cassette': 'a tape rip', 'cd': 'a CD rip', 'digital': 'a download'}
 
 
@@ -653,6 +691,7 @@ def _decide(album: dict, http, dm, *, mb_release_id: str = '', mb_discids=(), li
     mc.settle_title_numbers(album, cands)
     scored = mc.code_twins(album, [mc.score_candidate(album, c, cfg, ocr_text) for c in cands], cfg, ocr_text)
     mark_kind_against(scored, kind)
+    mark_code_against(scored, album)
     res = mc.classify(scored, cfg)
     # TagMender's R9 against Discogs' whole list: a bootleg your copy proves is yours when no
     # official release carries that proof (classify alone never takes one)
@@ -693,7 +732,7 @@ def _decide(album: dict, http, dm, *, mb_release_id: str = '', mb_discids=(), li
                                  f'not the one Picard matched')
             return out
 
-    proven = [x for x in scored if proven_by_copy(x) and x.get('tracks_ok')]
+    proven = [x for x in scored if proven_by_copy(x) and x.get('tracks_ok') and not other_product(x)]
     rank = proof_rank(best)
     if status == 'auto' and best is not None and rank and best.get('tracks_ok') \
             and all(x is best or proof_rank(x) < rank for x in proven):
